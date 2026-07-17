@@ -1,0 +1,13 @@
+# Секреты
+CBonds_API/.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Логи и локальные артефакты запуска
+logs/
+output/
