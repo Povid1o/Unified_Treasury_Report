@@ -1,7 +1,9 @@
 """Обёртка отчёта «ОВП» для единой консоли запуска (см. console.py)."""
 import argparse
 from pathlib import Path
+from typing import Optional
 
+from common import ui
 from reports.base import Report
 from reports.ovp import etl
 
@@ -41,32 +43,29 @@ class OvpReport(Report):
             currencies=args.currencies,
         )
         etl.save_report(df, output_path)
-        print(f"Готово: {len(df)} строк сохранено в {output_path}")
+        ui.success(f"Готово: {len(df)} строк сохранено в {output_path}")
 
-    def run_interactive(self) -> None:
-        input_str = input("Путь к исходному Excel-файлу (.xlsx): ").strip().strip('"')
+    def collect_interactive_args(self) -> Optional[argparse.Namespace]:
+        input_str = ui.ask("Путь к исходному Excel-файлу (.xlsx)").strip('"')
         input_path = Path(input_str)
 
         sheets = etl.list_currency_sheets(input_path)
         if not sheets:
-            print("Валютные листы не найдены (все листы содержат 'СВОД' в названии).")
-            return
-        print("Найдены валютные листы:", ", ".join(sheets))
+            ui.warning("Валютные листы не найдены (все листы содержат 'СВОД' в названии).")
+            return None
+        ui.console.print(f"Найдены валютные листы: [bold]{', '.join(sheets)}[/bold]")
 
-        full_history_str = input(
-            "Для каких валют выгрузить ВСЕ даты (через запятую, "
-            "Enter = ни для одной — берём только последнюю дату): "
-        ).strip()
+        full_history_str = ui.ask(
+            "Для каких валют выгрузить ВСЕ даты, через запятую (Enter = только последняя дата для всех)"
+        )
         full_history = [c.strip() for c in full_history_str.split(",") if c.strip()] if full_history_str else []
 
         default_output = _default_output_path(input_path)
-        output_str = input(f"Путь для сохранения CSV (Enter = {default_output}): ").strip()
-        output_path = Path(output_str) if output_str else default_output
+        output_str = ui.ask("Путь для сохранения CSV", default=str(default_output))
 
-        df = etl.convert_ovp_report(
-            input_path=input_path,
-            full_history_currencies=full_history,
+        return argparse.Namespace(
+            input=str(input_path),
+            output=output_str,
+            full_history=full_history,
             currencies=sheets,
         )
-        etl.save_report(df, output_path)
-        print(f"Готово: {len(df)} строк сохранено в {output_path}")

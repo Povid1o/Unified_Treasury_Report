@@ -1,4 +1,6 @@
 pandas
+numpy
 requests
 python-dotenv
 openpyxl
+rich

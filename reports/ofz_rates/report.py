@@ -2,7 +2,9 @@
 import argparse
 from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
 
+from common import ui
 from reports.base import Report
 from reports.ofz_rates import etl
 
@@ -39,15 +41,13 @@ class OfzRatesReport(Report):
 
         df = etl.build_report(as_of_date=as_of, lookback_days=args.lookback_days)
         etl.save_report(df, output_path)
-        print(f"Готово: {len(df)} строк сохранено в {output_path}")
+        ui.success(f"Готово: {len(df)} строк сохранено в {output_path}")
 
-    def run_interactive(self) -> None:
-        date_str = input("Дата отчёта (YYYY-MM-DD, Enter = сегодня): ").strip()
-        as_of = _parse_date(date_str) if date_str else None
+    def collect_interactive_args(self) -> Optional[argparse.Namespace]:
+        date_str = ui.ask("Дата отчёта YYYY-MM-DD (Enter = сегодня)")
+        if date_str:
+            _parse_date(date_str)  # валидируем сразу, чтобы не тратить время на спиннер впустую
 
-        lookback_str = input(f"Глубина истории в днях (Enter = {etl.LOOKBACK_DAYS}): ").strip()
-        lookback_days = int(lookback_str) if lookback_str else etl.LOOKBACK_DAYS
+        lookback_str = ui.ask("Глубина истории в днях", default=str(etl.LOOKBACK_DAYS))
 
-        df = etl.build_report(as_of_date=as_of, lookback_days=lookback_days)
-        output_path = etl.save_report(df)
-        print(f"Готово: {len(df)} строк сохранено в {output_path}")
+        return argparse.Namespace(date=date_str or None, lookback_days=int(lookback_str), output=None)
