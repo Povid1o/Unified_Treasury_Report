@@ -211,26 +211,64 @@ def validate_bi_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 def build_report(
     as_of_date: Optional[date] = None,
     lookback_days: int = LOOKBACK_DAYS,
+    date_from: Optional[date] = None,
+    date_to: Optional[date] = None,
+    dates: Optional[List[date]] = None,
 ) -> pd.DataFrame:
     """Полный цикл: подключение к API -> получение данных -> формат BI.
 
-    :param as_of_date: дата, на которую формируется отчёт ("любая дата" из
-        консоли запуска). По умолчанию — сегодня.
-    :param lookback_days: глубина истории в календарных днях назад от as_of_date.
-    """
-    as_of_date = as_of_date or date.today()
-    date_from = (as_of_date - timedelta(days=lookback_days)).isoformat()
-    date_to = as_of_date.isoformat()
+    Поддерживает три взаимоисключающих режима выбора периода (приоритет
+    сверху вниз):
 
-    logger.info("Формирование отчёта «Ставки ОФЗ» за период %s..%s", date_from, date_to)
+    1. ``dates`` — список конкретных (необязательно смежных) дат: у CBonds
+       нет метода "дай данные только за эти даты", поэтому запрашивается
+       диапазон [min(dates), max(dates)] одним запросом на срок, а итоговый
+       DataFrame фильтруется только по запрошенным датам.
+    2. ``date_from``/``date_to`` — явный интервал.
+    3. ``as_of_date`` (+ ``lookback_days``) — скользящее окно назад от даты
+       (поведение по умолчанию, как раньше).
+    """
+    if dates:
+        dates = sorted(set(dates))
+        range_from, range_to = dates[0], dates[-1]
+    elif date_from or date_to:
+        if not (date_from and date_to):
+            raise OfzDataError("Для интервала нужно указать обе границы: date_from и date_to")
+        if date_from > date_to:
+            raise OfzDataError(f"date_from ({date_from}) позже date_to ({date_to})")
+        range_from, range_to = date_from, date_to
+    else:
+        as_of_date = as_of_date or date.today()
+        range_from = as_of_date - timedelta(days=lookback_days)
+        range_to = as_of_date
+
+    span_days = (range_to - range_from).days
+    if span_days > 100:
+        logger.warning(
+            "Запрошенный период (%d дн.) превышает документированную глубину архива "
+            "CBonds для get_index_value_new (100 календарных дней) — часть дат может "
+            "не вернуться.",
+            span_days,
+        )
+
+    logger.info("Формирование отчёта «Ставки ОФЗ» за период %s..%s", range_from, range_to)
 
     api = build_api_client()
 
-    df = fetch_yield_curve_group(api, date_from, date_to)
+    df = fetch_yield_curve_group(api, range_from.isoformat(), range_to.isoformat())
     log_known_gaps()
 
     if df.empty:
         raise OfzDataError("Итоговый DataFrame пуст — ни одного показателя не удалось получить")
+
+    if dates:
+        wanted = {d.isoformat() for d in dates}
+        df = df[df["date_"].isin(wanted)]
+        missing = wanted - set(df["date_"].unique())
+        if missing:
+            logger.warning("Не найдено данных на даты: %s (выходной/нет торгов?)", sorted(missing))
+        if df.empty:
+            raise OfzDataError(f"Ни на одну из запрошенных дат данных не найдено: {sorted(wanted)}")
 
     df = validate_bi_dataframe(df)
     logger.info("Итоговый DataFrame: %d строк, %d показателей", len(df), df["name_st"].nunique())

@@ -17,8 +17,6 @@ from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("ovp", BASE_DIR / "logs")
 
-OUTPUT_DIR = BASE_DIR / "output" / "ovp"
-
 # Словарь иерархии категорий/подкатегорий отчёта ОВП (форма 634 и управленческие формы).
 HIERARCHY: Dict[str, List[str]] = {
     "АКТИВЫ(1)": [

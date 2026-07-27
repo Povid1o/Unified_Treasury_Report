@@ -5,7 +5,7 @@ Console — общий на весь процесс: логирование (с�
 над крутящимся спиннером вместо того, чтобы ломать его отрисовку.
 """
 from contextlib import contextmanager
-from typing import Iterator, Optional, Sequence
+from typing import Optional, Sequence
 
 from rich.console import Console
 from rich.panel import Panel
@@ -33,12 +33,14 @@ def print_menu(reports: Sequence) -> None:
 
 
 @contextmanager
-def spinner(message: str) -> Iterator[None]:
+def spinner(message: str):
     """Крутящийся индикатор загрузки. Лог-строки (через RichHandler на том же
-    Console) корректно печатаются над ним, не ломая анимацию.
+    Console) корректно печатаются над ним, не ломая анимацию. Возвращает
+    объект status — вызывающий код может status.update("новый текст") для
+    отображения прогресса (например, "файл 2 из 5") без пересоздания спиннера.
     """
-    with console.status(f"[bold cyan]{message}[/bold cyan]", spinner="dots"):
-        yield
+    with console.status(f"[bold cyan]{message}[/bold cyan]", spinner="dots") as status:
+        yield status
 
 
 def success(message: str) -> None:

@@ -5,20 +5,36 @@
 подключён под другой буквой/путём — поправьте константы ниже, ETL-код
 их не хардкодит и берёт значения только отсюда.
 
-ВАЖНО про NIM и TransfertStavka: в исходных ноутбуках не было
+ВАЖНО про NIM, TransfertStavka и ОВП: в исходных ноутбуках/GUI не было
 зафиксированной общей сетевой папки для входных файлов — NIM запрашивал
-путь через input() при каждом запуске, а TransfertStavka использовал
-личную папку Downloads автора ноутбука (C:\\Users\\BashlykovNV\\Downloads).
-Пути NIM_SOURCE и TRANSFERT_*_SOURCE ниже — это ЭКСТРАПОЛЯЦИЯ по аналогии
-с BalanceStruct/CHPD (общий архив Jupiter\\data\\<Отчёт> и
+путь через input() при каждом запуске, TransfertStavka использовал личную
+папку Downloads автора ноутбука (C:\\Users\\BashlykovNV\\Downloads), а ОВП
+выбирался вручную через диалог выбора файла в GUI. Пути NIM_SOURCE,
+TRANSFERT_*_SOURCE и OVP_SOURCE ниже — это ЭКСТРАПОЛЯЦИЯ по аналогии с
+BalanceStruct/CHPD (общий архив Jupiter\\data\\<Отчёт> и
 Jupiter\\output\\<Отчёт>). Обязательно проверьте и поправьте их перед
 использованием в проде.
+
+Если папка/файлы по указанному пути не найдутся — консоль не упадёт с
+ошибкой, а предложит вписать путь к файлу вручную (тот же сценарий, что
+раньше был единственным для ОВП).
 """
 from pathlib import Path
 
 from common.file_discovery import SourceConfig
 
 JUPITER_ROOT = Path(r"O:\Exchequer\Sotrudniki\Башлыков\Навигатор\Jupiter")
+
+# ── ОВП (путь — экстраполяция, см. предупреждение в начале файла) ─────────
+# У файлов ОВП нет даты в имени (в отличие от остальных отчётов), поэтому
+# filename_regex/date_format не заданы — источник сортирует файлы *.xlsx по
+# дате изменения (mtime) вместо даты, разобранной из имени.
+OVP_SOURCE = SourceConfig(
+    directory=JUPITER_ROOT / "data" / "OVP",
+    glob_pattern="*.xlsx",
+    label="ОВП",
+)
+OVP_OUTPUT_DIR = JUPITER_ROOT / "output" / "OVP"
 
 # ── BalanceStruct ("Структура баланса") ────────────────────────────────────
 # Имена файлов вида "ПФ_18_06_2026.xlsx" — путь и формат взяты дословно из
