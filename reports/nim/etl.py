@@ -24,6 +24,12 @@ MARKER_OSNOVA = "NIM - ОСНОВА"
 MARKER_RUR = "NIM - RUR"
 MARKER_VALUTA = "NIM - ВАЛЮТА"
 
+# Нормализованные формы маркеров считаются один раз при импорте: сравнение
+# идёт по ним, чтобы различия в пробелах/регистре не ломали поиск.
+_NORM_OSNOVA = excel_io.normalize_label(MARKER_OSNOVA)
+_NORM_RUR = excel_io.normalize_label(MARKER_RUR)
+_NORM_VALUTA = excel_io.normalize_label(MARKER_VALUTA)
+
 # Смещения строк данных блока ОСНОВА относительно строки маркера (+1..+4).
 # Все 4 строки блока подписаны в колонке A одинаково ("NIM" встречается
 # трижды с разным смыслом a2) — по тексту их не различить, поэтому здесь,
@@ -48,23 +54,29 @@ class NimDataError(RuntimeError):
 
 
 def _find_markers(df_full: pd.DataFrame) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """Ищет строки-маркеры в первой колонке. Возвращает (idx_osnova, idx_rur, idx_valuta)."""
+    """Ищет строки-маркеры в первой колонке. Возвращает (idx_osnova, idx_rur, idx_valuta).
+
+    Сравнение идёт по нормализованному виду (см. excel_io.normalize_label):
+    в выгрузках маркер может быть записан с другими пробелами или регистром.
+    """
     idx_osnova, idx_rur, idx_valuta = None, None, None
     for i, val in enumerate(df_full.iloc[:, 0]):
-        cell_val = str(val).strip()
-        if cell_val == MARKER_OSNOVA:
+        cell_val = excel_io.normalize_label(val)
+        if cell_val == _NORM_OSNOVA:
             idx_osnova = i
-        elif cell_val == MARKER_RUR:
+        elif cell_val == _NORM_RUR:
             idx_rur = i
-        elif cell_val == MARKER_VALUTA:
+        elif cell_val == _NORM_VALUTA:
             idx_valuta = i
     return idx_osnova, idx_rur, idx_valuta
 
 
 def _find_label_row(df_full: pd.DataFrame, start_idx: int, end_idx: int, label_text: str) -> Optional[int]:
+    """Ищет строку по метке в колонке A, сравнивая нормализованные значения —
+    иначе "% Активы" в константе и "%Активы" в файле считались бы разными."""
+    target = excel_io.normalize_label(label_text)
     for i in range(start_idx, end_idx):
-        cell = df_full.iloc[i, 0]
-        if not pd.isna(cell) and str(cell).strip() == label_text:
+        if excel_io.normalize_label(df_full.iloc[i, 0]) == target:
             return i
     return None
 

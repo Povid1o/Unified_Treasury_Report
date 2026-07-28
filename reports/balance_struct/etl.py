@@ -164,7 +164,9 @@ def build_name_to_path(nested: Dict) -> Dict[str, List[Tuple]]:
     result: Dict[str, List[Tuple]] = {}
 
     def _recurse(node_name: str, node_data: Any, path: List[str]) -> None:
-        clean_name = str(node_name).strip()
+        # Ключ нормализован (см. excel_io.normalize_label): в выгрузках статья
+        # может отличаться пробелами/регистром от эталона в NESTED_BALANCE.
+        clean_name = excel_io.normalize_label(node_name)
         axis = [None] * 4
         for i in range(min(len(path), 4)):
             axis[i] = path[i]
@@ -208,7 +210,10 @@ def apply_cleaning(
 
     if drop_row_names:
         first_col = df.columns[0]
-        mask = df[first_col].astype(str).str.strip().isin(drop_row_names)
+        # Сравниваем нормализованно — иначе "Итого" с висячим пробелом или
+        # неразрывным пробелом не отсеется и попадёт в отчёт лишней строкой.
+        targets = {excel_io.normalize_label(n) for n in drop_row_names}
+        mask = df[first_col].map(lambda v: excel_io.normalize_label(v) in targets)
         removed = df.loc[mask, first_col].tolist()
         df = df[~mask]
         logger.info("Удалены строки по имени статьи: %s", removed)
@@ -279,7 +284,7 @@ def parse_raw_rows(
     for i in range(len(df)):
         statya = str(df.iloc[i, 0]).strip()
 
-        candidates = name_map.get(statya, [])
+        candidates = name_map.get(excel_io.normalize_label(statya), [])
         selected_axis: Tuple = (None, None, None, None)
 
         if not candidates:

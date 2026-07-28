@@ -13,6 +13,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("ovp", BASE_DIR / "logs")
@@ -46,6 +47,18 @@ OUT_COLUMNS = [
 ]
 
 DATE_STR_PATTERN = re.compile(r"^\d{2}\.\d{2}\.\d{4}")
+
+# Нормализованный вид -> эталонное имя из HIERARCHY. Считается один раз при
+# импорте. Нужен, чтобы статья находилась независимо от пробелов и регистра в
+# файле (см. excel_io.normalize_label), а в выгрузку шло эталонное написание,
+# а не то, как её записал конкретный файл.
+_NORM_CATEGORIES: Dict[str, str] = {
+    excel_io.normalize_label(cat): cat for cat in HIERARCHY
+}
+_NORM_SUBCATEGORIES: Dict[str, Dict[str, str]] = {
+    cat: {excel_io.normalize_label(sub): sub for sub in subs}
+    for cat, subs in HIERARCHY.items()
+}
 
 
 class OvpDataError(RuntimeError):
@@ -158,11 +171,14 @@ def convert_ovp_report(
                 if not clean:
                     continue
 
-                if clean in HIERARCHY:
-                    current_category = clean
+                # Сравнение по нормализованному виду, в выгрузку идёт эталонное
+                # имя из HIERARCHY — см. _NORM_CATEGORIES/_NORM_SUBCATEGORIES.
+                norm = excel_io.normalize_label(clean)
+                if norm in _NORM_CATEGORIES:
+                    current_category = _NORM_CATEGORIES[norm]
                     target_subcategory = ""
-                elif current_category and clean in HIERARCHY[current_category]:
-                    target_subcategory = clean
+                elif current_category and norm in _NORM_SUBCATEGORIES[current_category]:
+                    target_subcategory = _NORM_SUBCATEGORIES[current_category][norm]
                 else:
                     continue
 

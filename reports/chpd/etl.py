@@ -77,12 +77,17 @@ class ChpdDataError(RuntimeError):
 
 
 def _build_name_to_paths(index_paths: List[Tuple]) -> Dict[str, List[Tuple]]:
-    """leaf_name -> список возможных (ax1, ax2, ax3, ax4) — некоторые названия
-    ("Юридические лица", "Физические лица", "SWAP") повторяются и в АКТИВАХ,
-    и в ПАССИВАХ, поэтому список, а не одно значение (см. _resolve_path)."""
+    """нормализованное leaf_name -> список возможных (ax1, ax2, ax3, ax4).
+
+    Ключ нормализован (см. excel_io.normalize_label), чтобы "Срочное**" в
+    константе находилось и когда в файле написано "Срочное **" или с
+    неразрывным пробелом. Некоторые названия ("Юридические лица",
+    "Физические лица", "SWAP") повторяются и в АКТИВАХ, и в ПАССИВАХ, поэтому
+    значение — список, а не одна запись (см. _resolve_path).
+    """
     result: Dict[str, List[Tuple]] = {}
     for leaf_name, ax1, ax2, ax3, ax4 in index_paths:
-        result.setdefault(leaf_name, []).append((ax1, ax2, ax3, ax4))
+        result.setdefault(excel_io.normalize_label(leaf_name), []).append((ax1, ax2, ax3, ax4))
     return result
 
 
@@ -95,7 +100,7 @@ def _resolve_path(
     берёт тот, что больше совпадает с текущим активным контекстом (ax1 уже
     известного раздела) — тот же приём, что и в balance_struct.parse_raw_rows.
     """
-    candidates = name_to_paths.get(leaf_name)
+    candidates = name_to_paths.get(excel_io.normalize_label(leaf_name))
     if not candidates:
         return None
     if len(candidates) == 1:
