@@ -6,13 +6,14 @@
 import re
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("chpd", BASE_DIR / "logs")
@@ -75,31 +76,87 @@ class ChpdDataError(RuntimeError):
     """Ошибка чтения или обработки Excel-отчёта ЧПД."""
 
 
+def _build_name_to_paths(index_paths: List[Tuple]) -> Dict[str, List[Tuple]]:
+    """leaf_name -> список возможных (ax1, ax2, ax3, ax4) — некоторые названия
+    ("Юридические лица", "Физические лица", "SWAP") повторяются и в АКТИВАХ,
+    и в ПАССИВАХ, поэтому список, а не одно значение (см. _resolve_path)."""
+    result: Dict[str, List[Tuple]] = {}
+    for leaf_name, ax1, ax2, ax3, ax4 in index_paths:
+        result.setdefault(leaf_name, []).append((ax1, ax2, ax3, ax4))
+    return result
+
+
+def _resolve_path(
+    leaf_name: str, active_context: List[Optional[str]], name_to_paths: Dict[str, List[Tuple]]
+) -> Optional[Tuple]:
+    """Выбирает (ax1, ax2, ax3, ax4) для строки с названием leaf_name.
+
+    Если у названия несколько вариантов (дубли между АКТИВАМИ/ПАССИВАМИ),
+    берёт тот, что больше совпадает с текущим активным контекстом (ax1 уже
+    известного раздела) — тот же приём, что и в balance_struct.parse_raw_rows.
+    """
+    candidates = name_to_paths.get(leaf_name)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    best, best_score = candidates[0], -1
+    for cand in candidates:
+        score = sum(1 for i in range(4) if cand[i] is not None and cand[i] == active_context[i])
+        if score > best_score:
+            best, best_score = cand, score
+    return best
+
+
 def build_long(df: pd.DataFrame, brief: bool = False) -> pd.DataFrame:
     """Переводит DataFrame из "широкого" вида в "длинный".
 
     Если brief=True, обрабатываются только столбцы *_Summary_Volume/*_Summary_%.
+
+    Оси (axis_1..axis_4) для каждой строки определяются по РЕАЛЬНОМУ названию
+    статьи из колонки A (df.index), а не по позиции строки в INDEX_PATHS.
+    Раньше строка №N в файле слепо получала N-ю запись из INDEX_PATHS — если
+    выгрузка из OLAP-куба добавляла/убирала строку (лишний подытог, другая
+    строка-разделитель), все нижестоящие строки сдвигались и получали чужие
+    оси без единой ошибки (файл читался, но значения оказывались не под теми
+    статьями). Сопоставление по названию устойчиво к таким сдвигам.
     """
-    if len(INDEX_PATHS) < len(df):
-        raise ChpdDataError(
-            f"INDEX_PATHS содержит {len(INDEX_PATHS)} записей, но DataFrame имеет "
-            f"{len(df)} строк. Добавьте недостающие элементы в INDEX_PATHS."
-        )
+    name_to_paths = _build_name_to_paths(INDEX_PATHS)
 
     if brief:
-        vol_cols = [c for c in df.columns if c.endswith("_Summary_Volume")]
-        col_pairs = [(v, v.replace("_Summary_Volume", "_Summary_%")) for v in vol_cols]
+        # Пары (объём, %) берём по ПОЗИЦИИ из COLUMN_SUFFIXES, а не подстановкой
+        # "_Summary_Volume" -> "_Summary_%" в имени колонки. Имя корректно
+        # склеивается только когда даты в заголовках объединены (тогда у пары
+        # общая дата-основа); если выгрузка пишет дату в каждую колонку
+        # отдельно, pandas делает имена уникальными ("...05", "...06"), и
+        # подстановка давала несуществующее имя -> KeyError.
+        col_pairs = [
+            (df.columns[i], df.columns[i + 1])
+            for i, suffix in enumerate(COLUMN_SUFFIXES)
+            if suffix == "Summary_Volume" and i + 1 < len(df.columns)
+        ]
     else:
         col_pairs = [(df.columns[i], df.columns[i + 1]) for i in range(0, len(df.columns), 2)]
 
     rows: List[dict] = []
+    active_context: List[Optional[str]] = [None, None, None, None]
+    unresolved: List[str] = []
 
-    for idx, _leaf in enumerate(df.index):
-        path = INDEX_PATHS[idx]
-        leaf_name, ax1, *rest = path
-        ax2 = rest[0] if len(rest) > 0 else None
-        ax3 = rest[1] if len(rest) > 1 else None
-        ax4_val = rest[2] if len(rest) > 2 else None
+    for idx, raw_leaf in enumerate(df.index):
+        leaf_name = str(raw_leaf).strip()
+        path = _resolve_path(leaf_name, active_context, name_to_paths)
+        if path is None:
+            unresolved.append(leaf_name)
+            continue
+        ax1, ax2, ax3, ax4_val = path
+
+        level_idx = -1
+        for lvl in (3, 2, 1, 0):
+            if path[lvl]:
+                level_idx = lvl
+                break
+        for lvl in range(4):
+            active_context[lvl] = path[lvl] if lvl <= level_idx else None
 
         # df.loc[leaf, col] возвращает Series при дублях в индексе ("Юридические
         # лица", "Физические лица", "SWAP" повторяются в Активах и Пассивах).
@@ -150,6 +207,12 @@ def build_long(df: pd.DataFrame, brief: bool = False) -> pd.DataFrame:
                     "value": perc_value, "nversionid": "", "axis_5": "%",
                 })
 
+    if unresolved:
+        logger.warning(
+            "Не найдено в INDEX_PATHS: %d строк, отброшены. Названия: %s",
+            len(unresolved), unresolved,
+        )
+
     return pd.DataFrame(rows, columns=OUT_COLUMNS)
 
 
@@ -162,15 +225,27 @@ def build_report(file_path: Path) -> pd.DataFrame:
         raise ChpdDataError(f"Файл не найден: {file_path}")
 
     try:
+        # Без usecols="A:M": pandas падал с ParserError, если колонок в листе
+        # меньше 13 (у выгрузок из кубов их часто меньше). Обрезаем сами —
+        # тогда несоответствие поймает понятная проверка ниже.
         data = pd.read_excel(
             file_path,
             sheet_name=SHEET_NAME,
             nrows=32,       # читает Excel rows 2-33 (row 1 = header)
-            usecols="A:M",
             index_col=0,    # столбец A сразу становится индексом при чтении
         )
+        data = data.iloc[:, :len(COLUMN_SUFFIXES)]
     except Exception as exc:
-        raise ChpdDataError(f"Не удалось прочитать файл {file_path} (лист {SHEET_NAME!r}): {exc}") from exc
+        # Показываем доступные листы: у выгрузок из кубов нужный лист часто
+        # называется иначе, и без списка причина неочевидна.
+        try:
+            available = pd.ExcelFile(file_path).sheet_names
+            hint = f" Листы в файле: {available}."
+        except Exception:
+            hint = ""
+        raise ChpdDataError(
+            f"Не удалось прочитать файл {file_path} (лист {SHEET_NAME!r}): {exc}.{hint}"
+        ) from exc
 
     # Восстанавливаем даты merged-ячеек (forward fill по Unnamed-столбцам B:M).
     cols = data.columns.to_frame()
@@ -193,16 +268,17 @@ def build_report(file_path: Path) -> pd.DataFrame:
     # Удаляем полностью пустые строки (разделитель между Активами и Пассивами).
     df_clean = df.dropna(how="all")
 
-    index_paths_trimmed = INDEX_PATHS[: len(df_clean)]
-    if len(index_paths_trimmed) != len(df_clean):
-        logger.warning(
-            "INDEX_PATHS (%d) != строк в df_clean (%d). Проверьте INDEX_PATHS или структуру листа.",
-            len(index_paths_trimmed), len(df_clean),
-        )
-
     result = build_long(df_clean, brief=True)
-    if result.empty:
-        raise ChpdDataError("Итоговый DataFrame пуст — не найдено ни одной строки данных.")
+
+    # Пусто либо все значения NaN — типично для выгрузок из куба, где числа
+    # остались формулами без сохранённого результата (см. common/excel_io).
+    # Молча отдать CSV из пустых value нельзя. Строки с одними NaN к этому
+    # моменту уже могли отсеяться в dropna выше, поэтому проверяем оба случая.
+    if result.empty or result["value"].notna().sum() == 0:
+        explanation = excel_io.describe_uncached_formulas(file_path, SHEET_NAME)
+        raise ChpdDataError(
+            explanation or "Итоговый DataFrame пуст — не найдено ни одной строки данных."
+        )
 
     logger.info("Обработано строк входа: %d, строк на выходе: %d", len(df_clean), len(result))
     return result

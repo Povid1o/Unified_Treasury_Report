@@ -15,6 +15,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("balance_struct", BASE_DIR / "logs")
@@ -221,7 +222,12 @@ def read_raw_file(file_path: Path, sheet_name: Any = 0) -> pd.DataFrame:
     ... млрд" и обрезает всё, что выше и левее неё, затем собирает заголовки.
     """
     try:
-        raw = pd.read_excel(file_path, header=None, sheet_name=sheet_name)
+        # read_matrix вместо pd.read_excel: разворачивает объединённые ячейки
+        # (иначе якорь и названия статей из выгрузок кубов не находятся) и
+        # объясняет ситуацию с формулами без кэша. См. common/excel_io.
+        raw = excel_io.read_matrix(file_path, sheet_name=sheet_name, logger=logger)
+    except excel_io.ExcelSourceError as exc:
+        raise BalanceStructError(str(exc)) from exc
     except Exception as exc:
         raise BalanceStructError(f"Не удалось прочитать файл {file_path} (лист {sheet_name!r}): {exc}") from exc
 
@@ -385,6 +391,17 @@ def build_report(file_path: Path) -> pd.DataFrame:
 
     cleaned_df = apply_cleaning(raw_df, drop_row_names=DROP_ROW_NAMES)
     parsed = parse_raw_rows(cleaned_df, name_map=name_map, cols_nversion_zero=COLS_NVERSION_ZERO)
+
+    # Ни одной строки со значением — типично для выгрузок из куба, где числа
+    # остались формулами без сохранённого результата (см. common/excel_io).
+    # Без этой проверки enrich_df падал с невнятным KeyError: 'date_'.
+    if parsed.empty or parsed["value"].isna().all():
+        explanation = excel_io.describe_uncached_formulas(file_path, SHEET_NAME)
+        raise BalanceStructError(
+            explanation
+            or f"В файле {file_path.name} найден якорь таблицы, но все значения пусты."
+        )
+
     final_df = enrich_df(parsed, PRECISION)
 
     final_df = drop_exact_duplicates(final_df)
