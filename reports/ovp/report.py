@@ -36,17 +36,21 @@ class OvpReport(Report):
             help="Пути к нескольким исходным Excel-файлам — пакетный запуск (см. --combine)",
         )
         parser.add_argument(
+            "--sheet", default=None,
+            help="Лист для обработки; обязателен, если в книге несколько листов",
+        )
+        parser.add_argument(
             "--output", default=None,
             help="Путь для сохранения CSV (по умолчанию — output/ovp/<имя файла>_converted.csv)",
         )
         parser.add_argument(
             "--full-history", nargs="*", default=[], metavar="CURRENCY",
-            help="Валютные листы, для которых нужно выгрузить все найденные даты "
-                 "(по умолчанию для всех листов берётся только последняя дата)",
+            help="Валютные листы старого формата, для которых нужно выгрузить все найденные даты "
+                 "(новый сводный формат содержит одну дату из заголовка)",
         )
         parser.add_argument(
             "--currencies", nargs="*", default=None, metavar="CURRENCY",
-            help="Ограничить обработку конкретными листами (по умолчанию — все, кроме СВОД)",
+            help="Ограничить обработку конкретными валютами (по умолчанию — все)",
         )
         parser.add_argument(
             "--combine", action="store_true",
@@ -60,11 +64,15 @@ class OvpReport(Report):
         if args.output and not args.combine and len(input_paths) > 1:
             ui.warning("--output задан без --combine при нескольких файлах — используются имена по умолчанию для каждого файла.")
 
+        sheets_by_input = getattr(args, "sheets_by_input", {})
+
         def build_one(path: Path):
+            selected_sheet = sheets_by_input.get(str(path), getattr(args, "sheet", None))
             return etl.convert_ovp_report(
                 input_path=path,
                 full_history_currencies=args.full_history,
                 currencies=args.currencies,
+                sheet_name=selected_sheet,
             )
 
         batch.run_batch(
@@ -78,9 +86,14 @@ class OvpReport(Report):
 
     def collect_interactive_args(self) -> Optional[argparse.Namespace]:
         paths = file_discovery.prompt_for_multiple_files(config.OVP_SOURCE)
+        sheets_by_input = {
+            str(path): _select_sheet(path, etl.list_sheets(path))
+            for path in paths
+        }
 
         full_history_str = ui.ask(
-            "Для каких валют выгрузить ВСЕ даты, через запятую (Enter = только последняя дата для всех)"
+            "Для каких валют старого формата выгрузить ВСЕ даты, через запятую "
+            "(Enter = дата из заголовка нового формата или последняя дата старого)"
         )
         full_history = [c.strip() for c in full_history_str.split(",") if c.strip()] if full_history_str else []
 
@@ -91,6 +104,7 @@ class OvpReport(Report):
         return argparse.Namespace(
             date=None, dates=None,
             input=None, inputs=[str(p) for p in paths], output=None,
+            sheet=None, sheets_by_input=sheets_by_input,
             full_history=full_history, currencies=None, combine=combine,
         )
 
@@ -114,6 +128,32 @@ def _parse_date(date_str: str):
         return datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError(f"Некорректный формат даты '{date_str}', ожидается YYYY-MM-DD") from exc
+
+
+def _select_sheet(input_path: Path, sheets: List[str]) -> str:
+    """Автоматически выбирает единственный лист или спрашивает пользователя."""
+    if not sheets:
+        raise etl.OvpDataError(f"В файле {Path(input_path).name} нет листов.")
+    if len(sheets) == 1:
+        ui.console.print(
+            f"[grey70]{Path(input_path).name}: найден один лист "
+            f"[bold]{sheets[0]}[/bold] — выбран автоматически.[/grey70]"
+        )
+        return sheets[0]
+
+    ui.console.print(f"В файле [bold]{Path(input_path).name}[/bold] найдено несколько листов:")
+    for index, name in enumerate(sheets, start=1):
+        ui.console.print(f"  [bold yellow]{index}[/bold yellow]. {name}")
+
+    while True:
+        choice = ui.ask("Выберите лист (номер или точное название)")
+        if choice.isdigit():
+            index = int(choice) - 1
+            if 0 <= index < len(sheets):
+                return sheets[index]
+        elif choice in sheets:
+            return choice
+        ui.warning("Некорректный выбор листа, попробуйте снова.")
 
 
 def _default_output_path(input_path: Path) -> Path:

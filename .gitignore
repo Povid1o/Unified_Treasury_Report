@@ -11,3 +11,4 @@ venv/
 # Логи и локальные артефакты запуска
 logs/
 output/
+excel_ofz/dist/

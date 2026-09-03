@@ -39,6 +39,10 @@ python console.py ofz-rates --date-from 2026-06-01 --date-to 2026-06-10   # ин
 python console.py ofz-rates --dates 2026-06-01,2026-06-15,2026-07-01      # список конкретных (не обязательно смежных) дат
 ```
 
+Если корпоративный файрвол не пропускает запросы из Python, тот же отчёт можно
+собрать прямо в Excel — запросы уйдут из процесса Excel (нужен Excel под Windows): см.
+[excel_ofz/README.md](excel_ofz/README.md).
+
 ### Файловые отчёты (ОВП, Структура баланса, ЧПД, NIM)
 
 ```bash
@@ -88,6 +92,7 @@ python console.py transfert-stavka --short-date 2026-03-17 --long-date 2026-04-3
   - `reports/chpd/` — «ЧПД» (разбор Excel «ЧПД YYYY MM DD», лист Table).
   - `reports/nim/` — «NIM» (разбор Excel «NIM_YYYY_MM» по текстовым маркерам).
   - `reports/transfert_stavka/` — «Трансфертные ставки» (два файла: короткие + длинные сроки).
+- `excel_ofz/` — автономная Excel-версия отчёта «Ставки ОФЗ» (VBA ходит в CBonds API напрямую, без Python).
 - `console.py` — точка входа: реестр отчётов + меню/CLI.
 - `output/<report_slug>/` — результаты запусков (для файловых отчётов путь берётся из `config.py`).
 - `logs/` — логи запусков (по одному файлу на отчёт).
