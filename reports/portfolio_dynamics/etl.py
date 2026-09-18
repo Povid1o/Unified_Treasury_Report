@@ -31,7 +31,7 @@ import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
-logger = get_logger("portfolio_dynamics", BASE_DIR / "logs")
+logger = get_logger("portfolio_dynamics")
 
 
 class PortfolioDynamicsError(RuntimeError):

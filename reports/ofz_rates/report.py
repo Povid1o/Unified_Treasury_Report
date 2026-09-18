@@ -8,6 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import List, Optional
 
+import config
 from common import ui
 from reports.base import Report
 from reports.ofz_rates import etl
@@ -35,8 +36,9 @@ class OfzRatesReport(Report):
             help="Дата, на которую формируется отчёт (YYYY-MM-DD, вместе с --lookback-days). По умолчанию — сегодня.",
         )
         parser.add_argument(
-            "--lookback-days", type=int, default=etl.LOOKBACK_DAYS,
-            help=f"Глубина истории в календарных днях назад от --date (по умолчанию {etl.LOOKBACK_DAYS}).",
+            "--lookback-days", type=int, default=None,
+            help="Глубина истории в календарных днях назад от --date "
+                 "(по умолчанию — из настроек, «Ставки ОФЗ» -> «Глубина истории»).",
         )
         parser.add_argument("--date-from", type=str, default=None, help="Начало интервала (YYYY-MM-DD)")
         parser.add_argument("--date-to", type=str, default=None, help="Конец интервала (YYYY-MM-DD)")
@@ -46,11 +48,12 @@ class OfzRatesReport(Report):
         )
         parser.add_argument(
             "--output", type=str, default=None,
-            help=f"Путь для сохранения CSV (по умолчанию {etl.OUTPUT_PATH}).",
+            help="Путь для сохранения CSV (по умолчанию — из настроек, "
+                 "«Ставки ОФЗ» -> «Файл результата»).",
         )
 
     def run(self, args: argparse.Namespace) -> None:
-        output_path = Path(args.output) if args.output else etl.OUTPUT_PATH
+        output_path = Path(args.output) if args.output else etl.output_path_default()
 
         if getattr(args, "dates", None):
             df = etl.build_report(dates=_parse_date_list(args.dates))
@@ -75,7 +78,7 @@ class OfzRatesReport(Report):
             date_from = _parse_date(ui.ask("Начало интервала (YYYY-MM-DD)"))
             date_to = _parse_date(ui.ask("Конец интервала (YYYY-MM-DD)"))
             return argparse.Namespace(
-                date=None, lookback_days=etl.LOOKBACK_DAYS,
+                date=None, lookback_days=etl.lookback_days_default(),
                 date_from=date_from.isoformat(), date_to=date_to.isoformat(),
                 dates=None, output=None,
             )
@@ -84,14 +87,14 @@ class OfzRatesReport(Report):
             dates_str = ui.ask("Даты через запятую (YYYY-MM-DD,YYYY-MM-DD,...)")
             _parse_date_list(dates_str)  # валидируем сразу, чтобы не тратить время на спиннер впустую
             return argparse.Namespace(
-                date=None, lookback_days=etl.LOOKBACK_DAYS,
+                date=None, lookback_days=etl.lookback_days_default(),
                 date_from=None, date_to=None, dates=dates_str, output=None,
             )
 
         date_str = ui.ask("Дата отчёта YYYY-MM-DD (Enter = сегодня)")
         if date_str:
             _parse_date(date_str)
-        lookback_str = ui.ask("Глубина истории в днях", default=str(etl.LOOKBACK_DAYS))
+        lookback_str = ui.ask("Глубина истории в днях", default=str(etl.lookback_days_default()))
         return argparse.Namespace(
             date=date_str or None, lookback_days=int(lookback_str),
             date_from=None, date_to=None, dates=None, output=None,

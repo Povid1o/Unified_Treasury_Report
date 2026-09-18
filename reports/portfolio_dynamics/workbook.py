@@ -39,7 +39,7 @@ from reports.portfolio_dynamics.etl import (  # noqa: E402
     PortfolioDynamicsData, PortfolioDynamicsError,
 )
 
-logger = get_logger("portfolio_dynamics", BASE_DIR / "logs")
+logger = get_logger("portfolio_dynamics")
 
 FONT = "Arial"
 F_BASE = Font(name=FONT, size=10)
@@ -71,7 +71,6 @@ FMT_DUR = "0.00"
 FMT_DATE = "YYYY-MM-DD"
 
 UNIT = "млн RUB"
-TOL = config.PORTFOLIO_DYNAMICS_TOLERANCE
 
 SCHEMA = {
     "dim_portfolio": [
@@ -606,9 +605,10 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     for word, fill in (("ЗЕЛЁНАЯ", FILL_GREEN), ("ЖЁЛТАЯ", FILL_YELLOW),
                        ("КРАСНАЯ", FILL_RED), ("ПРЕВЫШЕНИЕ", FILL_BREACH)):
         ws.conditional_formatting.add(zone_rng, CellIsRule(operator="equal", formula=['"%s"' % word], fill=fill))
+    tol = config.PORTFOLIO_DYNAMICS_TOLERANCE
     diff_rng = "I%d:I%d" % (TFIRST, TOT)
-    ws.conditional_formatting.add(diff_rng, CellIsRule(operator="greaterThan", formula=[str(TOL)], fill=FILL_RED))
-    ws.conditional_formatting.add(diff_rng, CellIsRule(operator="lessThan", formula=[str(-TOL)], fill=FILL_RED))
+    ws.conditional_formatting.add(diff_rng, CellIsRule(operator="greaterThan", formula=[str(tol)], fill=FILL_RED))
+    ws.conditional_formatting.add(diff_rng, CellIsRule(operator="lessThan", formula=[str(-tol)], fill=FILL_RED))
     ws.protection.sheet = True
     ws.protection.selectLockedCells = False
 
@@ -672,7 +672,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
          "=COUNTA({c})-COUNTA({n})".format(c=S_CODE, n=S_NOTE), "справочно, следить за ростом",
          "=\"OK\""),
         ("CHK_16", "Расхождение свода портфелей и объёма типа выше порога",
-         "=COUNTIF({d},\">%s\")+COUNTIF({d},\"<-%s\")".format(d=BT_DIFF) % (TOL, TOL),
+         "=COUNTIF({d},\">%s\")+COUNTIF({d},\"<-%s\")".format(d=BT_DIFF) % (tol, tol),
          "ровно 0 (порог 0.5%)", "=IF($C{r}=0,\"OK\",\"FAIL\")"),
         ("CHK_17", "Типы в dim_portfolio, для которых нет лимита в fact_limit",
          "=SUMPRODUCT((%s<>\"\")*(COUNTIFS(%s,%s&\"\")=0))" % (D_TYPE, L_TYPE, D_TYPE),
@@ -765,6 +765,7 @@ def evaluate_checks(data: PortfolioDynamicsData) -> List[Tuple[str, str, Any]]:
     единственный способ сказать в консоли «столько-то FAIL» — посчитать то же
     самое на данных. Список и семантика проверок обязаны совпадать с листом.
     """
+    tol = config.PORTFOLIO_DYNAMICS_TOLERANCE
     hist = data.fact_type_daily
     snap = data.fact_portfolio_snapshot
     dim = data.dim_portfolio
@@ -854,8 +855,8 @@ def evaluate_checks(data: PortfolioDynamicsData) -> List[Tuple[str, str, Any]]:
         ("CHK_13", "OK" if _positive("volume_t7") == 0 else "FAIL", _positive("volume_t7")),
         ("CHK_14", "OK" if _positive("duration_current_yrs") == 0 else "FAIL", _positive("duration_current_yrs")),
         ("CHK_15", "OK", 0 if snap.empty else int(len(snap) - snap["note_text"].notna().sum())),
-        ("CHK_16", "OK" if all(abs(d) <= TOL for d in diffs) else "FAIL",
-         sum(abs(d) > TOL for d in diffs)),
+        ("CHK_16", "OK" if all(abs(d) <= tol for d in diffs) else "FAIL",
+         sum(abs(d) > tol for d in diffs)),
         ("CHK_17", "OK" if all(str(t) in types for t in dim["portfolio_type"].dropna()) else "FAIL",
          sum(str(t) not in types for t in dim["portfolio_type"].dropna()) if not dim.empty else 0),
         ("CHK_18", "OK" if len(types) == len(set(types)) else "FAIL", len(types) - len(set(types))),

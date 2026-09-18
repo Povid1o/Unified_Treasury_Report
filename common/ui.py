@@ -21,13 +21,18 @@ def print_header() -> None:
     console.print(Panel.fit(f"[bold cyan]{APP_TITLE}[/bold cyan]", border_style="cyan", padding=(0, 2)))
 
 
-def print_menu(reports: Sequence) -> None:
+def print_menu(reports: Sequence, extra_rows: Sequence = ()) -> None:
+    """Меню: отчёты, затем extra_rows — пункты, которые отчётами не являются
+    (например «Настройки»: это диалог, а не загрузка, спиннером его не обернуть).
+    extra_rows — последовательность кортежей (номер, название, описание)."""
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold cyan", border_style="grey50")
     table.add_column("#", justify="right", style="bold yellow", no_wrap=True)
     table.add_column("Отчёт", style="bold white", no_wrap=True)
     table.add_column("Описание", style="grey70")
     for i, r in enumerate(reports, start=1):
         table.add_row(str(i), r.title, r.description)
+    for number, title, description in extra_rows:
+        table.add_row(str(number), f"[cyan]{title}[/cyan]", description)
     table.add_row("0", "[red]Выход[/red]", "")
     console.print(table)
 

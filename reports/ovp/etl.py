@@ -16,7 +16,7 @@ sys.path.insert(0, str(BASE_DIR))
 from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
-logger = get_logger("ovp", BASE_DIR / "logs")
+logger = get_logger("ovp")
 
 # Словарь иерархии категорий/подкатегорий отчёта ОВП (форма 634 и управленческие формы).
 HIERARCHY: Dict[str, List[str]] = {

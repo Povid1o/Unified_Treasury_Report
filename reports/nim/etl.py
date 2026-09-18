@@ -18,7 +18,7 @@ sys.path.insert(0, str(BASE_DIR))
 from common import excel_io  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
-logger = get_logger("nim", BASE_DIR / "logs")
+logger = get_logger("nim")
 
 MARKER_OSNOVA = "NIM - ОСНОВА"
 MARKER_RUR = "NIM - RUR"

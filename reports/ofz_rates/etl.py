@@ -11,23 +11,34 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+import config  # noqa: E402
+
 # .env лежит внутри перенесённой библиотеки (CBonds_API/.env). Загружаем его явно,
 # не полагаясь на автопоиск python-dotenv внутри cbonds_api_test.py, чтобы
-# скрипт работал независимо от того, откуда его запускают.
-load_dotenv(BASE_DIR / "CBonds_API" / ".env")
+# скрипт работал независимо от того, откуда его запускают. Путь настраивается
+# (Настройки -> Ставки ОФЗ), но сами логин и пароль остаются в .env.
+load_dotenv(config.CBONDS_ENV_PATH)
 
 from CBonds_API.cbonds_api_test import AVAILABLE_INDICES, CBondsAPI  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
-logger = get_logger("ofz_rates", BASE_DIR / "logs")
+logger = get_logger("ofz_rates")
 
 # ── Конфигурация отчёта ──────────────────────────────────────────────────────
-OUTPUT_PATH = BASE_DIR / "output" / "ofz_rates" / "ofz_report.csv"
-
+# Путь результата и глубина истории настраиваются (Настройки -> Ставки ОФЗ),
+# поэтому читаются функциями, а не захватываются в константы при импорте:
+# иначе правка настроек применялась бы только после перезапуска консоли.
 # Глубина архива для get_index_value_new у демо-подписки CBonds ограничена
-# 100 календарными днями (см. CBonds_API/README.md, раздел "Ограничения").
-# Берём немного меньше, с запасом под задержку публикации данных.
-LOOKBACK_DAYS = 90
+# 100 календарными днями (см. CBonds_API/README.md, раздел "Ограничения"),
+# поэтому по умолчанию берётся 90 — с запасом под задержку публикации данных.
+
+
+def output_path_default() -> Path:
+    return Path(config.OFZ_OUTPUT_PATH)
+
+
+def lookback_days_default() -> int:
+    return int(config.OFZ_LOOKBACK_DAYS)
 
 # Сроки кривой доходности ОФЗ, которые нужно выгрузить для группы
 # "Доходность ОФЗ" (пример из ТЗ по структуре BI).
@@ -89,7 +100,7 @@ def build_api_client() -> CBondsAPI:
     except ValueError as exc:
         raise OfzDataError(
             f"Не удалось инициализировать CBondsAPI: {exc}. "
-            f"Проверьте файл {BASE_DIR / 'CBonds_API' / '.env'}."
+            f"Проверьте файл {config.CBONDS_ENV_PATH}."
         ) from exc
 
 
@@ -210,7 +221,7 @@ def validate_bi_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 # ── Оркестрация ETL ──────────────────────────────────────────────────────────
 def build_report(
     as_of_date: Optional[date] = None,
-    lookback_days: int = LOOKBACK_DAYS,
+    lookback_days: Optional[int] = None,
     date_from: Optional[date] = None,
     date_to: Optional[date] = None,
     dates: Optional[List[date]] = None,
@@ -239,7 +250,7 @@ def build_report(
         range_from, range_to = date_from, date_to
     else:
         as_of_date = as_of_date or date.today()
-        range_from = as_of_date - timedelta(days=lookback_days)
+        range_from = as_of_date - timedelta(days=lookback_days or lookback_days_default())
         range_to = as_of_date
 
     span_days = (range_to - range_from).days
@@ -275,9 +286,9 @@ def build_report(
     return df
 
 
-def save_report(df: pd.DataFrame, output_path: Path = OUTPUT_PATH) -> Path:
+def save_report(df: pd.DataFrame, output_path: Optional[Path] = None) -> Path:
     """Сохраняет готовый к загрузке в BI DataFrame в CSV."""
-    output_path = Path(output_path)
+    output_path = Path(output_path) if output_path is not None else output_path_default()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
     logger.info("Отчёт сохранён: %s", output_path)
