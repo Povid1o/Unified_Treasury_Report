@@ -89,10 +89,11 @@ def find_date_folders(source: SourceConfig) -> List[DateFolder]:
     Пустые папки тоже возвращаются (их заранее создаёт «Создать папки по датам»),
     поэтому вызывающий код сам решает, что считать папкой «с данными».
     """
-    if not source.uses_date_folders:
+    if not source.uses_date_folders or not source.directory.is_dir():
+        # Папки может не быть вовсе — например, при первом запуске, когда файлы
+        # ещё лежат в загрузках. Это не ошибка: подпапок просто нет, а нужную
+        # создаст приёмка (см. reports/portfolio_dynamics/inbox.py).
         return []
-    if not source.directory.exists():
-        raise SourceFileError(f"[{source.label}] Папка с исходными файлами не найдена: {source.directory}")
 
     folders: List[DateFolder] = []
     for entry in source.directory.iterdir():
@@ -221,9 +222,28 @@ def resolve_file_for_date(source: SourceConfig, target_date: date) -> Path:
 
 
 def _not_found_message(source: SourceConfig) -> str:
+    """Почему в папке ничего не нашлось — с примерами того, что в ней лежит.
+
+    «Не найдено файлов, подходящих под шаблон» без единого примера не отвечает
+    на главный вопрос: папка пуста или имена не те? Поэтому сюда же идут первые
+    несколько имён из папки — по ним расхождение с шаблоном видно сразу.
+    """
     if source.uses_mtime:
-        return f"[{source.label}] В папке {source.directory} не найдено файлов по шаблону {source.glob_pattern!r}."
-    return f"[{source.label}] В папке {source.directory} не найдено файлов, подходящих под шаблон {source.filename_regex!r}."
+        head = f"[{source.label}] В папке {source.directory} не найдено файлов по шаблону {source.glob_pattern!r}."
+    else:
+        head = (f"[{source.label}] В папке {source.directory} не найдено файлов, "
+                f"подходящих под шаблон {source.filename_regex!r}.")
+
+    try:
+        present = sorted(f.name for f in source.directory.glob(source.glob_pattern)
+                         if f.is_file() and not f.name.startswith("~$"))
+    except OSError:
+        return head
+    if not present:
+        return f"{head} Файлов в папке нет вовсе."
+    shown = ", ".join(present[:5]) + (" …" if len(present) > 5 else "")
+    return (f"{head} Файлы в папке есть ({len(present)}), но под шаблон не подходят: {shown}. "
+            "Поправьте шаблон в настройках либо переименуйте файлы.")
 
 
 def _file_table(source: SourceConfig, top: List[Tuple[date, Path]], total: int) -> Table:
@@ -288,7 +308,9 @@ def _resolve_token(
 
 
 def _prompt_manual_path(source: SourceConfig, reason: str) -> Path:
-    ui.warning(f"[{source.label}] {reason}")
+    # reason приходит из _not_found_message/SourceFileError, а там метка
+    # источника уже есть — второй раз не добавляем.
+    ui.warning(reason)
     raw = ui.ask(f"[{source.label}] Введите путь к файлу вручную")
     if not raw:
         raise SourceFileError(f"[{source.label}] Путь к файлу не указан.")
@@ -296,7 +318,7 @@ def _prompt_manual_path(source: SourceConfig, reason: str) -> Path:
 
 
 def _prompt_manual_paths(source: SourceConfig, reason: str) -> List[Path]:
-    ui.warning(f"[{source.label}] {reason}")
+    ui.warning(reason)
     raw = ui.ask(f"[{source.label}] Введите путь(и) к файлу через запятую вручную")
     paths = [Path(p.strip().strip('"')) for p in raw.split(",") if p.strip()]
     if not paths:

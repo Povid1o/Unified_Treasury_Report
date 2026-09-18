@@ -284,6 +284,61 @@ class ArchiveOwnDateTests(InboxTestCase):
         self.assertEqual(self.names("2026-09-11"), [export_name("11.09.2026")])
 
 
+class ColdStartTests(InboxTestCase):
+    """Первый запуск: папки исходных файлов ещё нет, всё лежит в загрузках."""
+
+    def test_works_when_the_source_folder_does_not_exist_yet(self):
+        import shutil
+        shutil.rmtree(self.data)
+        self.download("18.09.2026")
+        self.download("11.09.2026")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertTrue(self.data.is_dir(), "папка исходных файлов должна создаться сама")
+        self.assertEqual(t0.parent.name, "2026-09-18")
+        self.assertIn("[11.09.2026]", t7.name)
+
+    def test_missing_source_folder_is_not_an_error_for_folder_scan(self):
+        """Раньше отсутствие папки роняло запуск раньше, чем доходило до загрузок."""
+        import shutil
+        from common import file_discovery
+        shutil.rmtree(self.data)
+
+        self.assertEqual(file_discovery.find_date_folders(self.source), [])
+        self.assertIsNone(file_discovery.latest_folder_with_data(self.source, min_files=2))
+
+    def test_error_message_names_both_places_and_the_way_out(self):
+        message = pd_report._nothing_found_message(self.source)
+
+        self.assertIn(str(self.data), message)
+        self.assertIn(str(self.downloads), message)
+        self.assertIn("--diagnose", message)
+        self.assertIn("settings --set", message)
+
+    def test_files_present_but_named_wrong_are_reported(self):
+        """Самый частый сюрприз: «файлы же на месте» — а имена не по шаблону."""
+        from common.file_discovery import _not_found_message
+        (self.data / "Позиция_18_09_2026.xlsx").write_bytes(b"x")
+        (self.data / "Позиция_11_09_2026.xlsx").write_bytes(b"x")
+
+        message = _not_found_message(self.source)
+
+        self.assertIn("Файлы в папке есть (2)", message)
+        self.assertIn("Позиция_18_09_2026.xlsx", message)
+
+    def test_empty_folder_says_so_explicitly(self):
+        from common.file_discovery import _not_found_message
+        self.assertIn("Файлов в папке нет вовсе", _not_found_message(self.source))
+
+    def test_error_message_reports_how_many_files_matched(self):
+        self.download("18.09.2026")  # один подходящий, пары не хватает
+        (self.downloads / "посторонний.xlsx").write_bytes(b"x")
+
+        message = pd_report._nothing_found_message(self.source)
+        self.assertIn("подходящих выгрузок: 1", message)
+
+
 class AvailableDatesTests(InboxTestCase):
     def test_dates_from_folders_and_downloads_are_merged(self):
         self.in_folder("2026-09-11", "04.09.2026")

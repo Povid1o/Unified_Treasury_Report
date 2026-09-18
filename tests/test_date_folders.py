@@ -42,12 +42,17 @@ class DateFolderTestCase(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.data = self.tmp / "data"
         self.data.mkdir()
+        self.downloads = self.tmp / "downloads"
+        self.downloads.mkdir()
 
         self._saved_env = os.environ.get(settings.SETTINGS_FILE_ENV)
         settings_file = self.tmp / "settings.json"
+        # downloads_dir тоже переопределяем: иначе тест зависел бы от того, что
+        # лежит в реальной папке загрузок того, кто его запускает.
         settings_file.write_text(json.dumps({
             "portfolio_dynamics_dir": str(self.data),
             "portfolio_dynamics_output_dir": str(self.tmp / "out"),
+            "downloads_dir": str(self.downloads),
         }), encoding="utf-8")
         os.environ[settings.SETTINGS_FILE_ENV] = str(settings_file)
         config.reload()
@@ -72,6 +77,7 @@ class DateFolderTestCase(unittest.TestCase):
 
     def no_args(self) -> argparse.Namespace:
         return argparse.Namespace(t0_input=None, t7_input=None, folder=None,
+                                  date=None, no_import=False, diagnose=False,
                                   t0_date=None, t7_date=None)
 
 
@@ -273,12 +279,31 @@ class ReportResolutionTests(DateFolderTestCase):
         self.assertIn("18.09.2026", t0.name)
         self.assertIn("11.09.2026", t7.name)
 
-    def test_single_file_says_what_to_do(self):
+    def test_single_file_says_where_it_looked(self):
         write_export(self.data / export_name("18.09.2026"), slice_rows(30, 60),
                      period_end="18.09.2026")
 
-        with self.assertRaisesRegex(etl.PortfolioDynamicsError, "Создать папки по датам"):
+        with self.assertRaises(etl.PortfolioDynamicsError) as caught:
             pd_report._resolve_slice_paths(self.no_args())
+
+        message = str(caught.exception)
+        self.assertIn(str(self.data), message)
+        self.assertIn(str(self.downloads), message)
+        self.assertIn("--diagnose", message)
+
+    def test_flat_layout_is_found_by_the_interactive_path_too(self):
+        """Интерактив идёт тем же путём разрешения, что и CLI, — иначе он бы
+        не увидел плоскую раскладку, которую CLI находит."""
+        for period_end in ("11.09.2026", "18.09.2026"):
+            write_export(self.data / export_name(period_end), slice_rows(30, 60),
+                         period_end=period_end)
+
+        args = self.no_args()
+        args.date = None
+        t0, t7 = pd_report._resolve_slice_paths(args)
+
+        self.assertIn("[18.09.2026]", t0.name)
+        self.assertIn("[11.09.2026]", t7.name)
 
     def test_one_explicit_input_without_the_other_is_rejected(self):
         args = self.no_args()

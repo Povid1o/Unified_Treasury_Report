@@ -212,5 +212,26 @@ class CheckPathsTests(SettingsTestCase):
         self.assertEqual(status.files, 0)
 
 
+class ConsoleMessageTests(unittest.TestCase):
+    """Сообщения консоли не должны терять данные из-за разметки rich."""
+
+    def test_brackets_and_backslashes_survive(self):
+        import io
+        from common import ui
+
+        text = (r"Шаблон \[\d{2}\.\d{4}\] и файл "
+                "«Позиция за период [01.01.2026] - [18.09.2026].xlsx»")
+        for emit in (ui.error, ui.warning, ui.success, ui.cancelled):
+            with self.subTest(emit=emit.__name__):
+                buffer, saved_file = io.StringIO(), ui.console.file
+                saved_width = ui.console.width
+                ui.console.file, ui.console.width = buffer, 300
+                try:
+                    emit(text)
+                finally:
+                    ui.console.file, ui.console.width = saved_file, saved_width
+                self.assertIn(text, buffer.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

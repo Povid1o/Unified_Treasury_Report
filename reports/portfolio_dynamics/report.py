@@ -31,6 +31,7 @@ from typing import Optional
 
 from rich import box
 from rich.table import Table
+from rich.text import Text
 
 import config
 from common import file_discovery, ui
@@ -79,8 +80,17 @@ class PortfolioDynamicsReport(Report):
                  "лимиты — нулевые (заполняются руками).",
         )
         parser.add_argument("--output", type=str, default=None, help="Путь для сохранения .xlsx")
+        parser.add_argument(
+            "--diagnose", action="store_true",
+            help="Ничего не считать: показать, какие папки и файлы отчёт видит и почему "
+                 "не находит данные.",
+        )
 
     def run(self, args: argparse.Namespace) -> None:
+        if getattr(args, "diagnose", False):
+            diagnose(args)
+            return
+
         t0_path, t7_path = _resolve_slice_paths(args)
         if t0_path == t7_path:
             raise etl.PortfolioDynamicsError(
@@ -113,24 +123,36 @@ class PortfolioDynamicsReport(Report):
     def collect_interactive_args(self) -> Optional[argparse.Namespace]:
         source = config.PORTFOLIO_DYNAMICS_T0_SOURCE
         no_import = not config.PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS
-        probe = argparse.Namespace(no_import=no_import)
+        probe = argparse.Namespace(no_import=no_import, t0_input=None, t7_input=None,
+                                   folder=None, date=None, t0_date=None, t7_date=None)
 
+        # Файлы поедут из загрузок уже здесь, до спиннера: это диалог, а не
+        # загрузка, и пользователь должен видеть, что куда переложили.
         target_date = _ask_for_date(probe)
-        if target_date is not None:
-            # Файлы поедут из загрузок уже здесь, до спиннера: это диалог,
-            # а не загрузка, и пользователь должен видеть, что куда переложили.
-            t0_path, t7_path = _from_date(target_date, probe)
-            ui.console.print(
-                f"[grey70]Дата [bold]{target_date.isoformat()}[/bold]: "
-                f"T0 = {t0_path.name}, T-7 = {t7_path.name}[/grey70]"
-            )
-        else:
-            # Ни папок с данными, ни подходящих файлов в загрузках — плоская
-            # раскладка, выбираем два файла руками, как раньше.
+        probe.date = target_date.isoformat() if target_date else None
+        try:
+            # Один и тот же путь разрешения, что и у CLI: спросить дату —
+            # единственное, что интерактив добавляет. Иначе интерактив не видел
+            # бы, например, плоской раскладки, которую CLI прекрасно находит.
+            t0_path, t7_path = _resolve_slice_paths(probe)
+        except etl.PortfolioDynamicsError as exc:
+            # Молча сваливаться в «выберите файл» нельзя: человек не узнает, ни
+            # где искали, ни почему не нашли, — сначала показываем разбор.
+            ui.warning(str(exc))
+            answer = ui.ask("Указать пути к двум файлам вручную? (y/N)", default="N")
+            if not answer.strip().lower().startswith("y"):
+                ui.cancelled("Отчёт не сформирован. Запустите "
+                             "«python console.py portfolio-dynamics --diagnose», "
+                             "чтобы увидеть, что именно видно отчёту.")
+                return None
             ui.console.print("[bold]Срез на сегодня (T0):[/bold]")
             t0_path = file_discovery.prompt_for_file(source)
             ui.console.print("[bold]Срез на T-7:[/bold]")
             t7_path = file_discovery.prompt_for_file(config.PORTFOLIO_DYNAMICS_T7_SOURCE)
+        else:
+            ui.console.print(
+                f"[grey70]T0 = {t0_path.name}, T-7 = {t7_path.name}[/grey70]"
+            )
 
         previous = etl.find_previous_release(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
         bootstrap = False
@@ -153,11 +175,141 @@ class PortfolioDynamicsReport(Report):
             ui.console.print(f"[grey70]Предыдущий выпуск: [bold]{previous.name}[/bold][/grey70]")
 
         return argparse.Namespace(
-            t0_input=str(t0_path), t7_input=str(t7_path), folder=None,
+            t0_input=str(t0_path), t7_input=str(t7_path), folder=None, diagnose=False,
             date=None, no_import=no_import, t0_date=None, t7_date=None,
             previous=str(previous) if previous is not None else None,
             bootstrap=bootstrap, output=None,
         )
+
+
+def diagnose(args: argparse.Namespace) -> None:
+    """Показывает, что отчёт видит: пути, папки-даты, содержимое загрузок.
+
+    Нужно ровно для одного вопроса — «почему не находит данные». Отвечает на
+    него по шагам: существуют ли папки, какие подпапки-даты есть и сколько в
+    них файлов, какие файлы в загрузках подошли под шаблон, а какие нет и
+    почему.
+    """
+    source = config.PORTFOLIO_DYNAMICS_T0_SOURCE
+    data_dir = Path(source.directory)
+    downloads = Path(config.DOWNLOADS_DIR)
+
+    def mark(path: Path) -> str:
+        return "[bold green]есть[/bold green]" if path.is_dir() else "[bold red]НЕ НАЙДЕНА[/bold red]"
+
+    ui.console.print()
+    ui.console.print("[bold]Пути[/bold]")
+    ui.console.print(f"  исходная папка : {data_dir}  {mark(data_dir)}")
+    ui.console.print(f"  папка загрузок : {downloads}  {mark(downloads)}")
+    ui.console.print(f"  папка выгрузки : {config.PORTFOLIO_DYNAMICS_OUTPUT_DIR}")
+    ui.console.print(f"  папки по датам : "
+                     f"{'включены' if source.uses_date_folders else 'выключены'}"
+                     f" (формат {config.DATE_FOLDER_FORMAT})")
+    ui.console.print(f"  приёмка из загрузок: "
+                     f"{'включена' if config.PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS else 'выключена'}"
+                     f", режим: {'перенос' if config.PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS else 'копирование'}")
+    ui.console.print(Text.assemble(
+        "  шаблон имени файла: ", (str(source.filename_regex), "grey70")))
+
+    folders = file_discovery.find_date_folders(source)
+    ui.console.print()
+    ui.console.print(f"[bold]Папки-даты в исходной папке: {len(folders)}[/bold]")
+    for folder in folders[:10]:
+        count = len(folder.files)
+        state = "[bold green]готова[/bold green]" if count >= 2 else (
+            "[yellow]не хватает файлов[/yellow]" if count else "[grey50]пусто[/grey50]")
+        ui.console.print(f"  {folder.path.name}  файлов: {count}  {state}")
+    if not folders:
+        ui.console.print("  [grey50]нет — их создаёт «Настройки» → «Создать папки по датам», "
+                         "либо приёмка из загрузок создаст нужную сама[/grey50]")
+
+    ui.console.print()
+    _print_loose_files(source, data_dir)
+
+    ui.console.print()
+    _print_downloads(source, downloads)
+
+    rows = _available_dates(args)
+    ui.console.print()
+    if rows:
+        ui.console.print(_dates_table(rows))
+        ui.console.print(f"[bold green]Запуск без аргументов возьмёт дату "
+                         f"{rows[0].date.isoformat()}.[/bold green]")
+    else:
+        ui.console.print("[bold red]Ни одной даты, на которую можно построить отчёт.[/bold red]")
+        ui.console.print("[grey70]Отчёту нужны ДВА файла: на отчётную дату и на более раннюю "
+                         "(T-7). Одного файла недостаточно.[/grey70]")
+
+
+def _print_loose_files(source: file_discovery.SourceConfig, data_dir: Path) -> None:
+    """Файлы, лежащие прямо в папке исходных файлов (не в подпапке-дате).
+
+    Самый частый повод удивиться: «файлы же на месте» — а имена не подходят под
+    шаблон, и отчёт их не видит. Вердикт по каждому отвечает на это сразу.
+    """
+    if not data_dir.is_dir():
+        return
+    loose = sorted(f for f in data_dir.glob(source.glob_pattern)
+                   if f.is_file() and not f.name.startswith("~$"))
+    if not loose:
+        return
+
+    matched = {c.path for c in _match_by_name(source, loose)}
+    ui.console.print(f"[bold]Файлы прямо в папке исходных файлов: {len(loose)}, "
+                     f"подошли под шаблон: {len(matched)}[/bold]")
+    for path in loose[:15]:
+        if path in matched:
+            ui.console.print(Text.assemble(("  ✓ ", "bold green"), path.name))
+        else:
+            ui.console.print(Text.assemble(
+                ("  ✗ ", "grey50"), (f"{path.name} — имя не подходит под шаблон", "grey50")))
+    if len(loose) > 15:
+        ui.console.print(f"  [grey50]… и ещё {len(loose) - 15}[/grey50]")
+
+
+def _match_by_name(source: file_discovery.SourceConfig, paths):
+    """Какие из файлов подходят под шаблон имени источника."""
+    import re
+    if not source.filename_regex:
+        return [inbox.Candidate(path=p, business_date=None) for p in paths]
+    pattern = re.compile(source.filename_regex)
+    found = []
+    for path in paths:
+        match = pattern.search(path.name)
+        if not match:
+            continue
+        try:
+            import datetime as _dt
+            parsed = _dt.datetime.strptime(match.group(1), source.date_format).date()
+        except ValueError:
+            continue
+        found.append(inbox.Candidate(path=path, business_date=parsed))
+    return found
+
+
+def _print_downloads(source: file_discovery.SourceConfig, downloads: Path) -> None:
+    """Список .xlsx в загрузках с вердиктом по каждому — подошёл под шаблон или нет."""
+    if not downloads.is_dir():
+        ui.console.print(f"[bold]Загрузки[/bold]: папка не найдена ({downloads})")
+        return
+
+    everything = sorted(f for f in downloads.glob("*.xlsx")
+                        if f.is_file() and not f.name.startswith("~$"))
+    matched = {c.path: c.business_date for c in inbox.scan_downloads(source, downloads)}
+    ui.console.print(f"[bold]Файлы .xlsx в загрузках: {len(everything)}, "
+                     f"подошли под шаблон: {len(matched)}[/bold]")
+    if not everything:
+        ui.console.print("  [grey50]пусто (ищется только верхний уровень папки, не подпапки)[/grey50]")
+    for path in everything[:15]:
+        if path in matched:
+            ui.console.print(Text.assemble(
+                ("  ✓ ", "bold green"), path.name,
+                (f"   дата среза: {matched[path].isoformat()}", "grey70")))
+        else:
+            ui.console.print(Text.assemble(
+                ("  ✗ ", "grey50"), (f"{path.name} — имя не подходит под шаблон", "grey50")))
+    if len(everything) > 15:
+        ui.console.print(f"  [grey50]… и ещё {len(everything) - 15}[/grey50]")
 
 
 def _dates_table(rows) -> Table:
@@ -325,15 +477,53 @@ def _two_latest_flat(source: file_discovery.SourceConfig) -> tuple:
     ещё не перешёл на папки-даты: раньше без аргументов оба источника отдавали
     ОДИН и тот же самый свежий файл, и запуск падал на проверке «срезы совпадают».
     """
-    found = file_discovery.find_dated_files(source)
+    try:
+        found = file_discovery.find_dated_files(source)
+    except file_discovery.SourceFileError:
+        found = []
     if len(found) < 2:
-        raise etl.PortfolioDynamicsError(
-            f"[{source.label}] В {source.directory} найдено файлов: {len(found)}, "
-            "а отчёту нужны два среза (T0 и T-7). Положите обе выгрузки в папку-дату "
-            "(«Настройки» -> «Создать папки по датам») или укажите файлы через "
-            "--t0-input/--t7-input."
-        )
+        raise etl.PortfolioDynamicsError(_nothing_found_message(source))
     return found[0][1], found[1][1]
+
+
+def _nothing_found_message(source: file_discovery.SourceConfig) -> str:
+    """Почему не нашлось ни одного среза — с проверкой обоих мест и что делать.
+
+    Самая частая причина при первом запуске — пути остались значениями по
+    умолчанию (сетевая папка Jupiter), поэтому текст показывает сами пути и
+    отвечает, существуют ли они: так опечатка и непримонтированный диск видны
+    сразу, а не после третьего запуска.
+    """
+    data_dir = Path(source.directory)
+    downloads = Path(config.DOWNLOADS_DIR)
+    import_on = config.PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS
+
+    def mark(path: Path) -> str:
+        return "есть" if path.is_dir() else "НЕ НАЙДЕНА"
+
+    lines = [
+        "Не нашлось двух срезов (T0 и T-7). Где искали:",
+        f"  исходная папка: {data_dir} — {mark(data_dir)}",
+    ]
+    if import_on:
+        matched = len(inbox.scan_downloads(source, downloads))
+        lines.append(
+            f"  загрузки:       {downloads} — {mark(downloads)}, "
+            f"подходящих выгрузок: {matched}"
+        )
+    else:
+        lines.append("  загрузки:       приёмка выключена настройкой "
+                     "«Забирать выгрузки из загрузок»")
+    lines += [
+        f"  шаблон имени:   {source.filename_regex}",
+        "",
+        "Что делать:",
+        "  python console.py portfolio-dynamics --diagnose   # показать, что именно видно",
+        '  python console.py settings --set portfolio_dynamics_dir="<путь>" '
+        'downloads_dir="<путь>"',
+        "  либо указать файлы напрямую: --t0-input <файл> --t7-input <файл>",
+    ]
+    return "\n".join(lines)
 
 
 def _resolve_by_date(source: file_discovery.SourceConfig, date_str: Optional[str]) -> Path:

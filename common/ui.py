@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 from rich.table import Table
 from rich import box
 
@@ -48,20 +49,29 @@ def spinner(message: str):
         yield status
 
 
+# Сообщения несут данные: пути, имена файлов, регулярные выражения. В них
+# сплошь и рядом квадратные скобки («Позиция за период [01.01.2026]») и
+# обратные слэши — если отдать такую строку на разбор разметки rich, часть
+# текста молча пропадёт. Поэтому текст добавляется как Text, без разметки:
+# оформляется только префикс.
+def _tagged(prefix: str, style: str, message: str, message_style: str = "") -> Text:
+    return Text.assemble((prefix, style), (message, message_style))
+
+
 def success(message: str) -> None:
-    console.print(f"[bold green]✓[/bold green] {message}")
+    console.print(_tagged("✓ ", "bold green", message))
 
 
 def error(message: str) -> None:
-    console.print(f"[bold red]✗ Ошибка:[/bold red] {message}")
+    console.print(_tagged("✗ Ошибка: ", "bold red", message))
 
 
 def warning(message: str) -> None:
-    console.print(f"[yellow]![/yellow] {message}")
+    console.print(_tagged("! ", "yellow", message))
 
 
 def cancelled(message: str = "Операция отменена пользователем.") -> None:
-    console.print(f"[yellow]⏹  {message}[/yellow]")
+    console.print(_tagged("⏹  ", "yellow", message, "yellow"))
 
 
 def ask(prompt: str, default: Optional[str] = None) -> str:
