@@ -256,6 +256,23 @@ python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx --boots
 - `output/<report_slug>/` — результаты запусков (для файловых отчётов путь берётся из `config.py`).
 - `logs/` — логи запусков (по одному файлу на отчёт).
 
+## Тесты
+
+```bash
+python -m unittest tests.test_ovp_etl tests.test_portfolio_dynamics_etl \
+    tests.test_settings tests.test_date_folders tests.test_inbox \
+    tests.test_workbook_formulas
+```
+
+`tests/test_workbook_formulas.py` проверяет выходной .xlsx на двух уровнях.
+Структурный работает всегда: ссылки формул ведут на существующие листы и
+именованные диапазоны, функции — только уровня Excel 2007, ref умных таблиц
+совпадает с данными. Вычислительный требует пакета `formulas`
+(`pip install formulas`, в requirements его нет намеренно — зависимость тяжёлая
+и нужна только для проверки): книга считается целиком, статусы листа `checks`
+сверяются с тем, что посчитал питон, и проверяется, что ни одна ячейка не даёт
+ошибку Excel. Без этого пакета вычислительные тесты помечаются как skipped.
+
 ## Добавление нового отчёта
 
 1. Создать `reports/<slug>/etl.py` с получением и преобразованием данных.
