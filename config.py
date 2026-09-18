@@ -85,3 +85,41 @@ TRANSFERT_LONG_SOURCE = SourceConfig(
     label="ТС свыше 3М",
 )
 TRANSFERT_OUTPUT_DIR = JUPITER_ROOT / "output" / "Transferta"
+
+# ── Динамика портфелей: ДВА среза одной и той же выгрузки (T0 и T-7) ──────
+# (путь — экстраполяция, см. предупреждение в начале файла)
+# Имена файлов вида "Позиция за период [01.01.2026] - [01.09.2026] - SECURITIES.xlsx".
+# В имени ДВЕ даты; отчётной считается ВТОРАЯ (конец периода выгрузки) — её и
+# захватывает единственная группа регулярки. Оба среза лежат в одной папке и
+# различаются только датой, поэтому источник один и тот же, а label разный —
+# он попадает в заголовки интерактивного выбора файла.
+PORTFOLIO_DYNAMICS_FILENAME_REGEX = r"\[\d{2}\.\d{2}\.\d{4}\]\s*-\s*\[(\d{2}\.\d{2}\.\d{4})\]"
+PORTFOLIO_DYNAMICS_DATE_FORMAT = "%d.%m.%Y"
+PORTFOLIO_DYNAMICS_DIR = JUPITER_ROOT / "data" / "PortfolioDynamics"
+
+PORTFOLIO_DYNAMICS_T0_SOURCE = SourceConfig(
+    directory=PORTFOLIO_DYNAMICS_DIR,
+    filename_regex=PORTFOLIO_DYNAMICS_FILENAME_REGEX,
+    date_format=PORTFOLIO_DYNAMICS_DATE_FORMAT,
+    label="Динамика портфелей T0",
+)
+PORTFOLIO_DYNAMICS_T7_SOURCE = SourceConfig(
+    directory=PORTFOLIO_DYNAMICS_DIR,
+    filename_regex=PORTFOLIO_DYNAMICS_FILENAME_REGEX,
+    date_format=PORTFOLIO_DYNAMICS_DATE_FORMAT,
+    label="Динамика портфелей T-7",
+)
+PORTFOLIO_DYNAMICS_OUTPUT_DIR = JUPITER_ROOT / "output" / "PortfolioDynamics"
+
+# Схема v3.0 требует млн RUB, а выгрузка отдаёт объёмы в рублях: делим на это
+# число. Если формат выгрузки изменится (тысячи, уже млн) — правится здесь, в
+# парсере масштаб не хардкодится.
+PORTFOLIO_DYNAMICS_VALUE_SCALE = 1_000_000
+
+# Порог сверки подытога в строке "Позиция: ..." с суммой по бумагам и сверки
+# грейнов на витрине (CHK_16). 0.5% — из CONTRACT.md.
+PORTFOLIO_DYNAMICS_TOLERANCE = 0.005
+
+# Сдвиг сравнения по умолчанию (календарных дней) — используется, если даты
+# срезов T0/T-7 определить не удалось. Обычно считается как разница их дат.
+PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK = 7

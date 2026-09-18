@@ -13,7 +13,8 @@ pip install -r requirements.txt
 Учётные данные CBonds лежат в `CBonds_API/.env` (`CBONDS_LOGIN`, `CBONDS_PASSWORD`).
 
 Пути к папкам с исходными Excel-файлами и результатами для файловых отчётов
-(BalanceStruct, ЧПД, NIM, Трансфертные ставки) настраиваются в [config.py](config.py).
+(BalanceStruct, ЧПД, NIM, Трансфертные ставки, Динамика портфелей) настраиваются
+в [config.py](config.py).
 
 ## Запуск
 
@@ -43,7 +44,7 @@ python console.py ofz-rates --dates 2026-06-01,2026-06-15,2026-07-01      # сп
 собрать прямо в Excel — запросы уйдут из процесса Excel (нужен Excel под Windows): см.
 [excel_ofz/README.md](excel_ofz/README.md).
 
-### Файловые отчёты (ОВП, Структура баланса, ЧПД, NIM)
+### Файловые отчёты (ОВП, Структура баланса, ЧПД, NIM, Динамика портфелей)
 
 ```bash
 python console.py balance-struct --date 2026-06-18            # один файл на дату
@@ -51,6 +52,7 @@ python console.py balance-struct --dates 2026-06-18,2026-06-25 --combine   # н�
 python console.py chpd --inputs "a.xlsx" "b.xlsx"              # несколько файлов -> отдельные csv (по умолчанию)
 python console.py ovp --inputs report1.xlsx report2.xlsx --combine
 python console.py transfert-stavka --short-date 2026-03-17 --long-date 2026-04-30
+python console.py portfolio-dynamics --t0-date 2026-09-01 --t7-date 2026-08-25
 ```
 
 Без `--date`/`--input`/`--inputs`/`--dates` файловые отчёты сами находят
@@ -76,6 +78,38 @@ python console.py transfert-stavka --short-date 2026-03-17 --long-date 2026-04-3
 (короткие + длинные ставки), поэтому пакетный режим (несколько запусков за
 один вызов) для него пока не реализован.
 
+«Динамика портфелей» — тоже два файла за раз (срез T0 и срез T-7), и ещё две
+особенности, которых нет ни у одного другого отчёта.
+
+Во-первых, он отдаёт **.xlsx, а не CSV**: на выходе шаблон обмена схемы v3.0
+(см. `_portfolio_dynamics_spec/CONTRACT.md`) — машинные листы `fact_type_daily`
+и `fact_portfolio_snapshot`, ручные `dim_portfolio` и `fact_limit`, витрины на
+формулах, лист `checks` с 24 проверками и словарь данных `dict`. Имя файла —
+`dinamika_portfeley_<дата T0>.xlsx`.
+
+Во-вторых, он работает **инкрементально: предыдущий выпуск отчёта является
+входом для следующего**. Входные выгрузки дают только два среза, а истории
+объёмов по типам (лист `fact_type_daily`), лимитов и заметок в них нет — всё
+это накапливается в самом файле. Каждый запуск читает предыдущий выпуск
+(по умолчанию — самый свежий xlsx в выходной папке, либо явный путь через
+`--previous`), дописывает в историю одну дату T0 (повторный прогон за ту же
+дату ЗАМЕНЯЕТ свои строки, а не задваивает их), переносит `fact_limit` и
+`dim_portfolio` как есть и возвращает `note_text` на место по `portfolio_code`.
+Первый запуск, когда предыдущего файла ещё нет, требует явного `--bootstrap`:
+история заводится с одной даты, лимиты — нулевые, и их надо заполнить руками.
+
+```bash
+python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx
+python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx --previous prev.xlsx
+python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx --bootstrap
+```
+
+Дата среза берётся из ВТОРОЙ даты в имени файла выгрузки
+(`Позиция за период [01.01.2026] - [01.09.2026] - SECURITIES.xlsx` -> 2026-09-01);
+если файл переименовали, та же строка ищется в шапке листа. Объёмы выгрузка
+отдаёт в рублях, а схема требует млн RUB — масштаб задаётся константой
+`PORTFOLIO_DYNAMICS_VALUE_SCALE` в `config.py`.
+
 ## Структура проекта
 
 - `CBonds_API/` — перенесённая библиотека-клиент CBonds JSON API (общая для всех отчётов).
@@ -92,6 +126,7 @@ python console.py transfert-stavka --short-date 2026-03-17 --long-date 2026-04-3
   - `reports/chpd/` — «ЧПД» (разбор Excel «ЧПД YYYY MM DD», лист Table).
   - `reports/nim/` — «NIM» (разбор Excel «NIM_YYYY_MM» по текстовым маркерам).
   - `reports/transfert_stavka/` — «Трансфертные ставки» (два файла: короткие + длинные сроки).
+  - `reports/portfolio_dynamics/` — «Динамика портфелей» (два среза выгрузки позиций -> xlsx схемы v3.0; единственный отчёт с xlsx на выходе и инкрементальным накоплением истории). Разбит на три модуля: `etl.py` (разбор выгрузок и слияние с предыдущим выпуском), `workbook.py` (сборка xlsx: листы, формулы, форматирование, валидация, checks), `report.py` (CLI и интерактив).
 - `excel_ofz/` — автономная Excel-версия отчёта «Ставки ОФЗ» (VBA ходит в CBonds API напрямую, без Python).
 - `console.py` — точка входа: реестр отчётов + меню/CLI.
 - `output/<report_slug>/` — результаты запусков (для файловых отчётов путь берётся из `config.py`).
