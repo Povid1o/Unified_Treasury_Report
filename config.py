@@ -37,6 +37,8 @@ from common.file_discovery import SourceConfig
 # состав конфига, даже когда значения проставляет _apply_settings().
 JUPITER_ROOT: Path
 LOGS_DIR: Path
+DATE_FOLDER_FORMAT: str
+DOWNLOADS_DIR: Path
 
 CBONDS_ENV_PATH: Path
 OFZ_OUTPUT_PATH: Path
@@ -67,6 +69,9 @@ PORTFOLIO_DYNAMICS_OUTPUT_DIR: Path
 PORTFOLIO_DYNAMICS_VALUE_SCALE: float
 PORTFOLIO_DYNAMICS_TOLERANCE: float
 PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
+PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS: bool
+PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS: bool
+PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
 
 
 def _apply_settings() -> None:
@@ -76,6 +81,13 @@ def _apply_settings() -> None:
 
     g["JUPITER_ROOT"] = v["jupiter_root"]
     g["LOGS_DIR"] = v["logs_dir"]
+    # Имя подпапки с выгрузками за один день (см. common/file_discovery.py,
+    # раздел «ПАПКИ-ДАТЫ»). Передаётся только тем источникам, у которых папки
+    # по датам включены настройкой.
+    g["DATE_FOLDER_FORMAT"] = v["date_folder_format"]
+    # Папка, куда браузер складывает скачанные выгрузки: отчёты с приёмкой ищут
+    # в ней недостающие файлы (см. reports/portfolio_dynamics/inbox.py).
+    g["DOWNLOADS_DIR"] = v["downloads_dir"]
 
     # ── Ставки ОФЗ (CBonds API) ──────────────────────────────────────────────
     # Логин и пароль лежат в .env и настройкой не являются — см. common/settings.py.
@@ -135,13 +147,18 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_FILENAME_REGEX"] = v["portfolio_dynamics_regex"]
     g["PORTFOLIO_DYNAMICS_DATE_FORMAT"] = v["portfolio_dynamics_date_format"]
     g["PORTFOLIO_DYNAMICS_DIR"] = v["portfolio_dynamics_dir"]
+    # Оба среза за день лежат в подпапке-дате: отчёт берёт самую свежую папку,
+    # в которой есть файлы, и сам определяет по ним, какой срез T0, а какой T-7.
+    folder_format = v["date_folder_format"] if v["portfolio_dynamics_use_date_folders"] else None
     g["PORTFOLIO_DYNAMICS_T0_SOURCE"] = SourceConfig(
         directory=v["portfolio_dynamics_dir"], filename_regex=v["portfolio_dynamics_regex"],
         date_format=v["portfolio_dynamics_date_format"], label="Динамика портфелей T0",
+        date_folder_format=folder_format,
     )
     g["PORTFOLIO_DYNAMICS_T7_SOURCE"] = SourceConfig(
         directory=v["portfolio_dynamics_dir"], filename_regex=v["portfolio_dynamics_regex"],
         date_format=v["portfolio_dynamics_date_format"], label="Динамика портфелей T-7",
+        date_folder_format=folder_format,
     )
     g["PORTFOLIO_DYNAMICS_OUTPUT_DIR"] = v["portfolio_dynamics_output_dir"]
 
@@ -155,6 +172,12 @@ def _apply_settings() -> None:
     # Сдвиг сравнения по умолчанию (календарных дней) — используется, если даты
     # срезов T0/T-7 определить не удалось. Обычно считается как разница их дат.
     g["PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK"] = v["portfolio_dynamics_default_lookback"]
+    # Приёмка из загрузок: искать ли там недостающие срезы и переносить их или копировать.
+    g["PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS"] = v["portfolio_dynamics_import_from_downloads"]
+    g["PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS"] = v["portfolio_dynamics_move_from_downloads"]
+    # Второй экземпляр среза в папке его собственной даты — чтобы файл, взятый
+    # как T-7, потом можно было использовать как T0 своей даты.
+    g["PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE"] = v["portfolio_dynamics_archive_own_date"]
 
 
 def reload() -> None:

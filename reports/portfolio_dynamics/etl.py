@@ -215,6 +215,66 @@ def _business_date_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optiona
     return None
 
 
+def read_business_date(path: Path) -> Optional[dt.date]:
+    """Дата среза одного файла выгрузки: из имени файла, иначе из шапки листа.
+
+    Разбор имени бесплатный, чтение книги — нет, поэтому лист читается только
+    когда имя ничего не дало (файл переименовали руками).
+    """
+    path = Path(path)
+    from_name = _business_date_from_name(path)
+    if from_name is not None:
+        return from_name
+    try:
+        _sheet, matrix, header_row, _cols = _find_sheet_and_header(path)
+    except (PortfolioDynamicsError, excel_io.ExcelSourceError):
+        return None
+    return _business_date_from_matrix(matrix, header_row)
+
+
+def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, Path]:
+    """Из файлов одной папки-даты выбирает, какой срез T0, а какой T-7.
+
+    Определяется по дате самой выгрузки (вторая дата периода), а не по имени
+    файла как строке: поздний срез — T0, ранний — T-7. Так пользователю не нужно
+    ничего переименовывать и раскладывать в правильном порядке — достаточно
+    положить в папку два файла.
+    """
+    where = f" в {folder_label}" if folder_label else ""
+    real_files = [f for f in files if f.is_file() and not f.name.startswith("~$")]
+    if len(real_files) < 2:
+        raise PortfolioDynamicsError(
+            f"Для отчёта нужны ДВА файла (срез T0 и срез T-7), а{where} найдено "
+            f"{len(real_files)}: {', '.join(f.name for f in real_files) or 'ничего'}."
+        )
+
+    dated = [(read_business_date(f), f) for f in real_files]
+    undated = [f.name for d, f in dated if d is None]
+    if undated:
+        raise PortfolioDynamicsError(
+            f"Не удалось определить дату среза у файлов{where}: {', '.join(undated)}. "
+            "В имени файла (или в шапке листа) должна быть строка вида "
+            "«Позиция за период [дд.мм.гггг] - [дд.мм.гггг]»."
+        )
+
+    dated.sort(key=lambda item: item[0], reverse=True)
+    if len(dated) > 2:
+        ignored = ", ".join(f.name for _d, f in dated[2:])
+        logger.warning(
+            "В папке%s больше двух файлов — взяты два самых свежих среза (%s и %s), "
+            "остальные проигнорированы: %s",
+            where, dated[0][1].name, dated[1][1].name, ignored,
+        )
+
+    (t0_date, t0_path), (t7_date, t7_path) = dated[0], dated[1]
+    if t0_date == t7_date:
+        raise PortfolioDynamicsError(
+            f"Оба файла{where} — срезы на одну и ту же дату {t0_date.isoformat()} "
+            f"({t0_path.name}, {t7_path.name}). Нужны два РАЗНЫХ среза: T0 и T-7."
+        )
+    return t0_path, t7_path
+
+
 def _weighted_duration(pairs: List[Tuple[float, float]]) -> Optional[float]:
     """Дюрация портфеля — средневзвешенная по стоимости, а не сумма и не среднее.
 

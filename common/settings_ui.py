@@ -17,7 +17,7 @@ from rich import box
 from rich.table import Table
 
 import config
-from common import settings, ui
+from common import file_discovery, settings, ui
 
 MENU_TITLE = "Настройки"
 MENU_DESCRIPTION = "Пути к папкам, шаблоны имён файлов и константы отчётов — без правки config.py"
@@ -179,6 +179,116 @@ def _edit_group(group: settings.Group) -> bool:
             ui.cancelled("Правка настройки отменена.")
 
 
+# ── Создание папок по датам ──────────────────────────────────────────────────
+def _source_configs(report: settings.ReportSource) -> List[file_discovery.SourceConfig]:
+    """Источники отчёта как SourceConfig — их собирает config по ключам настроек.
+
+    Сопоставление «ключ настройки -> константа config» держится здесь: settings
+    про config ничего не знает (он его импортирует), а таблица отчётов нужна
+    только этому экрану.
+    """
+    by_key = {
+        "ovp_dir": [config.OVP_SOURCE],
+        "balance_struct_dir": [config.BALANCE_STRUCT_SOURCE],
+        "chpd_dir": [config.CHPD_SOURCE],
+        "nim_dir": [config.NIM_SOURCE],
+        "transfert_short_dir": [config.TRANSFERT_SHORT_SOURCE],
+        "transfert_long_dir": [config.TRANSFERT_LONG_SOURCE],
+        "portfolio_dynamics_dir": [config.PORTFOLIO_DYNAMICS_T0_SOURCE],
+    }
+    sources: List[file_discovery.SourceConfig] = []
+    for key in report.dir_keys:
+        sources.extend(by_key.get(key, []))
+    return sources
+
+
+def _reports_table() -> Table:
+    table = Table(
+        title="Создать папки по датам", title_style="bold cyan", box=box.SIMPLE_HEAVY,
+        show_header=True, header_style="bold cyan",
+        caption="Папки-даты включаются настройкой отчёта; у остальных отчётов "
+                "раскладка плоская.",
+        caption_style="grey50",
+    )
+    table.add_column("#", justify="right", style="bold yellow", no_wrap=True, width=3)
+    table.add_column("Отчёт", style="bold white", max_width=24)
+    table.add_column("Папка исходных файлов", style="grey70", overflow="fold", ratio=2)
+    table.add_column("Папки-даты", no_wrap=True)
+
+    for i, report in enumerate(settings.REPORT_SOURCES, start=1):
+        dirs = "\n".join(str(settings.get(key)) for key in report.dir_keys)
+        enabled = any(s.uses_date_folders for s in _source_configs(report))
+        table.add_row(
+            str(i), report.title, dirs,
+            "[bold green]вкл[/bold green]" if enabled else "[grey50]выкл[/grey50]",
+        )
+    return table
+
+
+def _make_date_folders(report: settings.ReportSource, days: int, include_weekends: bool) -> None:
+    """Создаёт подпапки-даты у всех источников отчёта и печатает итог."""
+    sources = _source_configs(report)
+    if not sources:
+        raise settings.SettingsError(f"У отчёта «{report.title}» нет папок с исходными файлами.")
+
+    for source in sources:
+        if not source.uses_date_folders:
+            ui.warning(
+                f"[{source.label}] Папки по датам выключены — включите их в настройках "
+                f"отчёта «{report.title}», иначе отчёт не будет искать файлы в подпапках."
+            )
+            continue
+        created, existed = file_discovery.create_date_folders(source, days, include_weekends)
+        ui.success(
+            f"[{source.label}] {source.directory}: создано папок {len(created)}, "
+            f"уже было {len(existed)}"
+        )
+        if created:
+            ui.console.print(
+                "[grey70]   " + ", ".join(f.name for f in created[:12])
+                + (" …" if len(created) > 12 else "") + "[/grey70]"
+            )
+
+
+def make_folders_cli(slug: str, days: int, include_weekends: bool) -> None:
+    """Неинтерактивный режим: python console.py settings --make-folders <отчёт>."""
+    report = settings.REPORT_SOURCES_BY_SLUG.get(slug)
+    if report is None:
+        raise settings.SettingsError(
+            f"Неизвестный отчёт {slug!r}. Доступны: "
+            + ", ".join(r.slug for r in settings.REPORT_SOURCES)
+        )
+    _make_date_folders(report, days, include_weekends)
+
+
+def _make_folders_screen() -> None:
+    ui.console.print()
+    ui.console.print(_reports_table())
+    choice = ui.ask("Отчёт (номер), 0 — назад", default="0")
+    if choice in ("0", ""):
+        return
+    try:
+        report = settings.REPORT_SOURCES[int(choice) - 1]
+    except (ValueError, IndexError):
+        ui.warning("Некорректный выбор.")
+        return
+
+    days_raw = ui.ask("На сколько дней вперёд создать папки", default="14")
+    try:
+        days = int(days_raw)
+    except ValueError:
+        ui.error(f"Ожидается целое число дней, получено {days_raw!r}.")
+        return
+
+    weekends = ui.ask("Создавать папки и на выходные? (y/N)", default="N")
+    include_weekends = weekends.strip().lower().startswith("y")
+
+    try:
+        _make_date_folders(report, days, include_weekends)
+    except (settings.SettingsError, file_discovery.SourceFileError) as exc:
+        ui.error(str(exc))
+
+
 def _reset_all() -> bool:
     keys = settings.overridden_keys()
     if not keys:
@@ -202,8 +312,8 @@ def run_interactive() -> None:
             ui.console.print()
             ui.console.print(_groups_table())
             ui.console.print(
-                "[grey70]п — проверить пути, с — сбросить всё к значениям по умолчанию, "
-                "0 — выйти в главное меню[/grey70]"
+                "[grey70]п — проверить пути, д — создать папки по датам, "
+                "с — сбросить всё к значениям по умолчанию, 0 — выйти в главное меню[/grey70]"
             )
             choice = ui.ask("Раздел (номер) или действие", default="0").strip().lower()
 
@@ -212,6 +322,13 @@ def run_interactive() -> None:
             if choice in ("п", "p"):
                 ui.console.print()
                 ui.console.print(_paths_table())
+                continue
+            if choice in ("д", "d"):
+                try:
+                    _make_folders_screen()
+                except KeyboardInterrupt:
+                    ui.console.print()
+                    ui.cancelled("Создание папок отменено.")
                 continue
             if choice in ("с", "c", "s"):
                 changed |= _reset_all()

@@ -47,6 +47,7 @@ class SettingsError(ValueError):
 # regex1        — регулярка с РОВНО одной группой (дата в имени файла)
 # date_format   — strptime-формат содержимого этой группы
 # int/float     — число больше нуля
+# bool          — да/нет
 KIND_HINTS = {
     "dir": "путь к папке",
     "file": "путь к файлу",
@@ -55,7 +56,11 @@ KIND_HINTS = {
     "date_format": "формат даты (strptime), например %d.%m.%Y",
     "int": "целое число > 0",
     "float": "число > 0",
+    "bool": "да / нет",
 }
+
+_TRUE_WORDS = {"да", "д", "yes", "y", "true", "1", "вкл", "on"}
+_FALSE_WORDS = {"нет", "н", "no", "n", "false", "0", "выкл", "off"}
 
 Default = Union[Any, Callable[[Callable[[str], Any]], Any]]
 
@@ -106,6 +111,21 @@ SETTINGS: List[Setting] = [
              "data/<Отчёт> и output/<Отчёт>: смена корня двигает их все разом. "
              "Папку отдельного отчёта можно задать явно — тогда она от корня "
              "больше не зависит.",
+    ),
+    Setting(
+        key="downloads_dir", label="Папка загрузок", kind="dir", group="common",
+        default=Path.home() / "Downloads",
+        help="Куда браузер складывает скачанные выгрузки. Отчёты, умеющие приёмку, "
+             "ищут здесь недостающие файлы и раскладывают их по своим папкам-датам. "
+             "На русской Windows папка может называться «Загрузки» — поправьте путь.",
+    ),
+    Setting(
+        key="date_folder_format", label="Формат имени папки-даты", kind="date_format", group="common",
+        default="%Y-%m-%d",
+        help="Как называются подпапки с выгрузками за день (по умолчанию 2026-09-18). "
+             "Применяется к отчётам, у которых включены папки-даты. Меняйте только "
+             "до того, как папки созданы: уже созданные под старый формат перестанут "
+             "находиться.",
     ),
     Setting(
         key="logs_dir", label="Папка логов", kind="dir", group="common",
@@ -244,6 +264,38 @@ SETTINGS: List[Setting] = [
         help="Оба среза (T0 и T-7) лежат здесь: это одна и та же выгрузка на разные даты.",
     ),
     Setting(
+        key="portfolio_dynamics_use_date_folders", label="Складывать выгрузки в папки по датам",
+        kind="bool", group="portfolio_dynamics", default=True,
+        help="Да — оба среза за день лежат в подпапке вида 2026-09-18 внутри папки "
+             "исходных файлов, и отчёт по умолчанию берёт самую свежую папку, В КОТОРОЙ "
+             "ЕСТЬ файлы. Пустые папки, созданные заранее, пропускаются. Нет — старая "
+             "плоская раскладка: все выгрузки за все даты лежат в одной папке. Обе "
+             "раскладки сканируются одновременно, так что переходить можно постепенно.",
+    ),
+    Setting(
+        key="portfolio_dynamics_import_from_downloads", label="Забирать выгрузки из загрузок",
+        kind="bool", group="portfolio_dynamics", default=True,
+        help="Да — если в папке нужной даты не хватает срезов, отчёт сам поищет их в папке "
+             "загрузок (по тому же шаблону имени) и положит куда надо. Нет — файлы туда "
+             "кладёт человек.",
+    ),
+    Setting(
+        key="portfolio_dynamics_move_from_downloads", label="Переносить, а не копировать",
+        kind="bool", group="portfolio_dynamics", default=True,
+        help="Да — файл переносится (из загрузок исчезает, чтобы они не копили мусор). "
+             "Нет — копируется, оригинал остаётся в загрузках. Ничего не удаляется ни в "
+             "том, ни в другом случае.",
+    ),
+    Setting(
+        key="portfolio_dynamics_archive_own_date", label="Дублировать срез в папку его даты",
+        kind="bool", group="portfolio_dynamics", default=True,
+        help="Да — каждый срез кладётся и в папку отчётной даты, и в папку своей "
+             "собственной. Иначе файл за 11.09, попавший в папку 2026-09-18 как T-7, "
+             "останется в единственном экземпляре, и отчёт на 11.09 потом будет не "
+             "собрать без повторной выгрузки. Стоит места ровно в один лишний файл "
+             "на запуск.",
+    ),
+    Setting(
         key="portfolio_dynamics_regex", label="Шаблон имени файла", kind="regex1",
         group="portfolio_dynamics",
         default=r"\[\d{2}\.\d{2}\.\d{4}\]\s*-\s*\[(\d{2}\.\d{2}\.\d{4})\]",
@@ -323,8 +375,23 @@ def parse_value(setting: Setting, raw: Any) -> Any:
             )
         return pattern
 
+    if setting.kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        word = str(text).strip().casefold()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+        raise SettingsError(f"[{setting.key}] Ожидается «да» или «нет», получено {raw!r}.")
+
     if setting.kind == "date_format":
         fmt = str(text)
+        if "/" in fmt or "\\" in fmt:
+            raise SettingsError(
+                f"[{setting.key}] В формате даты не должно быть разделителей пути "
+                "(/ и \\): он используется как имя файла или папки."
+            )
         if "%" not in fmt:
             raise SettingsError(
                 f"[{setting.key}] Это не формат даты: в нём нет ни одной директивы %. "
@@ -464,6 +531,34 @@ def reset(key: str) -> Any:
 def reset_all() -> None:
     _write({})
     reload()
+
+
+# ── Источники отчётов: для «создать папки по датам» ──────────────────────────
+@dataclass(frozen=True)
+class ReportSource:
+    """Отчёт и ключи настроек с его папками исходных файлов.
+
+    Таблица живёт здесь, а не собирается из reports/*: settings импортирует
+    config, и обратная зависимость замкнула бы импорты в кольцо.
+    """
+
+    slug: str
+    title: str
+    dir_keys: tuple
+    date_folders_key: Optional[str] = None  # настройка «папки по датам», если она есть
+
+
+REPORT_SOURCES: List[ReportSource] = [
+    ReportSource("ovp", "ОВП", ("ovp_dir",)),
+    ReportSource("balance-struct", "Структура баланса", ("balance_struct_dir",)),
+    ReportSource("chpd", "ЧПД", ("chpd_dir",)),
+    ReportSource("nim", "NIM", ("nim_dir",)),
+    ReportSource("transfert-stavka", "Трансфертные ставки",
+                 ("transfert_short_dir", "transfert_long_dir")),
+    ReportSource("portfolio-dynamics", "Динамика портфелей", ("portfolio_dynamics_dir",),
+                 date_folders_key="portfolio_dynamics_use_date_folders"),
+]
+REPORT_SOURCES_BY_SLUG: Dict[str, ReportSource] = {r.slug: r for r in REPORT_SOURCES}
 
 
 # ── Диагностика путей ────────────────────────────────────────────────────────

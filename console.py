@@ -74,6 +74,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset", nargs="+", default=None, metavar="KEY",
                    help="Вернуть настройки к значениям по умолчанию")
     p.add_argument("--reset-all", action="store_true", help="Сбросить ВСЕ настройки к значениям по умолчанию")
+    p.add_argument("--make-folders", type=str, default=None, metavar="SLUG",
+                   help="Создать папки по датам для отчёта (" +
+                        ", ".join(r.slug for r in settings.REPORT_SOURCES) + ")")
+    p.add_argument("--days", type=int, default=14,
+                   help="Сколько дней вперёд создавать папки (по умолчанию 14, только рабочие)")
+    p.add_argument("--include-weekends", action="store_true",
+                   help="Создавать папки и на выходные тоже")
     p.add_argument("--check", action="store_true",
                    help="Проверить, что все настроенные папки и файлы доступны")
     p.add_argument("--path", action="store_true", help="Напечатать путь к файлу настроек")
@@ -100,6 +107,9 @@ def run_settings_cli(args: argparse.Namespace) -> int:
         did_something = True
     if args.set:
         settings_ui.apply_assignments(args.set)
+        did_something = True
+    if args.make_folders:
+        settings_ui.make_folders_cli(args.make_folders, args.days, args.include_weekends)
         did_something = True
     if args.check:
         return 1 if settings_ui.print_paths() else 0
