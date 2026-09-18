@@ -94,6 +94,34 @@ class ScanTests(InboxTestCase):
         self.assertEqual(inbox.scan_downloads(self.source, self.tmp / "нет такой"), [])
 
 
+class RealFilenameTests(InboxTestCase):
+    """Имена ровно в том виде, в каком их отдаёт выгрузка: без квадратных
+    скобок, с несколькими пробелами, одна и та же дата дважды."""
+
+    def real_download(self, day: str, volume: float = 30) -> Path:
+        name = f"Позиция за период   {day}  -  {day}   - SECURITIES.xlsx"
+        return write_export(self.downloads / name, slice_rows(volume, volume * 2),
+                            period_end=day)
+
+    def test_export_filenames_are_recognised(self):
+        self.real_download("18.09.2026")
+        self.real_download("11.09.2026")
+
+        found = {c.business_date for c in inbox.scan_downloads(self.source, self.downloads)}
+        self.assertEqual(found, {dt.date(2026, 9, 18), dt.date(2026, 9, 11)})
+
+    def test_full_run_from_downloads(self):
+        self.real_download("18.09.2026")
+        self.real_download("11.09.2026")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(t0.parent.name, "2026-09-18")
+        self.assertIn("18.09.2026", t0.name)
+        self.assertIn("11.09.2026", t7.name)
+        self.assertEqual(self.downloads_names(), [], "файлы должны уехать из загрузок")
+
+
 class PlanTests(InboxTestCase):
     def test_pair_is_t0_plus_the_newest_earlier_slice(self):
         for period_end in ("04.09.2026", "11.09.2026", "18.09.2026"):

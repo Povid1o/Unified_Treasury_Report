@@ -189,6 +189,24 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
         self.assertIsNone(etl.parse_number("-"))
         self.assertIsNone(etl.parse_number(None))
 
+    def test_filename_variants_of_the_export_are_all_recognised(self):
+        """Выгрузка называет ФАЙЛ без скобок и с лишними пробелами, а ту же строку
+        в ШАПКЕ ЛИСТА пишет со скобками — разбираться должны оба вида."""
+        variants = {
+            "Позиция за период   18.09.2026  -  18.09.2026   - SECURITIES.xlsx": dt.date(2026, 9, 18),
+            "Позиция за период [01.01.2026] - [18.09.2026] - SECURITIES.xlsx": dt.date(2026, 9, 18),
+            "Позиция за период 01.01.2026 - 18.09.2026 - SECURITIES.xlsx": dt.date(2026, 9, 18),
+        }
+        for name, expected in variants.items():
+            with self.subTest(name=name):
+                path = write_export(self.tmp / "варианты" / name, T0_ROWS)
+                self.assertEqual(etl._business_date_from_name(path), expected)
+
+    def test_unrelated_filenames_are_not_mistaken_for_exports(self):
+        for name in ("Economic_OVP_Report_v2.xlsx", "ЧПД 2026 09 18.xlsx", "отчёт.xlsx"):
+            with self.subTest(name=name):
+                self.assertIsNone(etl._business_date_from_name(Path(name)))
+
     def test_business_date_is_second_date_of_the_period(self):
         self.assertEqual(etl.parse_slice(self.t0_path, "T0").business_date, dt.date(2026, 9, 1))
         self.assertEqual(etl.parse_slice(self.t7_path, "T-7").business_date, dt.date(2026, 8, 25))
