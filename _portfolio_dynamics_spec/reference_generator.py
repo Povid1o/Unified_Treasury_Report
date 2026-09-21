@@ -315,7 +315,12 @@ def write_table(sheet_name, cols, rows, kind, table_name, widths=None, formats=N
         showRowStripes=True)
     ws.add_table(tab)
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = tab.ref
+    # Автофильтр на уровне ЛИСТА здесь не ставится намеренно. Умная таблица
+    # заводит свой autoFilter сама (openpyxl добавляет его при headerRowCount),
+    # а два фильтра на одном диапазоне Excel считает испорченным содержимым:
+    # открывает файл с предложением восстановить и выбрасывает таблицу целиком
+    # («Удалённое свойство: Таблица из части /xl/tables/tableN.xml»). Выпадающие
+    # списки фильтра при этом не теряются — их даёт сама таблица.
     for j, (name, *_r) in enumerate(cols, start=1):
         ws.column_dimensions[get_column_letter(j)].width = (widths or {}).get(name, max(14, len(name) + 3))
     ws.row_dimensions[1].height = 30

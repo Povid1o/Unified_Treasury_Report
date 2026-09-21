@@ -176,6 +176,35 @@ class StructureTests(WorkbookFormulaTestCase):
         self.assertEqual(statuses, 24)
         self.assertIsNone(ws.cell(row=29, column=1).value, "проверок должно быть ровно 24")
 
+    def test_no_worksheet_autofilter_next_to_a_table(self):
+        """Два автофильтра на одном диапазоне — Excel открывает файл с
+        предложением восстановить и выбрасывает таблицу целиком
+        («Удалённое свойство: Таблица из части /xl/tables/tableN.xml»).
+        Фильтр должен быть ровно один — тот, что заводит сама умная таблица."""
+        wb = load_workbook(self.path)
+        offenders = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            if ws.tables and ws.auto_filter.ref:
+                offenders.append(f"{sheet_name}: лист {ws.auto_filter.ref}, "
+                                 f"таблиц {len(ws.tables)}")
+        self.assertEqual(offenders, [], "на листе с таблицей стоит лишний автофильтр")
+
+    def test_every_table_keeps_its_own_filter(self):
+        """Убрав лишний фильтр, нельзя потерять и нужный: выпадающие списки в
+        шапке даёт autoFilter самой таблицы."""
+        wb = load_workbook(self.path)
+        for sheet_name in ("dim_portfolio", "fact_limit", "fact_type_daily",
+                           "fact_portfolio_snapshot", "dict"):
+            table = list(wb[sheet_name].tables.values())[0]
+            self.assertIsNotNone(table.autoFilter, sheet_name)
+            self.assertEqual(table.autoFilter.ref, table.ref, sheet_name)
+
+    def test_no_leftover_filter_database_names(self):
+        """_xlnm._FilterDatabase появлялись вместе с лист-уровневым фильтром."""
+        names = list(load_workbook(self.path).defined_names)
+        self.assertEqual([n for n in names if "FilterDatabase" in n], [])
+
     def test_table_refs_match_the_data(self):
         """Ref таблицы шире или уже данных — Excel предлагает «восстановить» файл."""
         wb = load_workbook(self.path)
