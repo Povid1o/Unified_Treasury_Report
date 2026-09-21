@@ -144,16 +144,59 @@ class LimitsImportTests(InboxTestCase):
         self.assertEqual(len(self.names("2026-09-21")), 3)
         self.assertEqual(self.downloads_names(), [])
 
-    def test_limits_file_of_another_date_is_not_taken(self):
+    def test_earlier_limits_file_is_used_with_a_warning(self):
+        """Лимиты меняются редко: отчёт с чуть устаревшими полезнее отчёта без них."""
         self.download("21.09.2026")
         self.download("14.09.2026")
         self.limits_download("14_09_2026")
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
+                                     limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+
+        self.assertIsNotNone(plan.limits)
+        self.assertIn("14_09_2026", plan.limits.name)
+        self.assertTrue(any("более ранний" in line for line in captured.output))
+
+    def test_exact_date_wins_over_an_earlier_one(self):
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        self.limits_download("14_09_2026")
+        self.limits_download("21_09_2026")
+
+        plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
+                                 limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+
+        self.assertIn("21_09_2026", plan.limits.name)
+
+    def test_limits_from_the_future_are_never_taken(self):
+        """Лимиты, выгруженные позже отчётной даты, к ней отношения не имеют."""
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        self.limits_download("28_09_2026")
 
         plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
                                  limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
 
         self.assertIsNone(plan.limits)
         self.assertTrue(plan.complete, "без лимитов отчёт всё равно должен собираться")
+
+    def test_filename_variants_are_recognised(self):
+        """Регистр, лишние пробелы и разделитель даты не должны мешать."""
+        from test_limits import DEFAULT_ROWS, write_limits_file
+        for name in ("состояние лимитов на дату 21.09.2026 - Результат.xlsx",
+                     "СОСТОЯНИЕ ЛИМИТОВ НА  ДАТУ  21-09-2026.xlsx"):
+            with self.subTest(name=name):
+                for old in self.downloads.glob("Состояние*"):
+                    old.unlink()
+                for old in self.downloads.glob("состояние*"):
+                    old.unlink()
+                for old in self.downloads.glob("СОСТОЯНИЕ*"):
+                    old.unlink()
+                write_limits_file(self.downloads / name, DEFAULT_ROWS)
+                found = inbox.scan_downloads(
+                    config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE, self.downloads)
+                self.assertEqual([c.business_date for c in found], [dt.date(2026, 9, 21)])
 
     def test_slices_are_still_chosen_correctly_with_limits_around(self):
         self.download("21.09.2026")

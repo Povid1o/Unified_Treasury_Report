@@ -832,9 +832,47 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
 
     dim["sort_order"] = pd.to_numeric(dim["sort_order"], errors="coerce")
     dim = dim.sort_values(["sort_order", "portfolio_code"], na_position="last").reset_index(drop=True)
+    _apply_type_rules(dim, known_types)
     _apply_portfolio_overrides(dim)
     _apply_nesting_to_total_flag(dim)
     return dim[DIM_COLUMNS], new_codes
+
+
+def _apply_type_rules(dim: pd.DataFrame, known_types) -> None:
+    """Пересчитывает тип по правилам для ВСЕХ строк справочника, не только новых.
+
+    Справочник переносится из предыдущего выпуска целиком, поэтому портфель,
+    размеченный до появления правил, так и оставался бы с прежним типом:
+    правило есть, а разметка «не чинится». Пересчёт делает правила
+    действующими задним числом.
+
+    Тип, которого нет среди известных, не проставляется: иначе странный код
+    (SOMETHING_ELSE -> «SOMETHING») затирал бы уже верную разметку мусором.
+    Точечные исключения применяются ПОСЛЕ и перебивают этот пересчёт.
+    """
+    if dim.empty:
+        return
+    allowed = {canonical_type(t) for t in known_types if str(t).strip()}
+    allowed.update(KNOWN_PORTFOLIO_TYPES)
+
+    changes = []
+    for index, row in dim.iterrows():
+        derived = guess_type(row["portfolio_code"], known_types)
+        if derived not in allowed:
+            continue
+        current = canonical_type(row["portfolio_type"]) if str(row["portfolio_type"] or "").strip() else ""
+        if current == derived:
+            continue
+        changes.append(f"{row['portfolio_code']}: {current or 'пусто'} -> {derived}")
+        dim.at[index, "portfolio_type"] = derived
+
+    if changes:
+        logger.warning(
+            "Разметка портфелей пересчитана по правилам, изменено %d: %s. "
+            "Если какая-то строка размечена неверно, задайте её в настройке "
+            "«Разметка отдельных портфелей» — она перебивает правила.",
+            len(changes), "; ".join(changes),
+        )
 
 
 def _apply_portfolio_overrides(dim: pd.DataFrame) -> None:
@@ -1149,6 +1187,14 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
     limits = _resolve_limits(dim, previous, business_date, bootstrap, limits_path, parsed_limits)
     snapshot, notes_restored = _build_snapshot(t0, t7, business_date, previous)
     history, carried, added, replaced = _build_type_daily(snapshot, dim, limits, previous, business_date)
+
+    if parsed_limits is not None:
+        from reports.portfolio_dynamics import limits as limits_module
+        today_rows = history[history["business_date"] == business_date]
+        limits_module.check_utilisation(
+            parsed_limits,
+            dict(zip(today_rows["portfolio_type"].astype(str), today_rows["volume_amount"])),
+        )
 
     if history_path is not None:
         from reports.portfolio_dynamics import history as history_module

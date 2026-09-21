@@ -26,7 +26,7 @@ from reports.portfolio_dynamics import etl, limits  # noqa: E402
 RUB = 1_000_000  # рублей в одном млн: выгрузка лимитов приходит в рублях
 
 LIMITS_HEADER = ["Подразделение", "Тип лимита", "Валюта",
-                 "Лимит снизу", "Лимит сверху", "Использование"]
+                 "Лимит снизу", "Лимит сверху", "Остаток лимита сверху"]
 # Проценты зон из согласованной таблицы казначейства (зелёная, жёлтая, красная).
 EXPECTED_PERCENTS = {
     "TSS": (0.7808, 0.8509, 0.9510),
@@ -49,11 +49,15 @@ def write_limits_file(path: Path, rows, header_row: int = 6) -> Path:
     for j, title in enumerate(LIMITS_HEADER, start=1):
         ws.cell(row=header_row, column=j, value=title)
     # header_row + 1 намеренно остаётся пустой
-    for i, (limit_type, amount) in enumerate(rows, start=header_row + 2):
+    for i, row in enumerate(rows, start=header_row + 2):
+        limit_type, amount = row[0], row[1]
+        remaining = row[2] if len(row) > 2 else None
         ws.cell(row=i, column=1, value="Казначейство")
         ws.cell(row=i, column=2, value=limit_type)
         ws.cell(row=i, column=3, value="RUB")
         ws.cell(row=i, column=5, value=amount)
+        if remaining is not None:
+            ws.cell(row=i, column=6, value=remaining)
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)
     return path
@@ -144,6 +148,94 @@ class ParseTests(LimitsTestCase):
         parsed = self.parse().set_index("portfolio_type")
         self.assertIn("HFT", parsed.index)
         self.assertNotIn("TSS", parsed.index)
+
+
+class RealFileNamingTests(LimitsTestCase):
+    """Имена типов ровно как в настоящей выгрузке: «Облигации AFS», «Облигации»,
+    «Облигации HTM». Точного псевдонима на каждую формулировку не напасёшься."""
+
+    REAL_ROWS = [
+        ("Облигации AFS", 400_000 * RUB, 100_000 * RUB),
+        ("Облигации AFS", 90_000 * RUB, 10_000 * RUB),   # меньший — отбрасывается
+        ("Облигации", 250_000 * RUB, 50_000 * RUB),      # торговый
+        ("Облигации HTM", 900_000 * RUB, 300_000 * RUB),
+    ]
+
+    def test_all_three_types_are_recognised(self):
+        parsed = self.parse(self.REAL_ROWS).set_index("portfolio_type")
+        self.assertEqual(sorted(parsed.index), ["AFS", "HTM", "TSS"])
+        self.assertAlmostEqual(parsed.loc["AFS", "limit_amount"], 400_000)
+        self.assertAlmostEqual(parsed.loc["HTM", "limit_amount"], 900_000)
+        self.assertAlmostEqual(parsed.loc["TSS", "limit_amount"], 250_000)
+
+    def test_larger_of_the_two_afs_rows_wins(self):
+        parsed = self.parse(self.REAL_ROWS).set_index("portfolio_type")
+        self.assertAlmostEqual(parsed.loc["AFS", "limit_amount"], 400_000)
+
+    def test_type_is_found_inside_the_name(self):
+        aliases = limits.parse_aliases(config.PORTFOLIO_DYNAMICS_LIMIT_ALIASES)
+        self.assertEqual(limits.resolve_type("Облигации AFS", aliases), "AFS")
+        self.assertEqual(limits.resolve_type("Облигации HTM", aliases), "HTM")
+        self.assertEqual(limits.resolve_type("Облигации", aliases), "TSS")
+
+    def test_longest_type_inside_the_name_wins(self):
+        """«Облигации HTM_KUAP» — это КУАП, а не HTM."""
+        aliases = limits.parse_aliases(config.PORTFOLIO_DYNAMICS_LIMIT_ALIASES)
+        self.assertEqual(limits.resolve_type("Облигации HTM_KUAP", aliases), "HTM_KUAP")
+
+    def test_unrelated_row_is_still_dropped(self):
+        aliases = limits.parse_aliases(config.PORTFOLIO_DYNAMICS_LIMIT_ALIASES)
+        self.assertNotIn(limits.resolve_type("Прочий лимит", aliases),
+                         ("AFS", "HTM", "TSS", "HTM_KUAP"))
+
+    def test_limits_reach_fact_limit(self):
+        """Ровно то, что было сломано: лист fact_limit оставался почти пустым."""
+        frame = limits.build_fact_limit(
+            self.parse(self.REAL_ROWS), ["AFS", "HTM", "TSS"],
+            pd.DataFrame(columns=etl.LIMIT_COLUMNS), dt.date(2026, 9, 21), "файл")
+        got = dict(zip(frame["portfolio_type"], frame["limit_amount"]))
+        self.assertEqual(got, {"AFS": 400_000, "HTM": 900_000, "TSS": 250_000})
+
+    def test_type_without_a_limit_and_without_portfolios_is_not_invented(self):
+        """Иначе HTM_KUAP висел бы с нулём и валил CHK_19 на каждом запуске."""
+        frame = limits.build_fact_limit(
+            self.parse(self.REAL_ROWS), ["AFS", "HTM", "TSS"],
+            pd.DataFrame(columns=etl.LIMIT_COLUMNS), dt.date(2026, 9, 21), "файл")
+        self.assertNotIn("HTM_KUAP", list(frame["portfolio_type"]))
+
+    def test_type_with_portfolios_stays_even_without_a_limit(self):
+        frame = limits.build_fact_limit(
+            self.parse(self.REAL_ROWS), ["AFS", "HTM", "TSS", "HTM_KUAP"],
+            pd.DataFrame(columns=etl.LIMIT_COLUMNS), dt.date(2026, 9, 21), "файл")
+        self.assertIn("HTM_KUAP", list(frame["portfolio_type"]))
+
+
+class RemainingColumnTests(LimitsTestCase):
+    """Колонка «Остаток лимита сверху» — второй, независимый взгляд на занятое."""
+
+    ROWS = [("Облигации AFS", 400_000 * RUB, 100_000 * RUB)]
+
+    def test_remaining_is_read_and_scaled(self):
+        parsed = self.parse(self.ROWS)
+        self.assertAlmostEqual(parsed.iloc[0]["remaining_amount"], 100_000)
+
+    def test_agreement_is_silent(self):
+        parsed = self.parse(self.ROWS)
+        problems = limits.check_utilisation(parsed, {"AFS": 300_000})
+        self.assertEqual(problems, [])
+
+    def test_divergence_is_reported(self):
+        parsed = self.parse(self.ROWS)
+        with self.assertLogs("portfolio_dynamics", level="WARNING"):
+            problems = limits.check_utilisation(parsed, {"AFS": 120_000})
+        self.assertEqual(len(problems), 1)
+        self.assertIn("AFS", problems[0])
+
+    def test_missing_column_is_not_an_error(self):
+        """Колонки может не быть — сверка просто пропускается."""
+        parsed = self.parse([("Облигации AFS", 400_000 * RUB)])
+        self.assertTrue(pd.isna(parsed.iloc[0]["remaining_amount"]))
+        self.assertEqual(limits.check_utilisation(parsed, {"AFS": 300_000}), [])
 
 
 class ZoneTests(LimitsTestCase):
@@ -268,6 +360,49 @@ class TypeRuleTests(LimitsTestCase):
         self.assertEqual(etl.parse_type_rules("OFZ_PD=TSS")["OFZ_PD"], "TSS")
         self.assertEqual(etl.parse_type_rules("OFZ_PD=TSS")["OFZ_PD"], "TSS")
         self.assertEqual(etl.canonical_type("tss"), "TSS")
+
+
+class ReclassificationTests(LimitsTestCase):
+    """Правила должны действовать и на портфели из предыдущего выпуска."""
+
+    def dim(self, rows):
+        return pd.DataFrame(rows, columns=etl.DIM_COLUMNS)
+
+    def test_existing_rows_are_reclassified(self):
+        """Справочник переносится целиком, и без пересчёта портфель, размеченный
+        до появления правил, так и остался бы с прежним типом."""
+        dim = self.dim([
+            ["OFZ_HTM_FLOAT_SEC", "ОФЗ флоатер", "OFZ", True, True, 10],
+            ["OFZ_PD_SEC", "ОФЗ-ПД", "OFZ", True, True, 20],
+            ["AFS_TR_RUR_SEC", "AFS", "OFZ", True, True, 30],
+        ])
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            etl._apply_type_rules(dim, ["AFS", "HTM", "TSS"])
+
+        self.assertEqual(list(dim["portfolio_type"]), ["HTM", "TSS", "AFS"])
+        self.assertTrue(any("пересчитана" in line for line in captured.output))
+
+    def test_correct_rows_are_left_alone(self):
+        dim = self.dim([["HTM_GOV", "ОФЗ", "HTM", True, True, 10]])
+        etl._apply_type_rules(dim, ["AFS", "HTM", "TSS"])
+        self.assertEqual(dim.iloc[0]["portfolio_type"], "HTM")
+
+    def test_unknown_derived_type_does_not_overwrite(self):
+        """Странный код не должен затирать уже верную разметку мусором."""
+        dim = self.dim([["ZZZ_STRANGE", "Непонятный", "HTM", True, True, 10]])
+        etl._apply_type_rules(dim, ["AFS", "HTM", "TSS"])
+        self.assertEqual(dim.iloc[0]["portfolio_type"], "HTM")
+
+    def test_override_wins_over_the_recalculation(self):
+        dim = self.dim([["OFZ_HTM_FLOAT_SEC", "ОФЗ", "OFZ", True, True, 10]])
+        settings.set_value("portfolio_dynamics_portfolio_types", "OFZ_HTM_FLOAT_SEC=AFS")
+        config.reload()
+
+        etl._apply_type_rules(dim, ["AFS", "HTM", "TSS"])
+        etl._apply_portfolio_overrides(dim)
+
+        self.assertEqual(dim.iloc[0]["portfolio_type"], "AFS")
 
 
 class PortfolioOverrideTests(LimitsTestCase):

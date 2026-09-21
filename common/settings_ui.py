@@ -302,6 +302,70 @@ def _manual_portfolios_screen() -> bool:
         ui.warning("Некорректный выбор, попробуйте снова.")
 
 
+# ── История из отчёта старого формата ────────────────────────────────────────
+HISTORY_FILE_KEY = "portfolio_dynamics_history_file"
+
+
+def _history_screen() -> bool:
+    """Выбор файла старого формата, из которого подтянуть историю по типам.
+
+    Отдельный пункт меню, а не просто настройка-путь: иначе возможность негде
+    найти — она теряется среди двух десятков настроек отчёта. Файл здесь же и
+    разбирается, чтобы сразу было видно, что из него прочиталось.
+    """
+    current = settings.get(HISTORY_FILE_KEY)
+    ui.console.print()
+    ui.console.print(
+        "[bold]История объёмов по типам (лист fact_type_daily)[/bold]\n"
+        "[grey70]Накапливается по одной дате за запуск. Если история уже ведётся в "
+        "отчёте старого формата — листы «Динамика AFS», «Динамика HTM», «Динамика "
+        "TSS» с колонками «Дата» и «Текущий объём», — её можно подтянуть оттуда. "
+        "Импорт только дополняет: даты, накопленные своими запусками, не "
+        "перезаписываются.[/grey70]"
+    )
+    if current and str(current).strip():
+        ui.console.print(f"Сейчас задан файл: [bold]{current}[/bold]")
+        ui.console.print("[grey70]Enter — оставить, «-» — больше не подтягивать, "
+                         "либо укажите другой путь.[/grey70]")
+    raw = ui.ask("Путь к файлу с историей")
+
+    if not raw.strip():
+        return False
+    if raw.strip() == "-":
+        settings.reset(HISTORY_FILE_KEY)
+        ui.success("История из старого отчёта больше не подтягивается.")
+        return True
+
+    path = Path(raw.strip().strip('"')).expanduser()
+    if not path.exists():
+        ui.error(f"Файл не найден: {path}")
+        return False
+
+    # Разбираем сразу: пусть человек увидит, что именно прочиталось, а не
+    # узнает о несовпадении формата через сутки при очередном запуске.
+    try:
+        from reports.portfolio_dynamics import history
+        frame = history.parse_history_file(path)
+    except Exception as exc:
+        ui.error(str(exc))
+        return False
+
+    types = ", ".join(sorted(frame["portfolio_type"].unique()))
+    ui.success(
+        f"Прочитано строк: {len(frame)}; типы: {types}; период "
+        f"{frame['business_date'].min().isoformat()} .. "
+        f"{frame['business_date'].max().isoformat()}"
+    )
+    try:
+        settings.set_value(HISTORY_FILE_KEY, str(path))
+    except settings.SettingsError as exc:
+        ui.error(str(exc))
+        return False
+    ui.console.print("[grey70]История подтянется при следующем запуске отчёта "
+                     "«Динамика портфелей».[/grey70]")
+    return True
+
+
 # ── Создание папок по датам ──────────────────────────────────────────────────
 def _source_configs(report: settings.ReportSource) -> List[file_discovery.SourceConfig]:
     """Источники отчёта как SourceConfig — их собирает config по ключам настроек.
@@ -436,8 +500,8 @@ def run_interactive() -> None:
             ui.console.print(_groups_table())
             ui.console.print(
                 "[grey70]п — проверить пути, д — создать папки по датам, "
-                "р — дополнительные портфели, с — сбросить всё к значениям по "
-                "умолчанию, 0 — выйти в главное меню[/grey70]"
+                "р — дополнительные портфели, и — история из старого отчёта, "
+                "с — сбросить всё к значениям по умолчанию, 0 — выйти[/grey70]"
             )
             choice = ui.ask("Раздел (номер) или действие", default="0").strip().lower()
 
@@ -446,6 +510,13 @@ def run_interactive() -> None:
             if choice in ("п", "p"):
                 ui.console.print()
                 ui.console.print(_paths_table())
+                continue
+            if choice in ("и", "i"):
+                try:
+                    changed |= _history_screen()
+                except KeyboardInterrupt:
+                    ui.console.print()
+                    ui.cancelled("Выбор файла истории отменён.")
                 continue
             if choice in ("р", "r"):
                 try:

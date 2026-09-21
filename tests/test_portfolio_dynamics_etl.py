@@ -296,14 +296,27 @@ class IncrementalTests(PortfolioDynamicsTestCase):
         self.assertEqual(new_row["portfolio_type"], "HTM")
 
     def test_unknown_prefix_leaves_type_empty(self):
+        """Код, не сводящийся ни к одному известному типу, остаётся без типа:
+        лучше пусто и предупреждение, чем выдуманный тип «ZZZ»."""
         previous = self.bootstrap_release()
         t0_with_new = write_export(self.tmp / "t0_unknown" / export_name("01.09.2026"),
+                                   T0_ROWS + [("Позиция: ZZZ_STRANGE", None, None, None),
+                                              ("Bond", 5 * MLN, 1.0, 1.0)])
+
+        data = self.build(previous=previous, t0_path=t0_with_new)
+        new_row = data.dim_portfolio.set_index("portfolio_code").loc["ZZZ_STRANGE"]
+        self.assertIsNone(new_row["portfolio_type"])
+
+    def test_known_type_in_the_code_is_recognised(self):
+        previous = self.bootstrap_release()
+        t0_with_new = write_export(self.tmp / "t0_known" / export_name("01.09.2026"),
                                    T0_ROWS + [("Позиция: TSS_FX", None, None, None),
                                               ("Bond", 5 * MLN, 1.0, 1.0)])
 
         data = self.build(previous=previous, t0_path=t0_with_new)
-        new_row = data.dim_portfolio.set_index("portfolio_code").loc["TSS_FX"]
-        self.assertIsNone(new_row["portfolio_type"])
+        self.assertEqual(
+            data.dim_portfolio.set_index("portfolio_code").loc["TSS_FX", "portfolio_type"],
+            "TSS")
 
     def test_limits_are_carried_over_untouched(self):
         previous = self.bootstrap_release()

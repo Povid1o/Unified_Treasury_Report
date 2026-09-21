@@ -102,6 +102,27 @@ def folder_for_date(source: SourceConfig, target_date: dt.date) -> Path:
     return Path(source.directory) / target_date.strftime(source.date_folder_format)
 
 
+def _parse_with_format(text: str, date_format: str) -> Optional[dt.date]:
+    """Дата из строки, не придираясь к разделителю.
+
+    Выгрузка называет файл то через «_», то через «.» — привязываться к одному
+    написанию значит регулярно не находить файл на ровном месте.
+    """
+    variants = {text}
+    for separator in ("_", ".", "-"):
+        variants.add(re.sub(r"[._-]", separator, text))
+    formats = {date_format}
+    for separator in ("_", ".", "-"):
+        formats.add(re.sub(r"[._-]", separator, date_format))
+    for variant in variants:
+        for fmt in formats:
+            try:
+                return dt.datetime.strptime(variant, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
 def _dated(paths: List[Path], source: SourceConfig) -> List[Candidate]:
     """Файлы с их датами среза; файлы без распознаваемой даты отбрасываются."""
     pattern = re.compile(source.filename_regex) if source.filename_regex else None
@@ -111,10 +132,7 @@ def _dated(paths: List[Path], source: SourceConfig) -> List[Candidate]:
         if pattern is not None:
             match = pattern.search(path.name)
             if match:
-                try:
-                    parsed = dt.datetime.strptime(match.group(1), source.date_format).date()
-                except ValueError:
-                    parsed = None
+                parsed = _parse_with_format(match.group(1), source.date_format)
         if parsed is None:
             parsed = read_business_date(path)  # дороже: открывает книгу
         if parsed is not None:
@@ -170,16 +188,34 @@ def _plan_limits(limits_source: Optional[SourceConfig], downloads_dir: Optional[
     # файл лимитов.
     in_folder = [f for f in _files_in_folder(limits_source, folder)
                  if _is_limits(limits_source, f)]
-    here = next((c.path for c in _dated(in_folder, limits_source)
-                 if c.business_date == target_date), None)
-    if here is not None:
-        return here, []
+    candidates = [(c, False) for c in _dated(in_folder, limits_source)]
+    if downloads_dir:
+        here = {c.path.name for c, _ in candidates}
+        candidates += [(c, True) for c in scan_downloads(limits_source, downloads_dir)
+                       if c.path.name not in here]
 
-    for candidate in scan_downloads(limits_source, downloads_dir) if downloads_dir else []:
-        if candidate.business_date == target_date:
-            destination = folder / candidate.path.name
-            return destination, [(candidate.path, destination)]
-    return None, []
+    # Лимиты из будущего брать нельзя; на прошлую дату — можно, они меняются
+    # редко, и отчёт без лимитов вовсе бесполезнее отчёта с чуть устаревшими.
+    usable = [(c, from_downloads) for c, from_downloads in candidates
+              if c.business_date <= target_date]
+    if not usable:
+        return None, []
+
+    exact = [item for item in usable if item[0].business_date == target_date]
+    chosen, from_downloads = (exact or sorted(
+        usable, key=lambda item: item[0].business_date, reverse=True))[0]
+
+    if chosen.business_date != target_date:
+        logger.warning(
+            "Файла лимитов на %s нет — взят ближайший более ранний, на %s (%s). "
+            "Если лимиты с тех пор менялись, выгрузите их на отчётную дату.",
+            target_date.isoformat(), chosen.business_date.isoformat(), chosen.path.name,
+        )
+
+    if not from_downloads:
+        return chosen.path, []
+    destination = folder / chosen.path.name
+    return destination, [(chosen.path, destination)]
 
 
 def plan_import(source: SourceConfig, downloads_dir: Optional[Path],

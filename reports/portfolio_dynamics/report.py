@@ -119,6 +119,12 @@ class PortfolioDynamicsReport(Report):
         workbook.save_workbook(data, output_path, checks=checks)
 
         failed = [cid for cid, status, _value in checks if status == "FAIL"]
+        if limits_path is None:
+            ui.warning(
+                "Файл лимитов не найден — лимиты и границы зон взяты из предыдущего "
+                "выпуска. Чтобы понять, почему он не нашёлся, запустите "
+                "«python console.py portfolio-dynamics --diagnose»."
+            )
         ui.success(
             f"Готово: {len(data.fact_portfolio_snapshot)} портфелей, "
             f"{len(data.fact_type_daily)} строк истории -> {output_path}"

@@ -31,12 +31,15 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    LIMIT_COLUMNS, PortfolioDynamicsError, canonical_type, logger, parse_number,
-    parse_nested_limits, parse_type_parents,
+    KNOWN_PORTFOLIO_TYPES, LIMIT_COLUMNS, PortfolioDynamicsError, canonical_type,
+    logger, parse_number, parse_nested_limits, parse_type_parents,
 )
 
 COL_LIMIT_TYPE = "Тип лимита"
 COL_LIMIT_AMOUNT = "Лимит сверху"
+# Необязательная колонка: сколько лимита ещё не выбрано по данным самой системы
+# лимитов. Нужна для сверки с объёмом, посчитанным по выгрузке позиций.
+COL_LIMIT_REMAINING = "Остаток лимита сверху"
 
 # Границы зон — доли от установленного лимита (limit_amount). Значения
 # ЗАФИКСИРОВАНЫ казначейством и намеренно НЕ вынесены в настройки: это не
@@ -75,11 +78,33 @@ def parse_aliases(raw: str) -> Dict[str, str]:
     return aliases
 
 
+def resolve_type(raw_name, aliases: Dict[str, str]) -> str:
+    """Имя строки из файла лимитов -> тип портфеля.
+
+    В выгрузке типы названы «Облигации AFS», «Облигации HTM» и просто
+    «Облигации» (это торговый). Точного псевдонима на каждую формулировку не
+    напасёшься, поэтому: сначала точное соответствие из настроек, затем поиск
+    ИЗВЕСТНОГО ТИПА внутри названия (самого длинного — чтобы «Облигации
+    HTM_KUAP» не свелось к HTM), и только потом имя как есть.
+    """
+    normalized = excel_io.normalize_label(raw_name)
+    if normalized in aliases:
+        return canonical_type(aliases[normalized])
+
+    upper = str(raw_name).upper()
+    inside = [t for t in KNOWN_PORTFOLIO_TYPES if t in upper]
+    if inside:
+        return max(inside, key=len)
+
+    return canonical_type(raw_name)
+
+
 def _find_header(path: Path) -> Tuple[str, pd.DataFrame, int, Dict[str, int]]:
     """Лист и строка с колонкой «Тип лимита»; рядом — индексы нужных колонок."""
     wanted = {
         COL_LIMIT_TYPE: excel_io.normalize_label(COL_LIMIT_TYPE),
         COL_LIMIT_AMOUNT: excel_io.normalize_label(COL_LIMIT_AMOUNT),
+        COL_LIMIT_REMAINING: excel_io.normalize_label(COL_LIMIT_REMAINING),
     }
     seen: List[str] = []
     for sheet_name, matrix in excel_io.iter_sheet_matrices(path):
@@ -122,8 +147,12 @@ def parse_limits_file(path: Path, scale: Optional[float] = None,
     sheet_name, matrix, header_row, columns = _find_header(path)
     type_col = columns[COL_LIMIT_TYPE]
     amount_col = columns[COL_LIMIT_AMOUNT]
+    remaining_col = columns.get(COL_LIMIT_REMAINING)
+    if remaining_col is None:
+        logger.info("В файле лимитов нет колонки «%s» — сверка использования пропущена.",
+                    COL_LIMIT_REMAINING)
 
-    rows: List[Tuple[str, str, float]] = []  # (тип, как названо в файле, лимит)
+    rows: List[Tuple[str, str, float, Optional[float]]] = []
     skipped_without_amount = 0
     for row_idx in range(header_row + 1, len(matrix)):
         raw_name = matrix.iloc[row_idx].iloc[type_col]
@@ -134,8 +163,11 @@ def parse_limits_file(path: Path, scale: Optional[float] = None,
         if amount is None:
             skipped_without_amount += 1
             continue
-        portfolio_type = canonical_type(aliases.get(normalized, str(raw_name)))
-        rows.append((portfolio_type, str(raw_name).strip(), amount / scale))
+        portfolio_type = resolve_type(raw_name, aliases)
+        remaining = (parse_number(matrix.iloc[row_idx].iloc[remaining_col])
+                     if remaining_col is not None else None)
+        rows.append((portfolio_type, str(raw_name).strip(), amount / scale,
+                     None if remaining is None else remaining / scale))
 
     if not rows:
         raise PortfolioDynamicsError(
@@ -144,7 +176,8 @@ def parse_limits_file(path: Path, scale: Optional[float] = None,
             f"«{COL_LIMIT_AMOUNT}»."
         )
 
-    frame = pd.DataFrame(rows, columns=["portfolio_type", "source_name", "limit_amount"])
+    frame = pd.DataFrame(
+        rows, columns=["portfolio_type", "source_name", "limit_amount", "remaining_amount"])
     duplicated = frame[frame.duplicated("portfolio_type", keep=False)]
     best = (frame.sort_values("limit_amount", ascending=False)
                  .drop_duplicates("portfolio_type", keep="first")
@@ -167,7 +200,7 @@ def parse_limits_file(path: Path, scale: Optional[float] = None,
         path.name, sheet_name, header_row + 1, len(frame), len(best),
         f", строк без суммы пропущено {skipped_without_amount}" if skipped_without_amount else "",
     )
-    return best[["portfolio_type", "limit_amount"]]
+    return best[["portfolio_type", "limit_amount", "remaining_amount"]]
 
 
 def _split_nested(from_file: Dict[str, float], known_types: set) -> Dict[str, float]:
@@ -258,29 +291,39 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
     Тип, которого в файле нет, сохраняет лимит из предыдущего выпуска — иначе
     один неполный файл обнулил бы уже согласованные лимиты.
     """
-    known_upper = {str(t).upper() for t in known_types if pd.notna(t) and str(t).strip()}
-    known_upper.update(ZONE_PERCENTS)
+    # Типы, которые вообще существуют в этом отчёте: из справочника и из
+    # предыдущего выпуска.
+    known_upper = {canonical_type(t) for t in known_types if pd.notna(t) and str(t).strip()}
+    # Согласованные типы узнаются в файле, даже если портфелей такого типа
+    # сегодня нет, — но САМИ ПО СЕБЕ в реестр не добавляются: тип без лимита,
+    # без портфелей и без строки в файле — это пустая строка, из-за которой
+    # CHK_19 («лимиты <= 0») падал бы на каждом запуске.
+    recognised = known_upper | set(ZONE_PERCENTS)
 
-    from_file = {str(row.portfolio_type).upper(): float(row.limit_amount)
+    from_file = {canonical_type(row.portfolio_type): float(row.limit_amount)
                  for row in parsed.itertuples()}
-    from_file = _split_nested(from_file, known_upper)
-    matched = {t: v for t, v in from_file.items() if t in known_upper}
+    from_file = _split_nested(from_file, recognised)
+    matched = {t: v for t, v in from_file.items() if t in recognised}
     ignored = sorted(set(from_file) - set(matched))
     if ignored:
         logger.info(
             "Лимиты: строк файла не отнесены ни к одному типу портфелей и пропущены "
             "(%d): %s. Известные типы: %s. Если какая-то из них всё же нужна — "
             "добавьте соответствие в настройку «Соответствия типов в файле лимитов».",
-            len(ignored), ", ".join(ignored), ", ".join(sorted(known_upper)),
+            len(ignored), ", ".join(ignored), ", ".join(sorted(recognised)),
         )
 
     previous_by_type = {}
     if previous is not None and not previous.empty:
-        previous_by_type = {str(row.portfolio_type).upper(): row
+        previous_by_type = {canonical_type(row.portfolio_type): row
                             for row in previous.itertuples()}
 
+    # В реестр идут типы, у которых есть хоть что-то: лимит из файла, портфели
+    # в справочнике или строка в предыдущем выпуске.
+    types_in_report = sorted(set(matched) | known_upper | set(previous_by_type))
+
     records = []
-    for portfolio_type in sorted(known_upper):
+    for portfolio_type in types_in_report:
         if portfolio_type in matched:
             limit_amount = matched[portfolio_type]
             green, yellow, red = zones_for(portfolio_type, limit_amount)
@@ -302,7 +345,7 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
             "valid_from": business_date, "updated_by": None,
         })
 
-    missing = sorted(t for t in known_upper if t not in matched)
+    missing = sorted(t for t in types_in_report if t not in matched)
     if missing:
         logger.warning(
             "Лимиты: в файле нет строк для типов %s — для них сохранены значения из "
@@ -312,6 +355,52 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
     frame = pd.DataFrame(records, columns=LIMIT_COLUMNS)
     _log_changes(frame, previous_by_type)
     return frame
+
+
+def check_utilisation(parsed: pd.DataFrame, volumes: Dict[str, float]) -> List[str]:
+    """Сверяет использование лимита по двум независимым источникам.
+
+    Файл лимитов знает, сколько лимита ещё не выбрано («Остаток лимита сверху»),
+    то есть косвенно — сколько уже занято. Отчёт считает занятое сам, из
+    выгрузки позиций. Расхождение означает, что либо типы сопоставлены не так,
+    либо источники разошлись, — и это надо увидеть, а не узнать от казначейства.
+
+    Возвращает список расхождений (для лога и для тестов).
+    """
+    if parsed is None or parsed.empty or "remaining_amount" not in parsed.columns:
+        return []
+
+    problems: List[str] = []
+    for row in parsed.itertuples():
+        remaining = getattr(row, "remaining_amount", None)
+        if remaining is None or pd.isna(remaining):
+            continue
+        portfolio_type = canonical_type(row.portfolio_type)
+        ours = volumes.get(portfolio_type)
+        if ours is None:
+            continue
+        implied = float(row.limit_amount) - float(remaining)
+        logger.info(
+            "Лимиты: %s — лимит %s, остаток по файлу %s, значит занято %s; "
+            "по выгрузке позиций занято %s.",
+            portfolio_type, f"{row.limit_amount:,.0f}", f"{remaining:,.0f}",
+            f"{implied:,.0f}", f"{ours:,.0f}",
+        )
+        reference = max(abs(implied), abs(ours))
+        if reference and abs(implied - ours) / reference > config.PORTFOLIO_DYNAMICS_TOLERANCE:
+            problems.append(
+                f"{portfolio_type}: по файлу лимитов занято {implied:,.0f}, "
+                f"по выгрузке позиций {ours:,.0f}"
+            )
+
+    if problems:
+        logger.warning(
+            "Использование лимита по файлу и по выгрузке позиций расходится (%d): %s. "
+            "Обычно это значит, что строка файла отнесена не к тому типу, либо "
+            "выгрузки сделаны на разные моменты.",
+            len(problems), "; ".join(problems),
+        )
+    return problems
 
 
 def _log_changes(frame: pd.DataFrame, previous_by_type: dict) -> None:
