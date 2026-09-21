@@ -320,6 +320,28 @@ SETTINGS: List[Setting] = [
              "Свой лимит у вложенного типа при этом остаётся и работает как подлимит.",
     ),
     Setting(
+        key="portfolio_dynamics_history_file", label="Файл с историей (старый формат)",
+        kind="file", group="portfolio_dynamics", default="",
+        help="Отчёт старого формата, из которого один раз подтягивается накопленная "
+             "история объёмов по типам: листы «Динамика AFS», «Динамика HTM», "
+             "«Динамика TSS» с колонками «Дата» и «Текущий объём». Используется, когда "
+             "предыдущего выпуска ещё нет. Импорт только ДОПОЛНЯЕТ: даты, уже "
+             "накопленные своими запусками, не перезаписываются. Пусто — не подтягивать.",
+    ),
+    Setting(
+        key="portfolio_dynamics_history_aliases", label="Соответствия типов в файле истории",
+        kind="pairs", group="portfolio_dynamics", default="TSS=TTS",
+        help="Через запятую, вида «имя листа=тип портфеля». В старом отчёте торговый "
+             "портфель назван TSS, а в схеме v3.0 он TTS.",
+    ),
+    Setting(
+        key="portfolio_dynamics_history_scale", label="Делитель истории", kind="float",
+        group="portfolio_dynamics", default=1_000_000.0,
+        help="Объёмы в старом отчёте указаны в рублях, а схема требует млн RUB. "
+             "Если импорт разойдётся с сегодняшними объёмами на порядки, отчёт "
+             "предупредит об этом в логе.",
+    ),
+    Setting(
         key="portfolio_dynamics_nested_limits", label="Сколько отдано вложенным типам",
         kind="pairs", group="portfolio_dynamics", default="",
         help="Через запятую, вида «тип=сумма в млн RUB». Лимит в выгрузке совокупный: "
@@ -404,6 +426,10 @@ def parse_value(setting: Setting, raw: Any) -> Any:
 
     if setting.kind in ("dir", "file"):
         if not str(text):
+            # Пустой путь допустим там, где значение по умолчанию тоже пустое:
+            # это означает «не задано», а не ошибку ввода.
+            if str(setting.default) == "":
+                return ""
             raise SettingsError(f"[{setting.key}] Путь не может быть пустым.")
         return Path(str(text)).expanduser()
 
@@ -549,7 +575,11 @@ def get(key: str) -> Any:
         return parse_value(SETTINGS_BY_KEY[key], overrides[key])
     value = default_of(key)
     setting = SETTINGS_BY_KEY[key]
-    return Path(value) if setting.kind in ("dir", "file") and not isinstance(value, Path) else value
+    if setting.kind in ("dir", "file") and not isinstance(value, Path):
+        # Пустая строка означает «путь не задан»; Path("") дал бы текущую
+        # папку («.»), и отчёт полез бы читать её как файл.
+        return Path(value) if str(value) else ""
+    return value
 
 
 def values() -> Dict[str, Any]:

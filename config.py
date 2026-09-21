@@ -71,6 +71,9 @@ PORTFOLIO_DYNAMICS_TOLERANCE: float
 PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
 PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
 PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
+PORTFOLIO_DYNAMICS_HISTORY_FILE: str
+PORTFOLIO_DYNAMICS_HISTORY_ALIASES: str
+PORTFOLIO_DYNAMICS_HISTORY_SCALE: float
 PORTFOLIO_DYNAMICS_LIMITS_REGEX: str
 PORTFOLIO_DYNAMICS_LIMITS_SOURCE: SourceConfig
 PORTFOLIO_DYNAMICS_LIMIT_SCALE: float
@@ -175,6 +178,10 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_TYPE_PARENTS"] = v["portfolio_dynamics_type_parents"]
     # Сколько из совокупного лимита выделено вложенному типу (млн RUB).
     g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
+    # Разовый импорт накопленной истории из отчёта старого формата.
+    g["PORTFOLIO_DYNAMICS_HISTORY_FILE"] = v["portfolio_dynamics_history_file"]
+    g["PORTFOLIO_DYNAMICS_HISTORY_ALIASES"] = v["portfolio_dynamics_history_aliases"]
+    g["PORTFOLIO_DYNAMICS_HISTORY_SCALE"] = v["portfolio_dynamics_history_scale"]
     g["PORTFOLIO_DYNAMICS_LIMITS_REGEX"] = v["portfolio_dynamics_limits_regex"]
     g["PORTFOLIO_DYNAMICS_LIMITS_SOURCE"] = SourceConfig(
         directory=v["portfolio_dynamics_dir"], filename_regex=v["portfolio_dynamics_limits_regex"],

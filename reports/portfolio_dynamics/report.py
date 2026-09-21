@@ -75,6 +75,12 @@ class PortfolioDynamicsReport(Report):
                  "заметки. По умолчанию — самый свежий файл в выходной папке.",
         )
         parser.add_argument(
+            "--history", type=str, default=None,
+            help="Отчёт старого формата, из которого подтянуть накопленную историю "
+                 "объёмов по типам (листы «Динамика AFS/HTM/TSS»). По умолчанию — путь "
+                 "из настроек, если он задан.",
+        )
+        parser.add_argument(
             "--bootstrap", action="store_true",
             help="Первый выпуск: предыдущего файла нет, история заводится с одной даты, "
                  "лимиты — нулевые (заполняются руками).",
@@ -105,7 +111,8 @@ class PortfolioDynamicsReport(Report):
 
         limits_path = _resolve_limits_path(t0_path, args)
         data = etl.build_data(t0_path, t7_path, previous_path=previous_path,
-                              bootstrap=bootstrap, limits_path=limits_path)
+                              bootstrap=bootstrap, limits_path=limits_path,
+                              history_path=_resolve_history_path(args))
 
         output_path = Path(args.output) if args.output else _default_output_path(data.business_date)
         checks = workbook.evaluate_checks(data)
@@ -158,6 +165,7 @@ class PortfolioDynamicsReport(Report):
 
         previous = etl.find_previous_release(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
         bootstrap = False
+        history = None
         if previous is None:
             ui.warning(
                 "Предыдущий выпуск отчёта не найден в "
@@ -168,6 +176,7 @@ class PortfolioDynamicsReport(Report):
             answer = ui.ask("Создать первый выпуск? (y/N) или путь к предыдущему файлу", default="N")
             if answer.strip().lower().startswith("y"):
                 bootstrap = True
+                history = _ask_for_history()
             elif answer.strip() and not answer.strip().lower().startswith("n"):
                 previous = Path(answer.strip().strip('"'))
             else:
@@ -180,7 +189,7 @@ class PortfolioDynamicsReport(Report):
             t0_input=str(t0_path), t7_input=str(t7_path), folder=None, diagnose=False,
             date=None, no_import=no_import, t0_date=None, t7_date=None,
             previous=str(previous) if previous is not None else None,
-            bootstrap=bootstrap, output=None,
+            bootstrap=bootstrap, history=history, output=None,
         )
 
 
@@ -231,6 +240,12 @@ def diagnose(args: argparse.Namespace) -> None:
     ui.console.print()
     _print_downloads(source, downloads)
 
+    ui.console.print()
+    _print_limits(downloads, data_dir)
+
+    ui.console.print()
+    _print_history_source()
+
     rows = _available_dates(args)
     ui.console.print()
     if rows:
@@ -241,6 +256,64 @@ def diagnose(args: argparse.Namespace) -> None:
         ui.console.print("[bold red]Ни одной даты, на которую можно построить отчёт.[/bold red]")
         ui.console.print("[grey70]Отчёту нужны ДВА файла: на отчётную дату и на более раннюю "
                          "(T-7). Одного файла недостаточно.[/grey70]")
+
+
+def _print_history_source() -> None:
+    """Откуда возьмётся накопленная история объёмов по типам."""
+    configured = config.PORTFOLIO_DYNAMICS_HISTORY_FILE
+    previous = etl.find_previous_release(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
+    ui.console.print("[bold]История объёмов по типам (лист fact_type_daily)[/bold]")
+    if previous is not None:
+        ui.console.print(f"  [bold green]✓[/bold green] переносится из предыдущего "
+                         f"выпуска: {previous.name}")
+    else:
+        ui.console.print("  [yellow]![/yellow] предыдущего выпуска нет — история начнётся "
+                         "с одной даты")
+    if configured and str(configured).strip():
+        exists = Path(str(configured)).exists()
+        mark = "[bold green]✓[/bold green]" if exists else "[bold red]✗[/bold red]"
+        ui.console.print(f"  {mark} импорт из отчёта старого формата: {configured}")
+    else:
+        ui.console.print("  [grey50]импорт из отчёта старого формата не настроен "
+                         "(«Файл с историей», либо аргумент --history)[/grey50]")
+
+
+def _print_limits(downloads: Path, data_dir: Path) -> None:
+    """Файлы лимитов — третий вход отчёта, и их тоже надо видеть.
+
+    Ищутся по своему шаблону имени (дата через подчёркивания) и берутся строго
+    на отчётную дату: файл лимитов на другую дату не подойдёт.
+    """
+    limits_source = config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE
+    ui.console.print("[bold]Файлы лимитов[/bold]")
+    ui.console.print(Text.assemble(
+        "  шаблон имени: ", (str(limits_source.filename_regex), "grey70")))
+
+    found = []
+    if downloads.is_dir():
+        found += [("загрузки", c) for c in inbox.scan_downloads(limits_source, downloads)]
+    if data_dir.is_dir():
+        for folder in file_discovery.find_date_folders(limits_source):
+            files = [f for f in folder.files if etl.is_limits_file(f)]
+            found += [("папка " + folder.path.name, c)
+                      for c in inbox._dated(files, limits_source)]
+
+    if not found:
+        ui.console.print("  [grey50]не найдено ни одного — лимиты будут перенесены "
+                         "из предыдущего выпуска[/grey50]")
+    for where, candidate in sorted(found, key=lambda item: item[1].business_date, reverse=True)[:10]:
+        ui.console.print(Text.assemble(
+            ("  ✓ ", "bold green"), candidate.path.name,
+            (f"   на дату {candidate.business_date.isoformat()}, {where}", "grey70")))
+
+    allocations = etl.parse_nested_limits()
+    parents = etl.parse_type_parents()
+    ui.console.print(f"  [grey50]вложенность типов: "
+                     f"{', '.join(f'{c} в {p}' for c, p in parents.items()) or 'не задана'}"
+                     f"[/grey50]")
+    ui.console.print(f"  [grey50]выделено вложенным: "
+                     f"{', '.join(f'{t} = {v:,.0f}' for t, v in allocations.items()) or 'не задано '
+                        '(объём вложенного типа складывается с объемлющим)'}[/grey50]")
 
 
 def _print_loose_files(source: file_discovery.SourceConfig, data_dir: Path) -> None:
@@ -333,6 +406,28 @@ def _dates_table(rows) -> Table:
     return table
 
 
+def _ask_for_history() -> Optional[str]:
+    """Предлагает подтянуть накопленную историю из отчёта старого формата.
+
+    Спрашивается только на ПЕРВОМ выпуске: дальше история накапливается сама и
+    живёт в предыдущем файле отчёта.
+    """
+    configured = config.PORTFOLIO_DYNAMICS_HISTORY_FILE
+    if configured and str(configured).strip():
+        ui.console.print(f"[grey70]История будет подтянута из {configured} "
+                         "(настройка «Файл с историей»).[/grey70]")
+        return None  # путь возьмётся из настройки
+
+    ui.console.print(
+        "[grey70]Лист истории объёмов по типам (fact_type_daily) у первого выпуска "
+        "пуст: она накапливается по одной дате за запуск. Если история уже ведётся "
+        "в отчёте старого формата (листы «Динамика AFS», «Динамика HTM», "
+        "«Динамика TSS»), её можно подтянуть оттуда.[/grey70]"
+    )
+    answer = ui.ask("Путь к файлу с историей (Enter — не подтягивать)")
+    return answer.strip().strip('"') or None
+
+
 def _ask_for_date(args: argparse.Namespace):
     """Спрашивает отчётную дату. None — подходящих дат не нашлось совсем."""
     rows = _available_dates(args)
@@ -416,6 +511,20 @@ def _resolve_slice_paths(args: argparse.Namespace) -> tuple:
         return _from_folder(folder)
 
     return _two_latest_flat(source)
+
+
+def _resolve_history_path(args: argparse.Namespace) -> Optional[Path]:
+    """Файл старого формата для разового импорта истории: аргумент или настройка."""
+    raw = getattr(args, "history", None) or config.PORTFOLIO_DYNAMICS_HISTORY_FILE
+    if not raw or not str(raw).strip():
+        return None
+    path = Path(str(raw).strip().strip('"'))
+    if not path.exists():
+        raise etl.PortfolioDynamicsError(
+            f"Файл с историей не найден: {path}. Уберите путь из настройки «Файл с "
+            "историей (старый формат)» либо поправьте его."
+        )
+    return path
 
 
 def _resolve_limits_path(t0_path: Path, args: argparse.Namespace) -> Optional[Path]:

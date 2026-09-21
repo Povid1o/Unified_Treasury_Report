@@ -567,6 +567,7 @@ class PortfolioDynamicsData:
     history_rows_carried: int = 0
     history_rows_added: int = 0
     history_rows_replaced: int = 0
+    history_rows_imported: int = 0
     notes_restored: int = 0
 
 
@@ -758,6 +759,32 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
     )
 
 
+def _import_history(previous: PreviousRelease, history_path: Optional[Path]) -> int:
+    """Дополняет историю предыдущего выпуска строками из отчёта старого формата.
+
+    Меняет previous.fact_type_daily на месте: дальше он идёт в _build_type_daily
+    обычным путём, и импортированные даты ничем не отличаются от накопленных.
+
+    Импорт внутри функции: history.py читает константы из etl.py, и импорт на
+    уровне модуля замкнул бы их в кольцо.
+    """
+    if history_path is None:
+        return 0
+
+    from reports.portfolio_dynamics import history as history_module
+
+    imported = history_module.parse_history_file(Path(history_path))
+    merged, added, skipped = history_module.merge_into(previous.fact_type_daily, imported)
+    previous.fact_type_daily = merged
+    if skipped:
+        logger.info(
+            "История: %d импортированных строк пропущено — эти даты уже есть в отчёте "
+            "и перезаписи не подлежат.", skipped,
+        )
+    logger.info("История: из %s добавлено строк %d", Path(history_path).name, added)
+    return added
+
+
 def _parse_limits(limits_path: Optional[Path]):
     """Разбирает файл лимитов, если он есть. None — файла нет.
 
@@ -867,13 +894,17 @@ def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.Data
 
 
 def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = None,
-               bootstrap: bool = False, limits_path: Optional[Path] = None
-               ) -> PortfolioDynamicsData:
+               bootstrap: bool = False, limits_path: Optional[Path] = None,
+               history_path: Optional[Path] = None) -> PortfolioDynamicsData:
     """Полный цикл ETL: два среза + предыдущий выпуск -> четыре таблицы схемы v3.0.
 
     limits_path — выгрузка «Состояние лимитов» на отчётную дату. Есть файл —
     лимиты и границы зон берутся из него; нет — переносятся из предыдущего
     выпуска, как было раньше.
+
+    history_path — отчёт СТАРОГО формата, из которого один раз подтягивается
+    уже накопленная история объёмов по типам. Импорт только дополняет: даты,
+    накопленные своими запусками, не перезаписываются.
     """
     t0 = parse_slice(t0_path, "T0")
     t7 = parse_slice(t7_path, "T-7")
@@ -919,10 +950,19 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
     limit_types += list(parse_nested_limits())
     limit_types += list(parse_type_parents()) + list(parse_type_parents().values())
 
+    imported_rows = _import_history(previous, history_path)
     dim, new_codes = _build_dim(t0, previous, bootstrap, extra_types=limit_types)
     limits = _resolve_limits(dim, previous, business_date, bootstrap, limits_path, parsed_limits)
     snapshot, notes_restored = _build_snapshot(t0, t7, business_date, previous)
     history, carried, added, replaced = _build_type_daily(snapshot, dim, limits, previous, business_date)
+
+    if history_path is not None:
+        from reports.portfolio_dynamics import history as history_module
+        today = history[history["business_date"] == business_date]
+        history_module.warn_if_scale_looks_wrong(
+            previous.fact_type_daily,
+            dict(zip(today["portfolio_type"].astype(str), today["volume_amount"])),
+        )
 
     missing = sorted(set(dim["portfolio_code"].astype(str)) - set(snapshot["portfolio_code"].astype(str)))
 
@@ -969,6 +1009,7 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
         missing_portfolio_codes=missing,
         history_rows_carried=carried,
         history_rows_added=added,
+        history_rows_imported=imported_rows,
         history_rows_replaced=replaced,
         notes_restored=notes_restored,
     )
