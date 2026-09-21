@@ -1,3 +1,5 @@
+# Минимальная версия Python — 3.9 (на рабочих машинах стоит 3.9/3.10).
+# Проверяется tests/test_python_compatibility.py, см. README.
 pandas
 numpy
 requests

@@ -4,6 +4,8 @@
 
 ## Установка
 
+Минимальная версия Python — **3.9** (на рабочих машинах стоит 3.9/3.10).
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
@@ -398,7 +400,20 @@ python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx --boots
 python -m unittest tests.test_ovp_etl tests.test_portfolio_dynamics_etl \
     tests.test_settings tests.test_date_folders tests.test_inbox \
     tests.test_limits tests.test_history tests.test_manual_portfolios \
-    tests.test_workbook_formulas
+    tests.test_workbook_formulas tests.test_python_compatibility
+```
+
+`tests/test_python_compatibility.py` проверяет, что весь код компилируется на
+Python 3.9. Это не паранойя: синтаксис, появившийся позже, интерпретатор
+разработчика принимает молча, а у пользователя падает сразу на импорте консоли.
+Нужен `pip install parso` — парсер с грамматикой конкретной версии; без него
+тест пропускается. Ни `ast.parse(feature_version=...)`, ни `vermin` такие
+ошибки не ловят (проверено). Полная гарантия — прогнать набор настоящим
+интерпретатором 3.9:
+
+```bash
+uv venv --python 3.9 py39 && uv pip install --python py39/bin/python -r requirements.txt
+py39/bin/python -m unittest tests.test_portfolio_dynamics_etl ...
 ```
 
 `tests/test_workbook_formulas.py` проверяет выходной .xlsx на двух уровнях.

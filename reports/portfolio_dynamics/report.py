@@ -308,12 +308,15 @@ def _print_limits(downloads: Path, data_dir: Path) -> None:
 
     allocations = etl.parse_nested_limits()
     parents = etl.parse_type_parents()
-    ui.console.print(f"  [grey50]вложенность типов: "
-                     f"{', '.join(f'{c} в {p}' for c, p in parents.items()) or 'не задана'}"
-                     f"[/grey50]")
-    ui.console.print(f"  [grey50]выделено вложенным: "
-                     f"{', '.join(f'{t} = {v:,.0f}' for t, v in allocations.items()) or 'не задано '
-                        '(объём вложенного типа складывается с объемлющим)'}[/grey50]")
+    nesting = ", ".join("{} в {}".format(child, parent)
+                        for child, parent in parents.items())
+    allocated = ", ".join("{} = {:,.0f}".format(name, value)
+                          for name, value in allocations.items())
+    ui.console.print("  [grey50]вложенность типов: %s[/grey50]"
+                     % (nesting or "не задана"))
+    ui.console.print("  [grey50]выделено вложенным: %s[/grey50]"
+                     % (allocated or "не задано (объём вложенного типа "
+                                     "складывается с объемлющим)"))
 
 
 def _print_loose_files(source: file_discovery.SourceConfig, data_dir: Path) -> None:
