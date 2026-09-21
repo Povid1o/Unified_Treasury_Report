@@ -468,6 +468,9 @@ class PreviousRelease:
     fact_limit: pd.DataFrame
     fact_type_daily: pd.DataFrame
     notes: pd.DataFrame  # portfolio_code, note_text
+    # Объёмы прошлого среза: нужны, чтобы у портфелей, ведущихся вручную,
+    # получалась настоящая дельта, а не ноль.
+    snapshot_volumes: Optional[Dict[str, float]] = None
 
     @classmethod
     def empty(cls) -> "PreviousRelease":
@@ -477,6 +480,7 @@ class PreviousRelease:
             fact_limit=pd.DataFrame(columns=LIMIT_COLUMNS),
             fact_type_daily=pd.DataFrame(columns=TYPE_DAILY_COLUMNS),
             notes=pd.DataFrame(columns=["portfolio_code", "note_text"]),
+            snapshot_volumes={},
         )
 
 
@@ -545,8 +549,42 @@ def load_previous_release(path: Path) -> PreviousRelease:
     notes = snapshot[["portfolio_code", "note_text"]]
     notes = notes[notes["portfolio_code"].notna()].copy()
 
+    _canonicalise_types(dim, limit, history, path)
+
+    volumes = snapshot[snapshot["portfolio_code"].notna()]
+    volumes = dict(zip(volumes["portfolio_code"].astype(str),
+                       pd.to_numeric(volumes["volume_t0"], errors="coerce")))
+
     return PreviousRelease(path=path, dim_portfolio=dim, fact_limit=limit,
-                           fact_type_daily=history, notes=notes)
+                           fact_type_daily=history, notes=notes,
+                           snapshot_volumes={k: v for k, v in volumes.items() if pd.notna(v)})
+
+
+def _canonicalise_types(*frames_and_path) -> None:
+    """Приводит имена типов из предыдущего выпуска к каноническому написанию.
+
+    Выпуски, сделанные до переименования, содержат TTS. Без приведения в
+    отчёте оказались бы ДВА торговых типа сразу — старый в перенесённой истории
+    и новый в свежей строке, — и история торгового портфеля разорвалась бы
+    надвое.
+    """
+    *frames, path = frames_and_path
+    renamed = 0
+    for frame in frames:
+        if frame is None or frame.empty or "portfolio_type" not in frame.columns:
+            continue
+        original = frame["portfolio_type"].copy()
+        frame["portfolio_type"] = [
+            canonical_type(v) if pd.notna(v) and str(v).strip() else v
+            for v in frame["portfolio_type"]
+        ]
+        renamed += int((original.astype(str) != frame["portfolio_type"].astype(str)).sum())
+    if renamed:
+        logger.info(
+            "Предыдущий выпуск %s: %d значений типа приведено к каноническому написанию "
+            "(TTS -> TSS) — иначе история торгового портфеля разорвалась бы надвое.",
+            Path(path).name, renamed,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -646,21 +684,91 @@ def types_counted_in(portfolio_type: str, parents: Dict[str, str]) -> List[str]:
     return [str(portfolio_type).upper()] + descendants_of(portfolio_type, parents)
 
 
-def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
-    """Тип портфеля по его коду.
+# Торговый тип называется TSS — так его зовут в казначействе и в отчёте
+# старого формата. В CONTRACT.md и эталонном шаблоне он назван TTS, поэтому
+# старое написание продолжает приниматься везде (в настройках, в файлах, в
+# уже выпущенных отчётах) и приводится к каноническому в одном месте.
+TYPE_SPELLINGS = {"TTS": "TSS"}
 
-    Если список известных типов задан — выбирается САМЫЙ ДЛИННЫЙ из них,
-    которым код начинается: HTM_KUAP_CORE -> HTM_KUAP, а не HTM. Резка по
-    первому "_" дала бы здесь HTM и увела бы объём КУАП в чужой тип.
-    Без известных типов остаётся прежнее правило: префикс до первого "_"
-    (AFS_TR_RUR -> AFS, HTM_ALCO -> HTM).
+# Четыре согласованных типа (CONTRACT.md, п. 8.1). Известны всегда, даже когда
+# файла лимитов нет: без этого AFS_OFZ_PD попадал бы под правило «OFZ_PD -> TTS»
+# и уезжал в торговый портфель, хотя начинается с типа AFS.
+KNOWN_PORTFOLIO_TYPES = ("AFS", "HTM", "HTM_KUAP", "TSS")
+
+
+def canonical_type(name) -> str:
+    """Каноническое написание типа: TSS и TTS — один и тот же торговый тип."""
+    text = str(name).strip().upper()
+    return TYPE_SPELLINGS.get(text, text)
+
+
+def manual_portfolios() -> List[dict]:
+    """Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
+
+    Задаются в настройках («Дополнительные портфели»). Попадают и в справочник,
+    и в срез, и в объём своего типа — иначе их объём выпал бы из светофора.
+    """
+    records = config.PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS or []
+    return [dict(r, type=canonical_type(r["type"])) for r in records]
+
+
+def parse_type_rules(raw: Optional[str] = None) -> Dict[str, str]:
+    """«HTM=HTM, OFZ_PD=TSS» -> {подстрока в коде: тип}, В ПОРЯДКЕ ЗАПИСИ.
+
+    Порядок важен: срабатывает первое подходящее правило, поэтому более общие
+    правила должны стоять ниже частных.
+    """
+    raw = config.PORTFOLIO_DYNAMICS_TYPE_RULES if raw is None else raw
+    rules: Dict[str, str] = {}
+    for item in str(raw or "").split(","):
+        marker, _, portfolio_type = item.partition("=")
+        if marker.strip() and portfolio_type.strip():
+            rules[marker.strip().upper()] = canonical_type(portfolio_type)
+    return rules
+
+
+def parse_portfolio_overrides(raw: Optional[str] = None) -> Dict[str, str]:
+    """«OFZ_SPECIAL=AFS» -> {код портфеля: тип}. Точечные исключения."""
+    raw = config.PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES if raw is None else raw
+    overrides: Dict[str, str] = {}
+    for item in str(raw or "").split(","):
+        code, _, portfolio_type = item.partition("=")
+        if code.strip() and portfolio_type.strip():
+            overrides[code.strip().upper()] = canonical_type(portfolio_type)
+    return overrides
+
+
+def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
+    """Тип портфеля по его коду. Порядок правил — от частного к общему.
+
+    1. Точечное исключение из настроек («Разметка отдельных портфелей»).
+    2. Самый ДЛИННЫЙ известный тип, которым код начинается: HTM_KUAP_CORE ->
+       HTM_KUAP, а не HTM. Это должно идти раньше правил по подстроке, иначе
+       правило «HTM» перехватывало бы КУАП и уводило его объём в чужой тип.
+    3. Правила по ВХОЖДЕНИЮ подстроки («Правила разметки по имени портфеля»):
+       OFZ_HTM -> HTM, OFZ_PD/OFZ_PK/OFZ_CNY -> торговый. Срабатывает первое
+       подходящее, поэтому порядок в настройке — это приоритет.
+    4. Если ничего не подошло — префикс до первого «_» (AFS_TR_RUR -> AFS).
     """
     code = str(portfolio_code).upper()
-    matches = [t for t in {str(t).upper() for t in known_types if str(t).strip()}
-               if code == t or code.startswith(t + "_")]
+
+    override = parse_portfolio_overrides().get(code)
+    if override:
+        return override
+
+    candidates = {canonical_type(t) for t in known_types if str(t).strip()}
+    candidates.update(KNOWN_PORTFOLIO_TYPES)
+    matches = [t for t in candidates if code == t or code.startswith(t + "_")]
     if matches:
         return max(matches, key=len)
-    return code.split("_", 1)[0]
+
+    for marker, portfolio_type in parse_type_rules().items():
+        if marker in code:
+            return portfolio_type
+
+    # Канонизируем и здесь: код TTS_OFZ, оставшийся с прежнего написания,
+    # должен дать тот же тип, что и TSS_OFZ.
+    return canonical_type(code.split("_", 1)[0])
 
 
 def _next_sort_order(dim: pd.DataFrame) -> int:
@@ -690,16 +798,29 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
                            for code in t0.frame["portfolio_code"])
 
     known_codes = set(dim["portfolio_code"].astype(str))
-    new_codes = [c for c in t0.frame["portfolio_code"] if c not in known_codes]
+    # Дополнительные портфели ведутся руками и в выгрузке не встречаются —
+    # в справочник они должны попасть наравне с выгруженными.
+    codes_in_report = list(t0.frame["portfolio_code"]) + [
+        r["code"] for r in manual_portfolios()
+    ]
+    new_codes = []
+    for code in codes_in_report:
+        if code not in known_codes and code not in new_codes:
+            new_codes.append(code)
 
     sort_order = _next_sort_order(dim)
+    # У портфеля, заведённого вручную, название и тип известны точно — их
+    # указал человек, гадать по коду не нужно.
+    manual_by_code = {r["code"]: r for r in manual_portfolios()}
     additions = []
     for code in new_codes:
+        manual = manual_by_code.get(code)
         guessed = guess_type(code, known_types)
         additions.append({
             "portfolio_code": code,
-            "portfolio_name": code,
-            "portfolio_type": guessed if guessed in known_types else None,
+            "portfolio_name": manual["name"] if manual else code,
+            "portfolio_type": manual["type"] if manual else (
+                guessed if guessed in known_types else None),
             "include_in_total": True,
             "is_limit_controlled": True,
             "sort_order": sort_order,
@@ -711,8 +832,31 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
 
     dim["sort_order"] = pd.to_numeric(dim["sort_order"], errors="coerce")
     dim = dim.sort_values(["sort_order", "portfolio_code"], na_position="last").reset_index(drop=True)
+    _apply_portfolio_overrides(dim)
     _apply_nesting_to_total_flag(dim)
     return dim[DIM_COLUMNS], new_codes
+
+
+def _apply_portfolio_overrides(dim: pd.DataFrame) -> None:
+    """Проставляет типы из точечных исключений, в том числе уже размеченным строкам.
+
+    Иначе настройка работала бы только для новых кодов, а исправить уже
+    неверно размеченный портфель можно было бы только правкой файла руками.
+    Колонка ручная, поэтому каждое изменение пишется в лог.
+    """
+    overrides = parse_portfolio_overrides()
+    if not overrides or dim.empty:
+        return
+    for index, row in dim.iterrows():
+        code = str(row["portfolio_code"]).upper()
+        wanted = overrides.get(code)
+        if wanted is None or str(row["portfolio_type"] or "").upper() == wanted:
+            continue
+        logger.warning(
+            "Портфель %s размечен как %s по настройке «Разметка отдельных портфелей» "
+            "(было: %s).", row["portfolio_code"], wanted, row["portfolio_type"] or "пусто",
+        )
+        dim.at[index, "portfolio_type"] = wanted
 
 
 def _apply_nesting_to_total_flag(dim: pd.DataFrame) -> None:
@@ -748,7 +892,14 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
     if not bootstrap or not previous.fact_limit.empty:
         return previous.fact_limit[LIMIT_COLUMNS].copy()
 
-    types = sorted({guess_type(code, dim["portfolio_type"].dropna()) for code in dim["portfolio_code"]})
+    # Тип берётся из справочника, а не угадывается по коду заново: у портфеля,
+    # заведённого вручную, он указан человеком, и повторное угадывание завело бы
+    # в fact_limit лишний тип (OFZ_EXTRA -> «OFZ») с нулевым объёмом.
+    types = {canonical_type(t) for t in dim["portfolio_type"].dropna() if str(t).strip()}
+    for code, portfolio_type in zip(dim["portfolio_code"], dim["portfolio_type"]):
+        if not str(portfolio_type or "").strip():
+            types.add(guess_type(code, types))
+    types = sorted(types)
     return pd.DataFrame(
         [{
             "portfolio_type": t, "limit_amount": 0, "green_max_util": 0,
@@ -823,6 +974,7 @@ def _build_snapshot(t0: PortfolioSlice, t7: PortfolioSlice, business_date: dt.da
     snapshot = t0.frame.rename(columns={"volume": "volume_t0"}).copy()
     volumes_t7 = t7.frame[["portfolio_code", "volume"]].rename(columns={"volume": "volume_t7"})
     snapshot = snapshot.merge(volumes_t7, on="portfolio_code", how="left")
+    snapshot = _add_manual_portfolios(snapshot, previous)
     snapshot.insert(0, "business_date", business_date)
 
     notes = previous.notes.copy()
@@ -835,6 +987,48 @@ def _build_snapshot(t0: PortfolioSlice, t7: PortfolioSlice, business_date: dt.da
 
     restored = int(snapshot["note_text"].notna().sum())
     return snapshot[SNAPSHOT_COLUMNS], restored
+
+
+def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) -> pd.DataFrame:
+    """Дописывает в срез портфели, которые ведутся вручную.
+
+    volume_t7 берётся из предыдущего выпуска: тогда правка объёма в настройках
+    видна в отчёте как настоящая дельта. Предыдущего значения нет — берём тот же
+    объём, чтобы дельта была нулевой, а не выдуманной (и чтобы CHK_13 не падал
+    на пустом volume_t7).
+    """
+    records = manual_portfolios()
+    if not records:
+        return snapshot
+
+    previous_t0 = {}
+    if previous.snapshot_volumes is not None:
+        previous_t0 = previous.snapshot_volumes
+
+    existing = set(snapshot["portfolio_code"].astype(str))
+    additions = []
+    for record in records:
+        if record["code"] in existing:
+            logger.warning(
+                "Портфель %s задан в «Дополнительных портфелях», но он есть и в выгрузке "
+                "позиций — значение из настроек не применяется, взято из выгрузки.",
+                record["code"],
+            )
+            continue
+        additions.append({
+            "portfolio_code": record["code"],
+            "volume": record["volume"],
+            "volume_t0": record["volume"],
+            "volume_t7": previous_t0.get(record["code"], record["volume"]),
+            "duration_current_yrs": record["duration"],
+            "duration_target_yrs": record["duration"],
+        })
+
+    if not additions:
+        return snapshot
+    logger.info("Дополнительных портфелей добавлено в срез: %d (%s)",
+                len(additions), ", ".join(a["portfolio_code"] for a in additions))
+    return pd.concat([snapshot, pd.DataFrame(additions)], ignore_index=True)
 
 
 def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.DataFrame,

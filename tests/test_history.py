@@ -3,7 +3,7 @@
 Старый формат: по листу на тип («Динамика AFS», «Динамика HTM», «Динамика
 TSS»), в каждом колонки «Дата», «Текущий объём», «Изменение». Проверяется то,
 что при переносе легко испортить незаметно: имя торгового типа (TSS против
-TTS), единицы, и главное — что импорт только дополняет и никогда не
+TSS), единицы, и главное — что импорт только дополняет и никогда не
 перезаписывает то, что отчёт накопил сам.
 """
 import datetime as dt
@@ -56,7 +56,7 @@ DAYS = [dt.date(2026, 9, 1), dt.date(2026, 9, 2), dt.date(2026, 9, 3)]
 DEFAULT_SHEETS = {
     "AFS": [(d, (300 + i) * RUB) for i, d in enumerate(DAYS)],
     "HTM": [(d, (600 + i) * RUB) for i, d in enumerate(DAYS)],
-    "TSS": [(d, (200 + i) * RUB) for i, d in enumerate(DAYS)],  # торговый назван TSS
+    "TSS": [(d, (200 + i) * RUB) for i, d in enumerate(DAYS)],  # торговый портфель
 }
 
 
@@ -92,13 +92,13 @@ class ParseTests(HistoryTestCase):
     def test_one_sheet_per_type_is_read(self):
         frame = self.parse()
         self.assertEqual(len(frame), 9)
-        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TTS"])
+        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])
 
-    def test_trading_type_is_renamed_from_the_old_name(self):
-        """В старом отчёте торговый портфель — TSS, в схеме v3.0 — TTS."""
-        frame = self.parse()
-        self.assertIn("TTS", set(frame["portfolio_type"]))
-        self.assertNotIn("TSS", set(frame["portfolio_type"]))
+    def test_old_spelling_of_the_trading_type_is_accepted(self):
+        """Лист мог называться и «Динамика TTS» — прежнее написание понимается."""
+        sheets = {"TTS": [(DAYS[0], 200 * RUB)]}
+        frame = self.parse(sheets)
+        self.assertEqual(list(frame["portfolio_type"]), ["TSS"])
 
     def test_roubles_are_converted_to_millions(self):
         frame = self.parse().set_index(["business_date", "portfolio_type"])
@@ -131,7 +131,7 @@ class ParseTests(HistoryTestCase):
         wb.save(path)
 
         frame = history.parse_history_file(path)
-        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TTS"])
+        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])
 
     def test_sheet_without_required_columns_is_reported(self):
         wb = Workbook()
@@ -224,7 +224,7 @@ class EndToEndTests(HistoryTestCase):
     def setUp(self):
         super().setUp()
         from test_portfolio_dynamics_etl import export_name
-        portfolios = [("AFS_A", 300), ("HTM_G", 600), ("TTS_OFZ", 200)]
+        portfolios = [("AFS_A", 300), ("HTM_G", 600), ("TSS_OFZ", 200)]
 
         def rows(scale):
             out = []
@@ -256,7 +256,7 @@ class EndToEndTests(HistoryTestCase):
         today = data.fact_type_daily[
             data.fact_type_daily["business_date"] == data.business_date]
         self.assertEqual(dict(zip(today["portfolio_type"], today["volume_amount"])),
-                         {"AFS": 300, "HTM": 600, "TTS": 200})
+                         {"AFS": 300, "HTM": 600, "TSS": 200})
 
     def test_without_history_nothing_changes(self):
         data = self.build()

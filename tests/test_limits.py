@@ -1,7 +1,7 @@
 """Тесты разбора выгрузки «Состояние лимитов» и сборки листа fact_limit.
 
 Проверяется то, что тихо испортит светофор: выбор из двух строк AFS, перевод
-«Облигации» в TTS, единицы (рубли -> млн), проценты зон и то, что неполный файл
+«Облигации» в TSS, единицы (рубли -> млн), проценты зон и то, что неполный файл
 не обнуляет уже согласованные лимиты.
 """
 import datetime as dt
@@ -29,7 +29,7 @@ LIMITS_HEADER = ["Подразделение", "Тип лимита", "Валю�
                  "Лимит снизу", "Лимит сверху", "Использование"]
 # Проценты зон из согласованной таблицы казначейства (зелёная, жёлтая, красная).
 EXPECTED_PERCENTS = {
-    "TTS": (0.7808, 0.8509, 0.9510),
+    "TSS": (0.7808, 0.8509, 0.9510),
     "AFS": (0.9032, 0.9355, 0.9677),
     "HTM": (0.8929, 0.9286, 0.9643),
     "HTM_KUAP": (0.7800, 0.8500, 0.9500),
@@ -100,7 +100,7 @@ class LimitsTestCase(unittest.TestCase):
 class ParseTests(LimitsTestCase):
     def test_header_is_found_despite_the_blank_row_under_it(self):
         parsed = self.parse()
-        self.assertEqual(set(parsed["portfolio_type"]), {"AFS", "HTM", "HTM_KUAP", "TTS", "ПРОЧИЙ ЛИМИТ"})
+        self.assertEqual(set(parsed["portfolio_type"]), {"AFS", "HTM", "HTM_KUAP", "TSS", "ПРОЧИЙ ЛИМИТ"})
 
     def test_header_row_is_found_by_content_not_by_number(self):
         """Форму выгрузки подвинут на строку — разбор не должен развалиться."""
@@ -112,10 +112,10 @@ class ParseTests(LimitsTestCase):
         self.assertAlmostEqual(parsed.loc["AFS", "limit_amount"], 40_000)
 
     def test_trading_portfolio_is_renamed_to_its_type(self):
-        """В файле лимитов торговый портфель называется «Облигации», в отчёте — TTS."""
+        """В файле лимитов торговый портфель называется «Облигации», в отчёте — TSS."""
         parsed = self.parse().set_index("portfolio_type")
-        self.assertIn("TTS", parsed.index)
-        self.assertAlmostEqual(parsed.loc["TTS", "limit_amount"], 45_000)
+        self.assertIn("TSS", parsed.index)
+        self.assertAlmostEqual(parsed.loc["TSS", "limit_amount"], 45_000)
         self.assertNotIn("ОБЛИГАЦИИ", parsed.index)
 
     def test_roubles_are_converted_to_millions(self):
@@ -143,7 +143,7 @@ class ParseTests(LimitsTestCase):
         config.reload()
         parsed = self.parse().set_index("portfolio_type")
         self.assertIn("HFT", parsed.index)
-        self.assertNotIn("TTS", parsed.index)
+        self.assertNotIn("TSS", parsed.index)
 
 
 class ZoneTests(LimitsTestCase):
@@ -180,8 +180,8 @@ class BuildFactLimitTests(LimitsTestCase):
         )
 
     def test_only_known_portfolio_types_get_into_fact_limit(self):
-        frame = self.build(["AFS", "HTM", "HTM_KUAP", "TTS"])
-        self.assertEqual(sorted(frame["portfolio_type"]), ["AFS", "HTM", "HTM_KUAP", "TTS"])
+        frame = self.build(["AFS", "HTM", "HTM_KUAP", "TSS"])
+        self.assertEqual(sorted(frame["portfolio_type"]), ["AFS", "HTM", "HTM_KUAP", "TSS"])
 
     def test_unrelated_limit_rows_are_ignored(self):
         frame = self.build(["AFS"])
@@ -221,17 +221,89 @@ class TypeGuessTests(unittest.TestCase):
     def test_longest_known_type_wins(self):
         """HTM_KUAP_CORE — это КУАП, а не HTM: резка по первому «_» уводила бы
         объём КУАП в чужой тип."""
-        known = ["AFS", "HTM", "HTM_KUAP", "TTS"]
+        known = ["AFS", "HTM", "HTM_KUAP", "TSS"]
         self.assertEqual(etl.guess_type("HTM_KUAP_CORE", known), "HTM_KUAP")
         self.assertEqual(etl.guess_type("HTM_ALCO", known), "HTM")
         self.assertEqual(etl.guess_type("HTM_KUAP", known), "HTM_KUAP")
 
-    def test_falls_back_to_the_prefix_without_known_types(self):
-        self.assertEqual(etl.guess_type("HTM_KUAP_CORE"), "HTM")
+    def test_agreed_types_are_known_even_without_a_limits_file(self):
+        """Четыре типа из CONTRACT.md известны всегда, файл лимитов не нужен."""
+        self.assertEqual(etl.guess_type("HTM_KUAP_CORE"), "HTM_KUAP")
         self.assertEqual(etl.guess_type("AFS_TR_RUR"), "AFS")
+        self.assertEqual(etl.guess_type("TSS_OFZ"), "TSS")
 
     def test_unknown_code_keeps_the_prefix_rule(self):
         self.assertEqual(etl.guess_type("XXX_NEW", ["AFS", "HTM"]), "XXX")
+
+
+class TypeRuleTests(LimitsTestCase):
+    """Разметка по ВХОЖДЕНИЮ подстроки в код портфеля."""
+
+    def test_any_code_containing_htm_is_htm(self):
+        for code in ("OFZ_HTM", "HTM_GOV", "RUB_HTM_LONG"):
+            with self.subTest(code=code):
+                self.assertEqual(etl.guess_type(code), "HTM")
+
+    def test_ofz_instruments_are_the_trading_type(self):
+        for code in ("OFZ_PD", "OFZ_PK_2027", "OFZ_CNY_A", "PORTFEL_OFZ_PD_1"):
+            with self.subTest(code=code):
+                self.assertEqual(etl.guess_type(code), "TSS")
+
+    def test_known_type_prefix_beats_a_substring_rule(self):
+        """Иначе правило «HTM» перехватило бы КУАП и увело его объём в чужой тип."""
+        self.assertEqual(etl.guess_type("HTM_KUAP_CORE"), "HTM_KUAP")
+        self.assertEqual(etl.guess_type("AFS_OFZ_PD"), "AFS")
+
+    def test_rules_are_applied_in_the_written_order(self):
+        rules = etl.parse_type_rules("OFZ_PD=TSS, HTM=HTM")
+        self.assertEqual(list(rules), ["OFZ_PD", "HTM"])
+
+    def test_rules_are_configurable(self):
+        settings.set_value("portfolio_dynamics_type_rules", "LINKER=HTM, HTM=HTM")
+        config.reload()
+        self.assertEqual(etl.guess_type("RUB_LINKER_5Y"), "HTM")
+
+    def test_both_spellings_of_the_trading_type_are_accepted(self):
+        """В настройках можно писать и TSS, и TSS — тип один и тот же."""
+        self.assertEqual(etl.parse_type_rules("OFZ_PD=TSS")["OFZ_PD"], "TSS")
+        self.assertEqual(etl.parse_type_rules("OFZ_PD=TSS")["OFZ_PD"], "TSS")
+        self.assertEqual(etl.canonical_type("tss"), "TSS")
+
+
+class PortfolioOverrideTests(LimitsTestCase):
+    """Точечная разметка конкретного портфеля — исключение из всех правил."""
+
+    def test_override_wins_over_every_rule(self):
+        settings.set_value("portfolio_dynamics_portfolio_types", "OFZ_HTM=AFS")
+        config.reload()
+        self.assertEqual(etl.guess_type("OFZ_HTM"), "AFS")
+        self.assertEqual(etl.guess_type("OFZ_HTM_OTHER"), "HTM", "правило для прочих в силе")
+
+    def test_override_accepts_the_old_spelling(self):
+        settings.set_value("portfolio_dynamics_portfolio_types", "HTM_GOV=TSS")
+        config.reload()
+        self.assertEqual(etl.guess_type("HTM_GOV"), "TSS")
+
+    def test_override_fixes_an_already_marked_portfolio(self):
+        """Иначе исправить неверно размеченный портфель можно было бы только руками."""
+        dim = pd.DataFrame([
+            ["OFZ_HTM", "ОФЗ", "HTM", True, True, 10],
+        ], columns=etl.DIM_COLUMNS)
+        settings.set_value("portfolio_dynamics_portfolio_types", "OFZ_HTM=AFS")
+        config.reload()
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            etl._apply_portfolio_overrides(dim)
+
+        self.assertEqual(dim.iloc[0]["portfolio_type"], "AFS")
+        self.assertTrue(any("OFZ_HTM" in line for line in captured.output))
+
+    def test_no_overrides_changes_nothing(self):
+        dim = pd.DataFrame([
+            ["OFZ_HTM", "ОФЗ", "HTM", True, True, 10],
+        ], columns=etl.DIM_COLUMNS)
+        etl._apply_portfolio_overrides(dim)
+        self.assertEqual(dim.iloc[0]["portfolio_type"], "HTM")
 
 
 class NestedFixture(LimitsTestCase):
@@ -246,10 +318,10 @@ class NestedFixture(LimitsTestCase):
         from test_portfolio_dynamics_etl import export_name, write_export, MLN
         self.downloads = self.tmp / "downloads"
         self.downloads.mkdir(exist_ok=True)
-        # HTM собственный 150 000 + КУАП 50 000; AFS 55 000; TTS 32 000
+        # HTM собственный 150 000 + КУАП 50 000; AFS 55 000; TSS 32 000
         self.portfolios = [("AFS_A", 30_000), ("AFS_B", 25_000), ("HTM_GOV", 90_000),
                            ("HTM_ALCO", 60_000), ("HTM_KUAP_CORE", 50_000),
-                           ("TTS_OFZ", 20_000), ("TTS_CORP", 12_000)]
+                           ("TSS_OFZ", 20_000), ("TSS_CORP", 12_000)]
 
         def rows(scale):
             out = []

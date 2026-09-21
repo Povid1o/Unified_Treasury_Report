@@ -71,6 +71,9 @@ PORTFOLIO_DYNAMICS_TOLERANCE: float
 PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
 PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
 PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
+PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS: list
+PORTFOLIO_DYNAMICS_TYPE_RULES: str
+PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES: str
 PORTFOLIO_DYNAMICS_HISTORY_FILE: str
 PORTFOLIO_DYNAMICS_HISTORY_ALIASES: str
 PORTFOLIO_DYNAMICS_HISTORY_SCALE: float
@@ -178,6 +181,11 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_TYPE_PARENTS"] = v["portfolio_dynamics_type_parents"]
     # Сколько из совокупного лимита выделено вложенному типу (млн RUB).
     g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
+    # Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
+    g["PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS"] = v["portfolio_dynamics_manual_portfolios"]
+    # Разметка портфелей по типам: правила по подстроке в коде и точечные исключения.
+    g["PORTFOLIO_DYNAMICS_TYPE_RULES"] = v["portfolio_dynamics_type_rules"]
+    g["PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES"] = v["portfolio_dynamics_portfolio_types"]
     # Разовый импорт накопленной истории из отчёта старого формата.
     g["PORTFOLIO_DYNAMICS_HISTORY_FILE"] = v["portfolio_dynamics_history_file"]
     g["PORTFOLIO_DYNAMICS_HISTORY_ALIASES"] = v["portfolio_dynamics_history_aliases"]

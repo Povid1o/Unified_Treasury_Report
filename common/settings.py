@@ -58,7 +58,13 @@ KIND_HINTS = {
     "float": "число > 0",
     "bool": "да / нет",
     "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
+    "portfolios": "список портфелей (код, название, тип, объём); правится своим экраном",
 }
+
+# Поля записи дополнительного портфеля (kind="portfolios").
+PORTFOLIO_FIELDS = ("code", "name", "type", "volume", "duration")
+# Подсказка в диалоге: четыре согласованных типа (CONTRACT.md, п. 8.1).
+KNOWN_TYPES_HINT = ("AFS", "HTM", "HTM_KUAP", "TSS")
 
 _TRUE_WORDS = {"да", "д", "yes", "y", "true", "1", "вкл", "on"}
 _FALSE_WORDS = {"нет", "н", "no", "n", "false", "0", "выкл", "off"}
@@ -320,6 +326,33 @@ SETTINGS: List[Setting] = [
              "Свой лимит у вложенного типа при этом остаётся и работает как подлимит.",
     ),
     Setting(
+        key="portfolio_dynamics_manual_portfolios", label="Дополнительные портфели",
+        kind="portfolios", group="portfolio_dynamics", default=[],
+        help="Портфели, которых нет в выгрузке позиций, но объём по ним нужно вести "
+             "вручную: код, название, тип, объём в млн RUB и (желательно) дюрация. "
+             "Попадают и в справочник dim_portfolio, и в срез, и в объём своего типа. "
+             "Правятся экраном «Настройки» -> «Дополнительные портфели» (добавить, "
+             "изменить, удалить).",
+    ),
+    Setting(
+        key="portfolio_dynamics_type_rules", label="Правила разметки по имени портфеля",
+        kind="pairs", group="portfolio_dynamics",
+        default="HTM=HTM, OFZ_PD=TSS, OFZ_PK=TSS, OFZ_CNY=TSS",
+        help="Через запятую, вида «подстрока в коде=тип». Проверяется ВХОЖДЕНИЕ, а не "
+             "начало: OFZ_HTM размечается как HTM. Порядок важен — срабатывает первое "
+             "подходящее правило, поэтому более общие правила пишите ниже. Применяется "
+             "после точного совпадения с известным типом (HTM_KUAP_CORE остаётся "
+             "HTM_KUAP) и до разбора префикса до первого «_».",
+    ),
+    Setting(
+        key="portfolio_dynamics_portfolio_types", label="Разметка отдельных портфелей",
+        kind="pairs", group="portfolio_dynamics", default="",
+        help="Через запятую, вида «код портфеля=тип». Исключения, которые не ложатся ни "
+             "в одно правило: разметка конкретного портфеля вручную. Имеет наивысший "
+             "приоритет и перебивает даже уже проставленный тип в dim_portfolio — "
+             "каждое изменение пишется в лог.",
+    ),
+    Setting(
         key="portfolio_dynamics_history_file", label="Файл с историей (старый формат)",
         kind="file", group="portfolio_dynamics", default="",
         help="Отчёт старого формата, из которого один раз подтягивается накопленная "
@@ -330,9 +363,10 @@ SETTINGS: List[Setting] = [
     ),
     Setting(
         key="portfolio_dynamics_history_aliases", label="Соответствия типов в файле истории",
-        kind="pairs", group="portfolio_dynamics", default="TSS=TTS",
-        help="Через запятую, вида «имя листа=тип портфеля». В старом отчёте торговый "
-             "портфель назван TSS, а в схеме v3.0 он TTS.",
+        kind="pairs", group="portfolio_dynamics", default="",
+        help="Через запятую, вида «имя листа=тип портфеля». Нужно, только если лист "
+             "назван не так, как называется тип: «Динамика TSS» отчёт понимает и без "
+             "псевдонимов.",
     ),
     Setting(
         key="portfolio_dynamics_history_scale", label="Делитель истории", kind="float",
@@ -373,7 +407,7 @@ SETTINGS: List[Setting] = [
     ),
     Setting(
         key="portfolio_dynamics_limit_aliases", label="Соответствия типов в файле лимитов",
-        kind="pairs", group="portfolio_dynamics", default="Облигации=TTS",
+        kind="pairs", group="portfolio_dynamics", default="Облигации=TSS",
         help="Через запятую, вида «имя в файле лимитов=тип портфеля». Торговый портфель "
              "выгрузка лимитов называет «Облигации», а в отчёте он TTS. Строки файла, не "
              "сводящиеся ни к одному известному типу, в fact_limit не попадают и "
@@ -452,6 +486,9 @@ def parse_value(setting: Setting, raw: Any) -> Any:
             )
         return pattern
 
+    if setting.kind == "portfolios":
+        return _parse_portfolios(setting, raw)
+
     if setting.kind == "pairs":
         text = str(text).strip()
         if not text:
@@ -506,6 +543,74 @@ def parse_value(setting: Setting, raw: Any) -> Any:
         return value
 
     raise SettingsError(f"[{setting.key}] Неизвестный вид значения {setting.kind!r}.")
+
+
+def _parse_portfolios(setting: "Setting", raw: Any) -> List[dict]:
+    """Проверяет список дополнительных портфелей: код, название, тип, объём.
+
+    Дюрация необязательна, но её отсутствие — не мелочь: CHK_14 считает
+    портфели без текущей дюрации, и пустое значение сделает лист checks
+    красным. Поэтому None допускается, а экран правки об этом предупреждает.
+    """
+    if raw in (None, "", []):
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SettingsError(
+                f"[{setting.key}] Ожидается список портфелей; правьте его через "
+                f"«Настройки» -> «Дополнительные портфели». Разбор не удался: {exc}"
+            ) from exc
+    if not isinstance(raw, list):
+        raise SettingsError(f"[{setting.key}] Ожидается список записей, получено {type(raw).__name__}.")
+
+    result: List[dict] = []
+    seen = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise SettingsError(f"[{setting.key}] Запись портфеля должна быть объектом: {item!r}")
+        code = str(item.get("code", "")).strip().upper()
+        portfolio_type = str(item.get("type", "")).strip().upper()
+        if not code:
+            raise SettingsError(f"[{setting.key}] У записи не указан код портфеля: {item!r}")
+        if not portfolio_type:
+            raise SettingsError(f"[{setting.key}] У портфеля {code} не указан тип.")
+        if code in seen:
+            raise SettingsError(f"[{setting.key}] Код портфеля {code} указан дважды.")
+        seen.add(code)
+
+        try:
+            volume = float(str(item.get("volume", "")).replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError) as exc:
+            raise SettingsError(
+                f"[{setting.key}] У портфеля {code} некорректный объём "
+                f"{item.get('volume')!r}: ожидается число в млн RUB."
+            ) from exc
+        if volume < 0:
+            raise SettingsError(f"[{setting.key}] Объём портфеля {code} не может быть отрицательным.")
+
+        duration = item.get("duration")
+        if duration in (None, ""):
+            duration = None
+        else:
+            try:
+                duration = float(str(duration).replace(" ", "").replace(",", "."))
+            except (TypeError, ValueError) as exc:
+                raise SettingsError(
+                    f"[{setting.key}] У портфеля {code} некорректная дюрация {duration!r}."
+                ) from exc
+            if duration < 0:
+                raise SettingsError(f"[{setting.key}] Дюрация портфеля {code} не может быть отрицательной.")
+
+        result.append({
+            "code": code,
+            "name": str(item.get("name") or code).strip(),
+            "type": portfolio_type,
+            "volume": volume,
+            "duration": duration,
+        })
+    return result
 
 
 def _serialize(value: Any) -> Any:

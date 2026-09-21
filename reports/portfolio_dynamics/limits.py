@@ -31,7 +31,7 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    LIMIT_COLUMNS, PortfolioDynamicsError, logger, parse_number,
+    LIMIT_COLUMNS, PortfolioDynamicsError, canonical_type, logger, parse_number,
     parse_nested_limits, parse_type_parents,
 )
 
@@ -45,7 +45,7 @@ COL_LIMIT_AMOUNT = "Лимит сверху"
 # согласованием; тест test_zone_percents_match_the_agreed_table сверяет её с
 # исходными цифрами.
 #
-#   Торговый (TTS)  красная 95,10 %  жёлтая 85,09 %  зелёная 78,08 %
+#   Торговый (TSS)  красная 95,10 %  жёлтая 85,09 %  зелёная 78,08 %
 #   AFS             красная 96,77 %  жёлтая 93,55 %  зелёная 90,32 %
 #   HTM             красная 96,43 %  жёлтая 92,86 %  зелёная 89,29 %
 #   HTM_KUAP        красная 95,00 %  жёлтая 85,00 %  зелёная 78,00 %
@@ -54,7 +54,7 @@ COL_LIMIT_AMOUNT = "Лимит сверху"
 # равен лимиту.
 #            (зелёная, жёлтая, красная)
 ZONE_PERCENTS: Dict[str, Tuple[float, float, float]] = {
-    "TTS":      (0.7808, 0.8509, 0.9510),  # торговый портфель, в файле «Облигации»
+    "TSS":      (0.7808, 0.8509, 0.9510),  # торговый портфель, в файле «Облигации»
     "AFS":      (0.9032, 0.9355, 0.9677),
     "HTM":      (0.8929, 0.9286, 0.9643),
     "HTM_KUAP": (0.7800, 0.8500, 0.9500),
@@ -134,7 +134,7 @@ def parse_limits_file(path: Path, scale: Optional[float] = None,
         if amount is None:
             skipped_without_amount += 1
             continue
-        portfolio_type = aliases.get(normalized, str(raw_name).strip().upper())
+        portfolio_type = canonical_type(aliases.get(normalized, str(raw_name)))
         rows.append((portfolio_type, str(raw_name).strip(), amount / scale))
 
     if not rows:
@@ -234,7 +234,7 @@ def _split_nested(from_file: Dict[str, float], known_types: set) -> Dict[str, fl
 
 def zones_for(portfolio_type: str, limit_amount: float) -> Tuple[float, float, float]:
     """Границы зон как доли от лимита (зелёная, жёлтая, красная)."""
-    percents = ZONE_PERCENTS.get(str(portfolio_type).upper())
+    percents = ZONE_PERCENTS.get(canonical_type(portfolio_type))
     if percents is None:
         percents = DEFAULT_ZONE_PERCENTS
         logger.warning(

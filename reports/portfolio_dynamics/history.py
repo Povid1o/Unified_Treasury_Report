@@ -29,7 +29,7 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    TYPE_DAILY_COLUMNS, PortfolioDynamicsError, logger, parse_number,
+    TYPE_DAILY_COLUMNS, PortfolioDynamicsError, canonical_type, logger, parse_number,
 )
 
 SHEET_PREFIX = "Динамика"
@@ -44,7 +44,8 @@ _DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y", "%d_%m_%Y")
 def parse_aliases(raw: Optional[str] = None) -> Dict[str, str]:
     """«TSS=TTS» -> {нормализованное имя из файла: тип портфеля}.
 
-    В старом отчёте торговый портфель назван TSS, в схеме v3.0 — TTS.
+    Нужны, только если лист назван не так, как называется тип: написание TSS
+    отчёт понимает и без псевдонимов.
     """
     raw = config.PORTFOLIO_DYNAMICS_HISTORY_ALIASES if raw is None else raw
     aliases: Dict[str, str] = {}
@@ -64,7 +65,7 @@ def _type_from_sheet(sheet_name: str, aliases: Dict[str, str]) -> Optional[str]:
     raw_type = sheet_name.strip()[len(SHEET_PREFIX):].strip(" -_:")
     if not raw_type:
         return None
-    return aliases.get(excel_io.normalize_label(raw_type), raw_type.upper())
+    return canonical_type(aliases.get(excel_io.normalize_label(raw_type), raw_type))
 
 
 def _parse_date(value) -> Optional[dt.date]:

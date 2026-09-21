@@ -298,11 +298,11 @@ class IncrementalTests(PortfolioDynamicsTestCase):
     def test_unknown_prefix_leaves_type_empty(self):
         previous = self.bootstrap_release()
         t0_with_new = write_export(self.tmp / "t0_unknown" / export_name("01.09.2026"),
-                                   T0_ROWS + [("Позиция: TTS_FX", None, None, None),
+                                   T0_ROWS + [("Позиция: TSS_FX", None, None, None),
                                               ("Bond", 5 * MLN, 1.0, 1.0)])
 
         data = self.build(previous=previous, t0_path=t0_with_new)
-        new_row = data.dim_portfolio.set_index("portfolio_code").loc["TTS_FX"]
+        new_row = data.dim_portfolio.set_index("portfolio_code").loc["TSS_FX"]
         self.assertIsNone(new_row["portfolio_type"])
 
     def test_limits_are_carried_over_untouched(self):

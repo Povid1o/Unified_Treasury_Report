@@ -23,8 +23,15 @@ MENU_TITLE = "Настройки"
 MENU_DESCRIPTION = "Пути к папкам, шаблоны имён файлов и константы отчётов — без правки config.py"
 
 
+MANUAL_PORTFOLIOS_KEY = "portfolio_dynamics_manual_portfolios"
+
+
 def _value_repr(key: str) -> str:
     value = settings.get(key)
+    if settings.SETTINGS_BY_KEY[key].kind == "portfolios":
+        if not value:
+            return "не заданы"
+        return f"{len(value)} шт.: " + ", ".join(p["code"] for p in value)
     return str(value)
 
 
@@ -179,6 +186,122 @@ def _edit_group(group: settings.Group) -> bool:
             ui.cancelled("Правка настройки отменена.")
 
 
+# ── Дополнительные портфели ──────────────────────────────────────────────────
+def _portfolios_table(records) -> Table:
+    table = Table(
+        title="Дополнительные портфели", title_style="bold cyan", box=box.SIMPLE_HEAVY,
+        show_header=True, header_style="bold cyan",
+        caption="Портфели, которых нет в выгрузке позиций; объём ведётся вручную.",
+        caption_style="grey50",
+    )
+    table.add_column("#", justify="right", style="bold yellow", no_wrap=True, width=3)
+    table.add_column("Код", style="bold white", no_wrap=True)
+    table.add_column("Название", style="grey70", overflow="fold")
+    table.add_column("Тип", no_wrap=True)
+    table.add_column("Объём, млн", justify="right", no_wrap=True)
+    table.add_column("Дюрация", justify="right", no_wrap=True)
+    for i, record in enumerate(records, start=1):
+        duration = ("—" if record["duration"] is None else f"{record['duration']:.2f}")
+        table.add_row(str(i), record["code"], record["name"], record["type"],
+                      f"{record['volume']:,.0f}", duration)
+    return table
+
+
+def _ask_portfolio(existing: Optional[dict] = None) -> Optional[dict]:
+    """Диалог одной записи. None — пользователь отказался."""
+    known = ", ".join(settings.KNOWN_TYPES_HINT)
+    current = existing or {}
+
+    code = ui.ask("Код портфеля (латиницей, например OFZ_EXTRA)",
+                  default=current.get("code", "")).strip().upper()
+    if not code:
+        ui.cancelled("Код не указан — запись не добавлена.")
+        return None
+
+    name = ui.ask("Название (Enter — совпадает с кодом)",
+                  default=current.get("name", "")).strip() or code
+    portfolio_type = ui.ask(f"Тип портфеля ({known})",
+                            default=current.get("type", "")).strip().upper()
+    if not portfolio_type:
+        ui.cancelled("Тип не указан — запись не добавлена.")
+        return None
+
+    volume = ui.ask("Объём, млн RUB",
+                    default=("" if not current else str(current.get("volume", "")))).strip()
+    if not volume:
+        ui.cancelled("Объём не указан — запись не добавлена.")
+        return None
+
+    ui.console.print("[grey70]Дюрацию можно не указывать, но тогда проверка CHK_14 "
+                     "(«пустая текущая дюрация в срезе») покажет FAIL.[/grey70]")
+    duration_default = "" if not current or current.get("duration") is None else str(current["duration"])
+    duration = ui.ask("Текущая дюрация, лет (Enter — не указывать)",
+                      default=duration_default).strip()
+
+    return {"code": code, "name": name, "type": portfolio_type,
+            "volume": volume, "duration": duration or None}
+
+
+def _save_portfolios(records) -> bool:
+    try:
+        settings.set_value(MANUAL_PORTFOLIOS_KEY, records)
+    except settings.SettingsError as exc:
+        ui.error(str(exc))
+        return False
+    return True
+
+
+def _manual_portfolios_screen() -> bool:
+    """Экран добавления/правки/удаления. True — что-то изменилось."""
+    changed = False
+    while True:
+        records = list(settings.get(MANUAL_PORTFOLIOS_KEY))
+        ui.console.print()
+        if records:
+            ui.console.print(_portfolios_table(records))
+        else:
+            ui.console.print("[grey70]Дополнительных портфелей нет.[/grey70]")
+        ui.console.print("[grey70]д — добавить, номер — изменить, у<номер> — удалить, "
+                         "0 — назад[/grey70]")
+        choice = ui.ask("Действие", default="0").strip().lower()
+
+        if choice in ("0", ""):
+            return changed
+
+        if choice in ("д", "d"):
+            record = _ask_portfolio()
+            if record is None:
+                continue
+            if _save_portfolios(records + [record]):
+                ui.success(f"Портфель {record['code']} добавлен.")
+                changed = True
+            continue
+
+        if choice.startswith(("у", "u")):
+            index = choice[1:].strip()
+            if not index.isdigit() or not 1 <= int(index) <= len(records):
+                ui.warning("Укажите номер удаляемой записи, например «у1».")
+                continue
+            removed = records.pop(int(index) - 1)
+            if _save_portfolios(records):
+                ui.success(f"Портфель {removed['code']} удалён.")
+                changed = True
+            continue
+
+        if choice.isdigit() and 1 <= int(choice) <= len(records):
+            position = int(choice) - 1
+            record = _ask_portfolio(records[position])
+            if record is None:
+                continue
+            records[position] = record
+            if _save_portfolios(records):
+                ui.success(f"Портфель {record['code']} изменён.")
+                changed = True
+            continue
+
+        ui.warning("Некорректный выбор, попробуйте снова.")
+
+
 # ── Создание папок по датам ──────────────────────────────────────────────────
 def _source_configs(report: settings.ReportSource) -> List[file_discovery.SourceConfig]:
     """Источники отчёта как SourceConfig — их собирает config по ключам настроек.
@@ -313,7 +436,8 @@ def run_interactive() -> None:
             ui.console.print(_groups_table())
             ui.console.print(
                 "[grey70]п — проверить пути, д — создать папки по датам, "
-                "с — сбросить всё к значениям по умолчанию, 0 — выйти в главное меню[/grey70]"
+                "р — дополнительные портфели, с — сбросить всё к значениям по "
+                "умолчанию, 0 — выйти в главное меню[/grey70]"
             )
             choice = ui.ask("Раздел (номер) или действие", default="0").strip().lower()
 
@@ -322,6 +446,13 @@ def run_interactive() -> None:
             if choice in ("п", "p"):
                 ui.console.print()
                 ui.console.print(_paths_table())
+                continue
+            if choice in ("р", "r"):
+                try:
+                    changed |= _manual_portfolios_screen()
+                except KeyboardInterrupt:
+                    ui.console.print()
+                    ui.cancelled("Правка дополнительных портфелей отменена.")
                 continue
             if choice in ("д", "d"):
                 try:
