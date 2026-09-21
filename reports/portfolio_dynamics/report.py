@@ -103,7 +103,9 @@ class PortfolioDynamicsReport(Report):
         if previous_path is None and not bootstrap:
             previous_path = etl.find_previous_release(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
 
-        data = etl.build_data(t0_path, t7_path, previous_path=previous_path, bootstrap=bootstrap)
+        limits_path = _resolve_limits_path(t0_path, args)
+        data = etl.build_data(t0_path, t7_path, previous_path=previous_path,
+                              bootstrap=bootstrap, limits_path=limits_path)
 
         output_path = Path(args.output) if args.output else _default_output_path(data.business_date)
         checks = workbook.evaluate_checks(data)
@@ -416,6 +418,33 @@ def _resolve_slice_paths(args: argparse.Namespace) -> tuple:
     return _two_latest_flat(source)
 
 
+def _resolve_limits_path(t0_path: Path, args: argparse.Namespace) -> Optional[Path]:
+    """Выгрузка «Состояние лимитов» на дату среза T0 — рядом с ним или из загрузок.
+
+    Ищется на дату САМОГО среза, а не на имя папки: папку могли назвать иначе,
+    а лимиты обязаны соответствовать отчётной дате.
+    """
+    target_date = etl.read_business_date(t0_path)
+    if target_date is None:
+        return None
+    found = inbox.resolve_limits_file(
+        config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE, _downloads_dir(args),
+        Path(t0_path).parent, target_date,
+        move=config.PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS,
+    )
+    if found is None:
+        etl.logger.warning(
+            "Файл лимитов на %s не найден (шаблон имени: %s) — лимиты и границы зон "
+            "переносятся из предыдущего выпуска. Положите «Состояние лимитов на дату …» "
+            "в загрузки или в папку %s, чтобы они обновились.",
+            target_date.isoformat(), config.PORTFOLIO_DYNAMICS_LIMITS_REGEX,
+            Path(t0_path).parent,
+        )
+    else:
+        etl.logger.info("Файл лимитов: %s", found.name)
+    return found
+
+
 def _downloads_dir(args: argparse.Namespace):
     """Папка загрузок или None, если приёмка выключена настройкой или --no-import."""
     if getattr(args, "no_import", False):
@@ -437,6 +466,7 @@ def _from_date(target_date, args: argparse.Namespace) -> tuple:
     plan = inbox.plan_import(
         source, _downloads_dir(args), target_date,
         archive_own_date=config.PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE,
+        limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE,
     )
     if not plan.complete:
         raise etl.PortfolioDynamicsError(plan.problem)

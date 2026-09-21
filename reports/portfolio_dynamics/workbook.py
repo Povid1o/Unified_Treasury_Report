@@ -37,6 +37,7 @@ from common.logging_utils import get_logger  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
     DIM_COLUMNS, LIMIT_COLUMNS, SNAPSHOT_COLUMNS, TYPE_DAILY_COLUMNS,
     PortfolioDynamicsData, PortfolioDynamicsError,
+    aggregated_parents, descendants_of, types_counted_in,
 )
 
 logger = get_logger("portfolio_dynamics")
@@ -535,18 +536,32 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
 
     nt = n_types
     TFIRST, TLAST = THR + 1, THR + nt
+    # Лимит совокупный: объём HTM в fact_type_daily уже включает HTM_KUAP.
+    # Значит и «Сумма по портфелям» у объемлющего типа обязана складываться с
+    # вложенными — иначе CHK_16 показывал бы расхождение грейнов там, где его нет.
+    parents = aggregated_parents()
+    limit_types = [str(t) for t in data.fact_limit["portfolio_type"]] if not data.fact_limit.empty else []
+
+    def _with_children(template: str, row: int, index: int) -> str:
+        """template % <критерий> для самого типа и каждого вложенного."""
+        parts = [template % ("$A%d" % row)]
+        if index < len(limit_types):
+            for child in descendants_of(limit_types[index], parents):
+                parts.append(template % ('"%s"' % child))
+        return "=" + "+".join(parts)
+
     for i in range(nt):
         r = TFIRST + i
         dr = 2 + i
         vals = {
             "A": "=fact_limit!$A$%d" % dr,
             "B": "=IF(COUNTIFS({t},$A{r},{inc},TRUE)>0,TRUE,FALSE)".format(t=D_TYPE, inc=D_INC, r=r),
-            "C": "=COUNTIFS(%s,$A%d)" % (V_TYPE, r),
+            "C": _with_children("COUNTIFS(%s,%%s)" % V_TYPE, r, i),
             "D": "=SUMIFS(%s,%s,BUSINESS_DATE,%s,$A%d)" % (TD_VOL, TD_DATE, TD_TYPE, r),
             "E": "=SUMIFS(%s,%s,BUSINESS_DATE-LOOKBACK_DAYS,%s,$A%d)" % (TD_VOL, TD_DATE, TD_TYPE, r),
             "F": "=IF(OR($D{r}=0,$E{r}=0),\"\",$D{r}-$E{r})".format(r=r),
             "G": "=IF($E{r}=0,\"\",$D{r}/$E{r}-1)".format(r=r),
-            "H": "=SUMIFS(%s,%s,$A%d)" % (V_T0, V_TYPE, r),
+            "H": _with_children("SUMIFS(%s,%s,%%s)" % (V_T0, V_TYPE), r, i),
             "I": "=IF(OR($D{r}=0,$H{r}=0),\"\",$H{r}/$D{r}-1)".format(r=r),
             "J": "=IFERROR(INDEX({a},MATCH($A{r},{t},0)),\"\")".format(a=L_AMT, t=L_TYPE, r=r),
             "K": "=IF(OR($J{r}=\"\",$J{r}=0),\"\",$D{r}/$J{r})".format(r=r),
@@ -574,7 +589,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     tot_vals = {
         "A": "ИТОГО (include_in_total)",
         "B": "",
-        "C": "=SUM($C$%d:$C$%d)" % (TFIRST, TLAST),
+        "C": "=SUMIFS($C$%d:$C$%d,%s,TRUE)" % (TFIRST, TLAST, T_INC),
         "D": "=SUMIFS($D$%d:$D$%d,%s,TRUE)" % (TFIRST, TLAST, T_INC),
         "E": "=SUMIFS($E$%d:$E$%d,%s,TRUE)" % (TFIRST, TLAST, T_INC),
         "F": "=IF(OR($D{r}=0,$E{r}=0),\"\",$D{r}-$E{r})".format(r=TOT),
@@ -786,11 +801,17 @@ def evaluate_checks(data: PortfolioDynamicsData) -> List[Tuple[str, str, Any]]:
     hist_dates = list(hist["business_date"]) if not hist.empty else []
     snap_codes = [str(c) for c in snap["portfolio_code"].dropna()] if not snap.empty else []
 
-    by_type_from_snapshot = (
+    parents = aggregated_parents()
+    own_by_type = (
         snap.merge(dim[["portfolio_code", "portfolio_type"]], on="portfolio_code", how="left")
             .groupby("portfolio_type")["volume_t0"].sum()
         if not snap.empty else pd.Series(dtype=float)
     )
+    # Объём объемлющего типа — вместе с вложенными, как и в fact_type_daily.
+    by_type_from_snapshot = pd.Series({
+        t: float(sum(own_by_type.get(x, 0.0) for x in types_counted_in(t, parents)))
+        for t in set(own_by_type.index) | set(types) | set(parents) | set(parents.values())
+    }, dtype=float)
     volume_by_type = (
         hist[hist["business_date"] == bd].set_index("portfolio_type")["volume_amount"]
         if not hist.empty else pd.Series(dtype=float)

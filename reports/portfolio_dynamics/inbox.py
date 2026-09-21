@@ -56,6 +56,7 @@ class ImportPlan:
     existing: List[Path] = field(default_factory=list)          # уже на месте
     to_import: List[Tuple[Path, Path]] = field(default_factory=list)  # (откуда, куда)
     archive: List[Tuple[Path, Path]] = field(default_factory=list)  # копия в папку своей даты
+    limits: Optional[Path] = None  # файл лимитов на эту дату, если нашёлся
     problem: Optional[str] = None  # чего не хватает, человекочитаемо
 
     @property
@@ -154,8 +155,36 @@ def _files_in_folder(source: SourceConfig, folder: Path) -> List[Path]:
     return sorted(f for f in folder.glob(source.glob_pattern) if _is_real_file(f))
 
 
+def _plan_limits(limits_source: Optional[SourceConfig], downloads_dir: Optional[Path],
+                 folder: Path, target_date: dt.date) -> Tuple[Optional[Path], List[Tuple[Path, Path]]]:
+    """Файл лимитов на отчётную дату: уже в папке или его надо взять из загрузок.
+
+    Лимиты приходят ТРЕТЬИМ файлом на ту же дату и едут в ту же папку. Их
+    отсутствие — не ошибка: тогда лимиты переносятся из предыдущего выпуска.
+    """
+    if limits_source is None:
+        return None, []
+
+    # Строго по шаблону имени, без запасного чтения книги: у выгрузки позиций
+    # дата в шапке листа тоже разбирается, и нестрогий поиск принял бы срез за
+    # файл лимитов.
+    in_folder = [f for f in _files_in_folder(limits_source, folder)
+                 if _is_limits(limits_source, f)]
+    here = next((c.path for c in _dated(in_folder, limits_source)
+                 if c.business_date == target_date), None)
+    if here is not None:
+        return here, []
+
+    for candidate in scan_downloads(limits_source, downloads_dir) if downloads_dir else []:
+        if candidate.business_date == target_date:
+            destination = folder / candidate.path.name
+            return destination, [(candidate.path, destination)]
+    return None, []
+
+
 def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
-                target_date: dt.date, archive_own_date: bool = True) -> ImportPlan:
+                target_date: dt.date, archive_own_date: bool = True,
+                limits_source: Optional[SourceConfig] = None) -> ImportPlan:
     """Собирает план: что уже на месте, что взять из загрузок, чего не хватает.
 
     Ничего не перекладывает — только считает. Так план можно показать
@@ -165,15 +194,20 @@ def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
     folder = folder_for_date(source, target_date)
     plan = ImportPlan(target_date=target_date, folder=folder)
 
-    in_folder = _dated(_files_in_folder(source, folder), source)
-    if source.uses_date_folders and len(_files_in_folder(source, folder)) >= 2:
-        # Папка-дата уже укомплектована — в загрузки можно не заглядывать.
-        plan.existing = _files_in_folder(source, folder)
+    slice_files = [f for f in _files_in_folder(source, folder) if not _is_limits(limits_source, f)]
+    in_folder = _dated(slice_files, source)
+    if source.uses_date_folders and len(slice_files) >= 2:
+        # Папка-дата уже укомплектована срезами — за ними в загрузки не идём,
+        # но файл лимитов всё равно может там лежать и быть нужен.
+        plan.existing = slice_files
         if archive_own_date:
             plan.archive = _plan_archive(source, folder, in_folder)
+        plan.limits, limits_import = _plan_limits(limits_source, downloads_dir, folder, target_date)
+        plan.to_import.extend(limits_import)
         return plan
 
-    downloads = scan_downloads(source, downloads_dir) if downloads_dir else []
+    downloads = [c for c in (scan_downloads(source, downloads_dir) if downloads_dir else [])
+                 if not _is_limits(limits_source, c.path)]
     taken_names = {c.path.name for c in in_folder}
     pool = in_folder + [c for c in downloads if c.path.name not in taken_names]
     where = _where_we_looked(folder, downloads_dir)
@@ -198,7 +232,16 @@ def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
             plan.to_import.append((candidate.path, folder / candidate.path.name))
     if archive_own_date:
         plan.archive = _plan_archive(source, folder, [t0, t7])
+    plan.limits, limits_import = _plan_limits(limits_source, downloads_dir, folder, target_date)
+    plan.to_import.extend(limits_import)
     return plan
+
+
+def _is_limits(limits_source: Optional[SourceConfig], path: Path) -> bool:
+    """Файл подходит под шаблон имени выгрузки лимитов?"""
+    if limits_source is None or not limits_source.filename_regex:
+        return False
+    return re.search(limits_source.filename_regex, Path(path).name) is not None
 
 
 def _plan_archive(source: SourceConfig, folder: Path,
@@ -298,6 +341,31 @@ def _apply_archive(plan: ImportPlan) -> List[Path]:
     return copied
 
 
+def resolve_limits_file(limits_source: Optional[SourceConfig], downloads_dir: Optional[Path],
+                        folder: Path, target_date: dt.date, move: bool = True) -> Optional[Path]:
+    """Файл лимитов на дату: найти в папке, иначе забрать из загрузок. None — нет.
+
+    Отсутствие файла лимитов не ошибка: тогда лимиты переносятся из предыдущего
+    выпуска, как было до появления этой выгрузки.
+    """
+    path, to_import = _plan_limits(limits_source, downloads_dir, folder, target_date)
+    if path is None:
+        return None
+    for src, dst in to_import:
+        if dst.exists():
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst)) if move else shutil.copy2(str(src), str(dst))
+        except (OSError, shutil.Error) as exc:
+            logger.warning("Не удалось взять файл лимитов %s из загрузок: %s", src.name, exc)
+            return dst if dst.exists() else None
+        logger.info("%s из загрузок: %s -> %s",
+                    "Перенесён файл лимитов" if move else "Скопирован файл лимитов",
+                    src.name, folder)
+    return path if path.exists() else None
+
+
 def available_dates(source: SourceConfig, downloads_dir: Optional[Path],
                     limit: int = 10) -> List[AvailableDate]:
     """Даты, на которые отчёт можно построить: из папок, из загрузок или из обоих.
@@ -335,9 +403,11 @@ def available_dates(source: SourceConfig, downloads_dir: Optional[Path],
 
 def resolve_pair(source: SourceConfig, downloads_dir: Optional[Path],
                  target_date: dt.date, move: bool = True,
-                 archive_own_date: bool = True) -> List[Path]:
+                 archive_own_date: bool = True,
+                 limits_source: Optional[SourceConfig] = None) -> List[Path]:
     """План + перекладывание одним вызовом: вернуть файлы срезов на дату."""
-    plan = plan_import(source, downloads_dir, target_date, archive_own_date=archive_own_date)
+    plan = plan_import(source, downloads_dir, target_date, archive_own_date=archive_own_date,
+                       limits_source=limits_source)
     if not plan.complete:
         raise PortfolioDynamicsError(plan.problem)
     return apply_import(plan, move=move)

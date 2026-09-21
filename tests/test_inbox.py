@@ -122,6 +122,60 @@ class RealFilenameTests(InboxTestCase):
         self.assertEqual(self.downloads_names(), [], "файлы должны уехать из загрузок")
 
 
+class LimitsImportTests(InboxTestCase):
+    """Файл лимитов — третий файл на отчётную дату, едет в ту же папку."""
+
+    def limits_download(self, day_underscored: str) -> Path:
+        from test_limits import DEFAULT_ROWS, write_limits_file
+        return write_limits_file(
+            self.downloads / f"Состояние лимитов на дату {day_underscored} - Результат.xlsx",
+            DEFAULT_ROWS)
+
+    def test_limits_file_is_imported_together_with_the_slices(self):
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        self.limits_download("21_09_2026")
+
+        plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
+                                 limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+        inbox.apply_import(plan, move=True)
+
+        self.assertIsNotNone(plan.limits)
+        self.assertEqual(len(self.names("2026-09-21")), 3)
+        self.assertEqual(self.downloads_names(), [])
+
+    def test_limits_file_of_another_date_is_not_taken(self):
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        self.limits_download("14_09_2026")
+
+        plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
+                                 limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+
+        self.assertIsNone(plan.limits)
+        self.assertTrue(plan.complete, "без лимитов отчёт всё равно должен собираться")
+
+    def test_slices_are_still_chosen_correctly_with_limits_around(self):
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        self.limits_download("21_09_2026")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertIn("21.09.2026", t0.name)
+        self.assertIn("14.09.2026", t7.name)
+
+    def test_missing_limits_file_is_not_an_error(self):
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+
+        plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 21),
+                                 limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+
+        self.assertTrue(plan.complete)
+        self.assertIsNone(plan.limits)
+
+
 class PlanTests(InboxTestCase):
     def test_pair_is_t0_plus_the_newest_earlier_slice(self):
         for period_end in ("04.09.2026", "11.09.2026", "18.09.2026"):

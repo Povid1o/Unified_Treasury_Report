@@ -20,7 +20,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -237,16 +237,32 @@ def read_business_date(path: Path) -> Optional[dt.date]:
     return _business_date_from_matrix(matrix, header_row)
 
 
+def is_limits_file(path: Path) -> bool:
+    """Это выгрузка лимитов, а не срез позиций?
+
+    В папке-дате лежат ТРИ файла: два среза позиций и файл лимитов. Последний
+    к срезам отношения не имеет, и принимать его за срез нельзя — иначе разбор
+    падает на «не удалось определить дату среза».
+    """
+    pattern = config.PORTFOLIO_DYNAMICS_LIMITS_REGEX
+    return bool(pattern) and re.search(pattern, Path(path).name) is not None
+
+
 def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, Path]:
     """Из файлов одной папки-даты выбирает, какой срез T0, а какой T-7.
 
     Определяется по дате самой выгрузки (вторая дата периода), а не по имени
     файла как строке: поздний срез — T0, ранний — T-7. Так пользователю не нужно
     ничего переименовывать и раскладывать в правильном порядке — достаточно
-    положить в папку два файла.
+    положить в папку два файла. Файл лимитов, если он тут же, в расчёт не идёт.
     """
     where = f" в {folder_label}" if folder_label else ""
     real_files = [f for f in files if f.is_file() and not f.name.startswith("~$")]
+    limit_files = [f for f in real_files if is_limits_file(f)]
+    real_files = [f for f in real_files if f not in limit_files]
+    if limit_files:
+        logger.debug("Файлы лимитов%s не участвуют в выборе срезов: %s",
+                     where, ", ".join(f.name for f in limit_files))
     if len(real_files) < 2:
         raise PortfolioDynamicsError(
             f"Для отчёта нужны ДВА файла (срез T0 и срез T-7), а{where} найдено "
@@ -554,9 +570,96 @@ class PortfolioDynamicsData:
     notes_restored: int = 0
 
 
-def guess_type(portfolio_code: str) -> str:
-    """Тип по префиксу кода до первого "_": AFS_TR_RUR -> AFS, HTM_ALCO -> HTM."""
-    return str(portfolio_code).split("_", 1)[0].upper()
+def parse_type_parents(raw: Optional[str] = None) -> Dict[str, str]:
+    """«HTM_KUAP=HTM» -> {вложенный тип: объемлющий}.
+
+    Лимит в выгрузке СОВОКУПНЫЙ: лимит HTM ограничивает HTM вместе с HTM_KUAP.
+    Отсюда три следствия, которые дальше и реализуются: объём объемлющего типа
+    считается с вложенными, у портфелей вложенного типа снимается флаг «входит
+    в итог» (иначе ИТОГО задвоится), а свой лимит вложенного типа остаётся
+    подлимитом внутри общего.
+    """
+    raw = config.PORTFOLIO_DYNAMICS_TYPE_PARENTS if raw is None else raw
+    parents: Dict[str, str] = {}
+    for item in str(raw or "").split(","):
+        child, _, parent = item.partition("=")
+        child, parent = child.strip().upper(), parent.strip().upper()
+        if child and parent and child != parent:
+            parents[child] = parent
+    return parents
+
+
+def parse_nested_limits(raw: Optional[str] = None) -> Dict[str, float]:
+    """«HTM_KUAP=100» -> {вложенный тип: выделенная ему сумма, млн RUB}.
+
+    Это ручное решение казначейства: из совокупного лимита (900 на HTM) часть
+    отводится вложенному типу (100 на КУАП), остаток достаётся объемлющему
+    (800 на весь остальной HTM). Меняется настройкой, без правки кода.
+    """
+    raw = config.PORTFOLIO_DYNAMICS_NESTED_LIMITS if raw is None else raw
+    allocations: Dict[str, float] = {}
+    for item in str(raw or "").split(","):
+        name, _, amount = item.partition("=")
+        if not name.strip() or not amount.strip():
+            continue
+        try:
+            value = float(amount.strip().replace(" ", "").replace(",", "."))
+        except ValueError as exc:
+            raise PortfolioDynamicsError(
+                f"Не удалось разобрать подлимит {item.strip()!r}: ожидается «тип=сумма», "
+                "сумма в млн RUB. Поправьте настройку «Сколько отдано вложенным типам»."
+            ) from exc
+        if value <= 0:
+            raise PortfolioDynamicsError(
+                f"Подлимит для {name.strip()} должен быть больше нуля, задано {value}."
+            )
+        allocations[name.strip().upper()] = value
+    return allocations
+
+
+def aggregated_parents() -> Dict[str, str]:
+    """Вложенности, объёмы которых СКЛАДЫВАЮТСЯ с объемлющим типом.
+
+    Выделили вложенному типу собственный подлимит — его объём и лимит стоят
+    отдельно, складывать нечего. Не выделили — объём идёт внутрь объемлющего
+    и сравнивается с общим лимитом: так превышение общего лимита не потеряется.
+    """
+    allocations = parse_nested_limits()
+    return {child: parent for child, parent in parse_type_parents().items()
+            if child not in allocations}
+
+
+def descendants_of(portfolio_type: str, parents: Dict[str, str]) -> List[str]:
+    """Типы, объём которых входит в объём этого типа (на любую глубину)."""
+    result, frontier = [], [str(portfolio_type).upper()]
+    while frontier:
+        current = frontier.pop()
+        children = [c for c, p in parents.items() if p == current and c not in result]
+        result.extend(children)
+        frontier.extend(children)
+    return result
+
+
+def types_counted_in(portfolio_type: str, parents: Dict[str, str]) -> List[str]:
+    """Сам тип плюс все вложенные — то, из чего складывается его объём."""
+    return [str(portfolio_type).upper()] + descendants_of(portfolio_type, parents)
+
+
+def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
+    """Тип портфеля по его коду.
+
+    Если список известных типов задан — выбирается САМЫЙ ДЛИННЫЙ из них,
+    которым код начинается: HTM_KUAP_CORE -> HTM_KUAP, а не HTM. Резка по
+    первому "_" дала бы здесь HTM и увела бы объём КУАП в чужой тип.
+    Без известных типов остаётся прежнее правило: префикс до первого "_"
+    (AFS_TR_RUR -> AFS, HTM_ALCO -> HTM).
+    """
+    code = str(portfolio_code).upper()
+    matches = [t for t in {str(t).upper() for t in known_types if str(t).strip()}
+               if code == t or code.startswith(t + "_")]
+    if matches:
+        return max(matches, key=len)
+    return code.split("_", 1)[0]
 
 
 def _next_sort_order(dim: pd.DataFrame) -> int:
@@ -564,8 +667,8 @@ def _next_sort_order(dim: pd.DataFrame) -> int:
     return int(values.max()) + 10 if len(values) else 10
 
 
-def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool
-               ) -> Tuple[pd.DataFrame, List[str]]:
+def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
+               extra_types: Iterable[str] = ()) -> Tuple[pd.DataFrame, List[str]]:
     """Справочник портфелей: предыдущий как есть + новые коды из T0.
 
     Тип нового кода угадывается по префиксу, и только если такой тип уже заведён
@@ -576,8 +679,14 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool
     if dim.empty:
         dim = pd.DataFrame(columns=DIM_COLUMNS)
     known_types = set(previous.fact_limit["portfolio_type"].astype(str)) if not previous.fact_limit.empty else set()
+    # Типы из файла лимитов — самый надёжный источник: это и есть реестр типов.
+    known_types.update(str(t).upper() for t in extra_types if str(t).strip())
     if bootstrap:
-        known_types = {guess_type(code) for code in t0.frame["portfolio_code"]}
+        # Первый выпуск: реестра типов ещё нет, поэтому недостающие типы
+        # достраиваются по кодам портфелей. Именно ДОБАВЛЯЮТСЯ, а не заменяют:
+        # типы из настроек и файла лимитов точнее угадывания по префиксу.
+        known_types.update(guess_type(code, known_types)
+                           for code in t0.frame["portfolio_code"])
 
     known_codes = set(dim["portfolio_code"].astype(str))
     new_codes = [c for c in t0.frame["portfolio_code"] if c not in known_codes]
@@ -585,7 +694,7 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool
     sort_order = _next_sort_order(dim)
     additions = []
     for code in new_codes:
-        guessed = guess_type(code)
+        guessed = guess_type(code, known_types)
         additions.append({
             "portfolio_code": code,
             "portfolio_name": code,
@@ -601,7 +710,30 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool
 
     dim["sort_order"] = pd.to_numeric(dim["sort_order"], errors="coerce")
     dim = dim.sort_values(["sort_order", "portfolio_code"], na_position="last").reset_index(drop=True)
+    _apply_nesting_to_total_flag(dim)
     return dim[DIM_COLUMNS], new_codes
+
+
+def _apply_nesting_to_total_flag(dim: pd.DataFrame) -> None:
+    """Снимает «входит в итог» у портфелей вложенных типов.
+
+    Объём вложенного типа уже посчитан внутри объемлющего, поэтому в ИТОГО по
+    банку он попадать не должен — иначе КУАП сложится дважды (CONTRACT.md, п. 5
+    про include_in_total и п. 8.2). Колонка ручная, поэтому каждое изменение
+    пишется в лог: человек должен видеть, что скрипт тронул его лист.
+    """
+    parents = aggregated_parents()
+    if not parents or dim.empty:
+        return
+    nested = dim["portfolio_type"].astype(str).str.upper().isin(parents)
+    changed = dim.loc[nested & (dim["include_in_total"] != False)]  # noqa: E712
+    if len(changed):
+        logger.warning(
+            "Снят флаг «Входит в итог» у %d портфелей вложенных типов (%s): их объём "
+            "уже учтён в объемлющем типе, иначе ИТОГО по банку задвоится.",
+            len(changed), ", ".join(str(c) for c in changed["portfolio_code"]),
+        )
+    dim.loc[nested, "include_in_total"] = False
 
 
 def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: dt.date,
@@ -615,7 +747,7 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
     if not bootstrap or not previous.fact_limit.empty:
         return previous.fact_limit[LIMIT_COLUMNS].copy()
 
-    types = sorted({guess_type(code) for code in dim["portfolio_code"]})
+    types = sorted({guess_type(code, dim["portfolio_type"].dropna()) for code in dim["portfolio_code"]})
     return pd.DataFrame(
         [{
             "portfolio_type": t, "limit_amount": 0, "green_max_util": 0,
@@ -623,6 +755,34 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
             "valid_from": business_date, "updated_by": None,
         } for t in types],
         columns=LIMIT_COLUMNS,
+    )
+
+
+def _parse_limits(limits_path: Optional[Path]):
+    """Разбирает файл лимитов, если он есть. None — файла нет.
+
+    Импорт внутри функции намеренно: limits.py читает константы из etl.py, и
+    импорт на уровне модуля замкнул бы их в кольцо.
+    """
+    if limits_path is None:
+        return None
+    from reports.portfolio_dynamics import limits as limits_module
+    return limits_module.parse_limits_file(Path(limits_path))
+
+
+def _resolve_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: dt.date,
+                    bootstrap: bool, limits_path: Optional[Path], parsed) -> pd.DataFrame:
+    """Лимиты: из файла «Состояние лимитов», иначе — из предыдущего выпуска."""
+    if parsed is None:
+        return _build_limits(dim, previous, business_date, bootstrap)
+
+    from reports.portfolio_dynamics import limits as limits_module
+
+    known_types = [t for t in dim["portfolio_type"].dropna().unique() if str(t).strip()]
+    if not previous.fact_limit.empty:
+        known_types += [t for t in previous.fact_limit["portfolio_type"].dropna()]
+    return limits_module.build_fact_limit(
+        parsed, known_types, previous.fact_limit, business_date, Path(limits_path).stem,
     )
 
 
@@ -670,16 +830,26 @@ def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.Data
     types_frame = snapshot.merge(
         dim[["portfolio_code", "portfolio_type"]], on="portfolio_code", how="left"
     )
-    sums = (
+    own = (
         types_frame[types_frame["portfolio_type"].notna()]
         .groupby("portfolio_type")["volume_t0"].sum()
     )
+    # Лимит совокупный, поэтому и объём объемлющего типа — совокупный:
+    # volume(HTM) = HTM + HTM_KUAP. Иначе светофор HTM занижал бы использование
+    # и не показывал бы превышение общего лимита.
+    parents = aggregated_parents()
+    sums = {}
+    for portfolio_type in set(own.index) | set(parents) | set(parents.values()):
+        sums[portfolio_type] = float(sum(
+            own.get(t, 0.0) for t in types_counted_in(portfolio_type, parents)
+        ))
+    sums = pd.Series(sums, dtype=float)
 
     # Одна строка на КАЖДЫЙ тип из fact_limit (в том числе на тип без портфелей):
     # так CHK_04 «строк на отчётную дату = число типов» остаётся выполнимой.
     known_types = [str(t) for t in limits["portfolio_type"]] if not limits.empty else []
     for extra in sums.index:
-        if str(extra) not in known_types:
+        if str(extra) not in known_types and sums.get(extra):
             known_types.append(str(extra))
 
     fresh = pd.DataFrame(
@@ -697,8 +867,14 @@ def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.Data
 
 
 def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = None,
-               bootstrap: bool = False) -> PortfolioDynamicsData:
-    """Полный цикл ETL: два среза + предыдущий выпуск -> четыре таблицы схемы v3.0."""
+               bootstrap: bool = False, limits_path: Optional[Path] = None
+               ) -> PortfolioDynamicsData:
+    """Полный цикл ETL: два среза + предыдущий выпуск -> четыре таблицы схемы v3.0.
+
+    limits_path — выгрузка «Состояние лимитов» на отчётную дату. Есть файл —
+    лимиты и границы зон берутся из него; нет — переносятся из предыдущего
+    выпуска, как было раньше.
+    """
     t0 = parse_slice(t0_path, "T0")
     t7 = parse_slice(t7_path, "T-7")
 
@@ -733,8 +909,18 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
             "Укажите файл через --previous либо запустите первый выпуск с --bootstrap."
         )
 
-    dim, new_codes = _build_dim(t0, previous, bootstrap)
-    limits = _build_limits(dim, previous, business_date, bootstrap)
+    # Файл лимитов разбирается ДО справочника: он задаёт перечень типов, и без
+    # него HTM_KUAP_CORE был бы отнесён к HTM (префикс до первого "_").
+    parsed_limits = _parse_limits(limits_path)
+    limit_types = list(parsed_limits["portfolio_type"]) if parsed_limits is not None else []
+    # Типы, объявленные настройками, тоже известны: подлимит HTM_KUAP задаётся
+    # руками, и строки HTM_KUAP в файле лимитов может не быть вовсе — без этого
+    # HTM_KUAP_CORE был бы отнесён к HTM и его объём ушёл бы в чужой тип.
+    limit_types += list(parse_nested_limits())
+    limit_types += list(parse_type_parents()) + list(parse_type_parents().values())
+
+    dim, new_codes = _build_dim(t0, previous, bootstrap, extra_types=limit_types)
+    limits = _resolve_limits(dim, previous, business_date, bootstrap, limits_path, parsed_limits)
     snapshot, notes_restored = _build_snapshot(t0, t7, business_date, previous)
     history, carried, added, replaced = _build_type_daily(snapshot, dim, limits, previous, business_date)
 

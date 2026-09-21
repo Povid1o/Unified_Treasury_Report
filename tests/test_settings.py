@@ -171,6 +171,15 @@ class ValidationTests(SettingsTestCase):
         """Путь из проводника вставляют вместе с кавычками — это не должно мешать."""
         self.assertEqual(settings.set_value("nim_dir", '"/data/nim"'), Path("/data/nim"))
 
+    def test_pairs_setting_accepts_empty_and_checks_the_shape(self):
+        self.assertEqual(settings.set_value("portfolio_dynamics_nested_limits", ""), "")
+        self.assertEqual(settings.set_value("portfolio_dynamics_type_parents", "A=B, C=D"),
+                         "A=B, C=D")
+        for bad in ("HTM_KUAP", "=HTM", "HTM_KUAP="):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(settings.SettingsError, "ключ=значение"):
+                    settings.set_value("portfolio_dynamics_type_parents", bad)
+
     def test_unknown_key_is_rejected(self):
         with self.assertRaisesRegex(settings.SettingsError, "Неизвестная настройка"):
             settings.set_value("no_such_setting", "x")

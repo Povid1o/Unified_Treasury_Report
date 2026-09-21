@@ -69,6 +69,12 @@ PORTFOLIO_DYNAMICS_OUTPUT_DIR: Path
 PORTFOLIO_DYNAMICS_VALUE_SCALE: float
 PORTFOLIO_DYNAMICS_TOLERANCE: float
 PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
+PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
+PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
+PORTFOLIO_DYNAMICS_LIMITS_REGEX: str
+PORTFOLIO_DYNAMICS_LIMITS_SOURCE: SourceConfig
+PORTFOLIO_DYNAMICS_LIMIT_SCALE: float
+PORTFOLIO_DYNAMICS_LIMIT_ALIASES: str
 PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
@@ -161,6 +167,22 @@ def _apply_settings() -> None:
         date_folder_format=folder_format,
     )
     g["PORTFOLIO_DYNAMICS_OUTPUT_DIR"] = v["portfolio_dynamics_output_dir"]
+
+    # Лимиты приходят ТРЕТЬИМ файлом на отчётную дату — «Состояние лимитов на
+    # дату 21_09_2026 - Результат.xlsx». Он лежит там же, где выгрузки позиций,
+    # и датируется так же, но имя и формат даты у него свои.
+    # Лимит в выгрузке совокупный: HTM ограничивает HTM вместе с HTM_KUAP.
+    g["PORTFOLIO_DYNAMICS_TYPE_PARENTS"] = v["portfolio_dynamics_type_parents"]
+    # Сколько из совокупного лимита выделено вложенному типу (млн RUB).
+    g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
+    g["PORTFOLIO_DYNAMICS_LIMITS_REGEX"] = v["portfolio_dynamics_limits_regex"]
+    g["PORTFOLIO_DYNAMICS_LIMITS_SOURCE"] = SourceConfig(
+        directory=v["portfolio_dynamics_dir"], filename_regex=v["portfolio_dynamics_limits_regex"],
+        date_format=v["portfolio_dynamics_limits_date_format"], label="Лимиты портфелей",
+        date_folder_format=folder_format,
+    )
+    g["PORTFOLIO_DYNAMICS_LIMIT_SCALE"] = v["portfolio_dynamics_limit_scale"]
+    g["PORTFOLIO_DYNAMICS_LIMIT_ALIASES"] = v["portfolio_dynamics_limit_aliases"]
 
     # Схема v3.0 требует млн RUB, а выгрузка отдаёт объёмы в рублях: делим на это
     # число. Если формат выгрузки изменится (тысячи, уже млн) — правится в

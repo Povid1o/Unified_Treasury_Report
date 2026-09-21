@@ -57,6 +57,7 @@ KIND_HINTS = {
     "int": "целое число > 0",
     "float": "число > 0",
     "bool": "да / нет",
+    "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
 }
 
 _TRUE_WORDS = {"да", "д", "yes", "y", "true", "1", "вкл", "on"}
@@ -310,6 +311,53 @@ SETTINGS: List[Setting] = [
         group="portfolio_dynamics", default="%d.%m.%Y", help="Как разбирать дату среза.",
     ),
     Setting(
+        key="portfolio_dynamics_type_parents", label="Вложенность типов", kind="pairs",
+        group="portfolio_dynamics", default="HTM_KUAP=HTM",
+        help="Через запятую, вида «вложенный тип=объемлющий». Лимит в выгрузке "
+             "СОВОКУПНЫЙ: лимит HTM ограничивает HTM и HTM_KUAP вместе. Поэтому объём "
+             "объемлющего типа считается вместе с вложенными, а у портфелей вложенного "
+             "типа снимается флаг «Входит в итог», чтобы ИТОГО по банку не задвоилось. "
+             "Свой лимит у вложенного типа при этом остаётся и работает как подлимит.",
+    ),
+    Setting(
+        key="portfolio_dynamics_nested_limits", label="Сколько отдано вложенным типам",
+        kind="pairs", group="portfolio_dynamics", default="",
+        help="Через запятую, вида «тип=сумма в млн RUB». Лимит в выгрузке совокупный: "
+             "если на HTM указано 900, а здесь задано HTM_KUAP=100, то КУАП получает "
+             "лимит 100, а на весь остальной HTM остаётся 800. Пусто — подлимит не "
+             "выделен: тогда объём вложенного типа складывается с объемлющим и "
+             "сравнивается с общим лимитом (так безопаснее, превышение не потеряется).",
+    ),
+    Setting(
+        key="portfolio_dynamics_limits_regex", label="Шаблон имени файла лимитов",
+        kind="regex1", group="portfolio_dynamics",
+        default=r"Состояние лимитов на дату (\d{2}_\d{2}_\d{4})",
+        help="Отдельная выгрузка с лимитами по типам портфелей — «Состояние лимитов "
+             "на дату 21_09_2026 - Результат.xlsx». Группа в скобках захватывает дату; "
+             "она должна совпадать с ОТЧЁТНОЙ датой (T0).",
+    ),
+    Setting(
+        key="portfolio_dynamics_limits_date_format", label="Формат даты в имени файла лимитов",
+        kind="date_format", group="portfolio_dynamics", default="%d_%m_%Y",
+        help="Как разбирать дату из имени файла лимитов (в нём дата через подчёркивания, "
+             "а не через точки, как у выгрузки позиций).",
+    ),
+    Setting(
+        key="portfolio_dynamics_limit_scale", label="Делитель лимитов", kind="float",
+        group="portfolio_dynamics", default=1_000_000.0,
+        help="Колонка «Лимит сверху» приходит в рублях, а схема требует млн RUB. "
+             "Отдельная настройка от делителя объёмов — на случай, если единицы в двух "
+             "выгрузках разойдутся.",
+    ),
+    Setting(
+        key="portfolio_dynamics_limit_aliases", label="Соответствия типов в файле лимитов",
+        kind="pairs", group="portfolio_dynamics", default="Облигации=TTS",
+        help="Через запятую, вида «имя в файле лимитов=тип портфеля». Торговый портфель "
+             "выгрузка лимитов называет «Облигации», а в отчёте он TTS. Строки файла, не "
+             "сводящиеся ни к одному известному типу, в fact_limit не попадают и "
+             "перечисляются в логе.",
+    ),
+    Setting(
         key="portfolio_dynamics_output_dir", label="Папка результатов", kind="dir",
         group="portfolio_dynamics", default=_under_root("output", "PortfolioDynamics"),
         help="Куда складывать xlsx. Отсюда же берётся предыдущий выпуск отчёта — "
@@ -377,6 +425,19 @@ def parse_value(setting: Setting, raw: Any) -> Any:
                 r"Пример: ^ЧПД (\d{4} \d{2} \d{2})\.xlsx$"
             )
         return pattern
+
+    if setting.kind == "pairs":
+        text = str(text).strip()
+        if not text:
+            return ""  # пусто — законное значение: соответствий не задано
+        for item in text.split(","):
+            key, sep, value = item.partition("=")
+            if not sep or not key.strip() or not value.strip():
+                raise SettingsError(
+                    f"[{setting.key}] Ожидаются пары «ключ=значение» через запятую, "
+                    f"не разобрано: {item.strip()!r}. Пример: HTM_KUAP=HTM"
+                )
+        return text
 
     if setting.kind == "bool":
         if isinstance(raw, bool):
