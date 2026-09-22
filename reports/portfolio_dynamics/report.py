@@ -36,7 +36,7 @@ from rich.text import Text
 import config
 from common import file_discovery, ui
 from reports.base import Report
-from reports.portfolio_dynamics import etl, inbox, workbook
+from reports.portfolio_dynamics import etl, history, inbox, workbook
 
 
 class PortfolioDynamicsReport(Report):
@@ -231,11 +231,25 @@ def diagnose(args: argparse.Namespace) -> None:
     folders = file_discovery.find_date_folders(source)
     ui.console.print()
     ui.console.print(f"[bold]Папки-даты в исходной папке: {len(folders)}[/bold]")
+    # Какие именно срезы лежат внутри каждой папки: дата ПАПКИ и даты файлов в
+    # ней — разные вещи (в папке 18.09 лежит и срез за 11.09), а пару отчёт
+    # собирает по датам файлов, где бы они ни лежали.
+    slices_by_folder = {}
+    for candidate in inbox.slices_in_other_date_folders(
+            source, Path(""), config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE):
+        slices_by_folder.setdefault(candidate.path.parent, set()).add(
+            candidate.business_date.isoformat())
     for folder in folders[:10]:
         count = len(folder.files)
-        state = "[bold green]готова[/bold green]" if count >= 2 else (
-            "[yellow]не хватает файлов[/yellow]" if count else "[grey50]пусто[/grey50]")
-        ui.console.print(f"  {folder.path.name}  файлов: {count}  {state}")
+        here = sorted(slices_by_folder.get(folder.path, ()), reverse=True)
+        if count >= 2:
+            state = "[bold green]готова[/bold green]"
+        elif count:
+            state = "[grey50]пара доберётся из других папок или загрузок[/grey50]"
+        else:
+            state = "[grey50]пусто[/grey50]"
+        srezy = ("  срезы: %s" % ", ".join(here)) if here else ""
+        ui.console.print(f"  {folder.path.name}  файлов: {count}{srezy}  {state}")
     if not folders:
         ui.console.print("  [grey50]нет — их создаёт «Настройки» → «Создать папки по датам», "
                          "либо приёмка из загрузок создаст нужную сама[/grey50]")
@@ -282,6 +296,18 @@ def _print_history_source() -> None:
     else:
         ui.console.print("  [grey50]импорт из отчёта старого формата не настроен "
                          "(«Файл с историей», либо аргумент --history)[/grey50]")
+        # Раз не настроен — сразу показываем, что можно было бы взять: иначе о
+        # самой возможности узнать неоткуда.
+        found = history.find_candidates(_history_search_dirs(), limit=5)
+        for path, sheets in found:
+            ui.console.print(Text.assemble(
+                ("  подходит: ", "grey70"), (path.name, "bold"),
+                ("  [%s]" % ", ".join(sheets), "grey50"),
+                ("\n            %s" % path.parent, "grey50"),
+            ))
+        if found:
+            ui.console.print("  [grey50]задаётся в «Настройки» → «и — история из "
+                             "старого отчёта» или аргументом --history[/grey50]")
 
 
 def _print_limits(downloads: Path, data_dir: Path) -> None:
@@ -297,7 +323,7 @@ def _print_limits(downloads: Path, data_dir: Path) -> None:
 
     found = []
     if downloads.is_dir():
-        found += [("загрузки", c) for c in inbox.scan_downloads(limits_source, downloads)]
+        found += [("загрузки", c) for c in inbox.scan_limits(limits_source, downloads)]
     if data_dir.is_dir():
         for folder in file_discovery.find_date_folders(limits_source):
             files = [f for f in folder.files if etl.is_limits_file(f)]
@@ -379,21 +405,36 @@ def _print_downloads(source: file_discovery.SourceConfig, downloads: Path) -> No
 
     everything = sorted(f for f in downloads.glob("*.xlsx")
                         if f.is_file() and not f.name.startswith("~$"))
-    matched = {c.path: c.business_date for c in inbox.scan_downloads(source, downloads)}
+    by_name = {c.path: c.business_date
+               for c in inbox.scan_slices(source, downloads, deep=False)}
+    matched = {c.path: c.business_date for c in inbox.scan_slices(source, downloads)}
+    # Файлы, опознанные по содержимому, показываем отдельно: иначе непонятно,
+    # почему отчёт берёт файл с «неправильным» именем.
+    by_content = {path: value for path, value in matched.items() if path not in by_name}
     ui.console.print(f"[bold]Файлы .xlsx в загрузках: {len(everything)}, "
-                     f"подошли под шаблон: {len(matched)}[/bold]")
+                     f"подошли под шаблон: {len(by_name)}, "
+                     f"опознаны по содержимому: {len(by_content)}[/bold]")
     if not everything:
         ui.console.print("  [grey50]пусто (ищется только верхний уровень папки, не подпапки)[/grey50]")
-    for path in everything[:15]:
-        if path in matched:
+    # Сначала подошедшие: в папке на тысячу файлов иначе их не видно.
+    shown = sorted(matched, key=lambda f: matched[f], reverse=True)
+    shown += [f for f in everything if f not in matched][:15]
+    for path in shown:
+        if path in by_name:
             ui.console.print(Text.assemble(
                 ("  ✓ ", "bold green"), path.name,
                 (f"   дата среза: {matched[path].isoformat()}", "grey70")))
+        elif path in by_content:
+            ui.console.print(Text.assemble(
+                ("  ✓ ", "bold yellow"), path.name,
+                (f"   дата среза: {matched[path].isoformat()}"
+                 " — по содержимому, имя под шаблон не подходит", "grey70")))
         else:
             ui.console.print(Text.assemble(
-                ("  ✗ ", "grey50"), (f"{path.name} — имя не подходит под шаблон", "grey50")))
-    if len(everything) > 15:
-        ui.console.print(f"  [grey50]… и ещё {len(everything) - 15}[/grey50]")
+                ("  ✗ ", "grey50"), (f"{path.name} — ни имя, ни содержимое не подошли", "grey50")))
+    hidden = len(everything) - len([f for f in shown if f in everything])
+    if hidden > 0:
+        ui.console.print(f"  [grey50]… и ещё {hidden}[/grey50]")
 
 
 def _dates_table(rows) -> Table:
@@ -415,6 +456,43 @@ def _dates_table(rows) -> Table:
     return table
 
 
+def _history_search_dirs() -> list:
+    """Где искать отчёт старого формата: загрузки, папка отчёта, папка выгрузки."""
+    return [Path(config.DOWNLOADS_DIR), Path(config.PORTFOLIO_DYNAMICS_DIR),
+            Path(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)]
+
+
+def _pick_history_file() -> Optional[str]:
+    """Показывает найденные файлы старого формата и даёт выбрать номером.
+
+    Искать по имени бесполезно: у старого отчёта оно произвольное. Зато листы
+    «Динамика <ТИП>» видны в оглавлении книги мгновенно, поэтому кандидаты
+    ищутся по содержимому — человеку остаётся выбрать номер, а не вспоминать
+    и набирать путь.
+    """
+    candidates = history.find_candidates(_history_search_dirs())
+    if candidates:
+        ui.console.print("[bold]Похожие файлы (листы «Динамика <ТИП>»):[/bold]")
+        for number, (path, sheets) in enumerate(candidates, start=1):
+            ui.console.print(Text.assemble(
+                ("  %d) " % number, "bold"), (path.name, ""),
+                ("  [%s]" % ", ".join(sheets), "grey50"),
+                ("\n     %s" % path.parent, "grey50"),
+            ))
+        answer = ui.ask("Номер файла, путь к своему файлу или Enter — не подтягивать")
+    else:
+        ui.console.print("[grey50]Автоматически ничего похожего не нашлось "
+                         "(искали в загрузках, папке отчёта и папке выгрузки).[/grey50]")
+        answer = ui.ask("Путь к файлу с историей (Enter — не подтягивать)")
+
+    token = answer.strip().strip('"')
+    if not token:
+        return None
+    if token.isdigit() and 1 <= int(token) <= len(candidates):
+        return str(candidates[int(token) - 1][0])
+    return token
+
+
 def _ask_for_history() -> Optional[str]:
     """Предлагает подтянуть накопленную историю из отчёта старого формата.
 
@@ -433,8 +511,7 @@ def _ask_for_history() -> Optional[str]:
         "в отчёте старого формата (листы «Динамика AFS», «Динамика HTM», "
         "«Динамика TSS»), её можно подтянуть оттуда.[/grey70]"
     )
-    answer = ui.ask("Путь к файлу с историей (Enter — не подтягивать)")
-    return answer.strip().strip('"') or None
+    return _pick_history_file()
 
 
 def _ask_for_date(args: argparse.Namespace):
@@ -574,7 +651,8 @@ def _downloads_dir(args: argparse.Namespace):
 
 def _available_dates(args: argparse.Namespace):
     return inbox.available_dates(
-        config.PORTFOLIO_DYNAMICS_T0_SOURCE, _downloads_dir(args)
+        config.PORTFOLIO_DYNAMICS_T0_SOURCE, _downloads_dir(args),
+        limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE,
     )
 
 
@@ -654,7 +732,7 @@ def _nothing_found_message(source: file_discovery.SourceConfig) -> str:
         f"  исходная папка: {data_dir} — {mark(data_dir)}",
     ]
     if import_on:
-        matched = len(inbox.scan_downloads(source, downloads))
+        matched = len(inbox.scan_slices(source, downloads))
         lines.append(
             f"  загрузки:       {downloads} — {mark(downloads)}, "
             f"подходящих выгрузок: {matched}"

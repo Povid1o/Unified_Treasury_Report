@@ -43,10 +43,17 @@ DIM_COLUMNS = [
     "portfolio_code", "portfolio_name", "portfolio_type",
     "include_in_total", "is_limit_controlled", "sort_order",
 ]
+# limit_remaining дописан ПОСЛЕ updated_by намеренно: формулы витрин и checks
+# адресуют колонки fact_limit буквами ($B — лимит, $C..$E — границы зон), и
+# вставка в середину сдвинула бы их все. В хвосте новая колонка не двигает
+# ничего, и файл остаётся совместимым со всем, что читает лист по позициям.
 LIMIT_COLUMNS = [
     "portfolio_type", "limit_amount", "green_max_util", "yellow_max_util",
-    "red_max_util", "valid_from", "updated_by",
+    "red_max_util", "valid_from", "updated_by", "limit_remaining",
 ]
+# Колонки, появившиеся позже схемы v3.0: в выпуске, сделанном до их появления,
+# их нет, и требовать их от предыдущего файла нельзя — он входит в следующий.
+OPTIONAL_LIMIT_COLUMNS = ["limit_remaining"]
 TYPE_DAILY_COLUMNS = ["business_date", "portfolio_type", "volume_amount"]
 SNAPSHOT_COLUMNS = [
     "business_date", "portfolio_code", "volume_t0", "volume_t7",
@@ -235,6 +242,70 @@ def read_business_date(path: Path) -> Optional[dt.date]:
     except (PortfolioDynamicsError, excel_io.ExcelSourceError):
         return None
     return _business_date_from_matrix(matrix, header_row)
+
+
+# Книги, которые вообще имеет смысл открывать при поиске по содержимому.
+PROBE_SUFFIXES = (".xlsx", ".xlsm")
+# Сколько верхних строк листа читать при таком поиске. Шапка выгрузки и строка
+# «Позиция за период …» лежат в самом верху; читать весь лист, чтобы узнать
+# только дату, незачем.
+PROBE_ROWS = 60
+
+
+def probe_business_date(path: Path) -> Optional[dt.date]:
+    """Дата среза по СОДЕРЖИМОМУ книги — дёшево, не читая её целиком.
+
+    Зачем отдельно от read_business_date: тот ради даты разбирает книгу
+    полностью (все листы в DataFrame), и перебирать им чужую папку загрузок
+    непозволительно долго. Здесь читается только верх каждого листа, и этого
+    достаточно: и строка «Позиция за период [..] - [..]», и шапка таблицы
+    находятся в первых строках.
+
+    None — файл не похож на выгрузку позиций. Требуется И дата периода, И
+    колонка «Тип актива»: одной даты мало, диапазон дат встречается в любом
+    отчёте, и без второго признака поиск начал бы принимать за срез что попало.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in PROBE_SUFFIXES:
+        return None
+    wanted_header = excel_io.normalize_label(COL_ASSET_TYPE)
+    try:
+        from openpyxl import load_workbook
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except Exception:  # не книга, битая, нет прав — просто не наш файл
+        return None
+    try:
+        for worksheet in workbook.worksheets:
+            found_date: Optional[dt.date] = None
+            has_header = False
+            for row in worksheet.iter_rows(max_row=PROBE_ROWS, values_only=True):
+                for value in row:
+                    if value is None:
+                        continue
+                    text = str(value)
+                    if found_date is None:
+                        match = PERIOD_DATES_PATTERN.search(text)
+                        if match:
+                            try:
+                                found_date = dt.datetime.strptime(
+                                    match.group(2), config.PORTFOLIO_DYNAMICS_DATE_FORMAT
+                                ).date()
+                            except ValueError:
+                                pass
+                    if not has_header and excel_io.normalize_label(text) == wanted_header:
+                        has_header = True
+                if found_date is not None and has_header:
+                    return found_date
+            if found_date is not None and has_header:
+                return found_date
+    except Exception:
+        return None
+    finally:
+        try:
+            workbook.close()
+        except Exception:
+            pass
+    return None
 
 
 def is_limits_file(path: Path) -> bool:
@@ -506,7 +577,12 @@ def find_previous_release(output_dir: Path) -> Optional[Path]:
     return max(candidates, key=lambda f: f.stat().st_mtime)
 
 
-def _read_sheet(path: Path, sheet_name: str, columns: List[str]) -> pd.DataFrame:
+def _read_sheet(path: Path, sheet_name: str, columns: List[str],
+                optional: Optional[List[str]] = None) -> pd.DataFrame:
+    """optional — колонки, которых у старого выпуска может не быть: они
+    дозаполняются пустыми. Требовать их значило бы, что первый же запуск после
+    обновления схемы падает на файле, сделанном вчера."""
+    optional = optional or []
     try:
         frame = pd.read_excel(path, sheet_name=sheet_name)
     except ValueError as exc:  # листа нет в книге
@@ -521,6 +597,15 @@ def _read_sheet(path: Path, sheet_name: str, columns: List[str]) -> pd.DataFrame
         ) from exc
 
     missing = [c for c in columns if c not in frame.columns]
+    added = [c for c in missing if c in optional]
+    for column in added:
+        frame[column] = None
+    if added:
+        logger.info(
+            "В предыдущем выпуске %s, лист %r нет колонок %s — они появились позже "
+            "и заполнены пустыми значениями.", path.name, sheet_name, ", ".join(added),
+        )
+    missing = [c for c in missing if c not in optional]
     if missing:
         raise PortfolioDynamicsError(
             f"В предыдущем выпуске {path.name}, лист {sheet_name!r}: нет колонок {missing}. "
@@ -536,7 +621,8 @@ def load_previous_release(path: Path) -> PreviousRelease:
         raise PortfolioDynamicsError(f"Предыдущий выпуск не найден: {path}")
 
     dim = _read_sheet(path, "dim_portfolio", DIM_COLUMNS)
-    limit = _read_sheet(path, "fact_limit", LIMIT_COLUMNS)
+    limit = _read_sheet(path, "fact_limit", LIMIT_COLUMNS,
+                        optional=OPTIONAL_LIMIT_COLUMNS)
     history = _read_sheet(path, "fact_type_daily", TYPE_DAILY_COLUMNS)
     snapshot = _read_sheet(path, "fact_portfolio_snapshot", SNAPSHOT_COLUMNS)
 
@@ -942,7 +1028,7 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
         [{
             "portfolio_type": t, "limit_amount": 0, "green_max_util": 0,
             "yellow_max_util": 0, "red_max_util": 0,
-            "valid_from": business_date, "updated_by": None,
+            "valid_from": business_date, "updated_by": None, "limit_remaining": None,
         } for t in types],
         columns=LIMIT_COLUMNS,
     )

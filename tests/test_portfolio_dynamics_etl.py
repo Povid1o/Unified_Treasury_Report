@@ -215,6 +215,61 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
 # ════════════════════════════════════════════════════════════════════════════
 # Инкрементальность: заметки, история, новые портфели
 # ════════════════════════════════════════════════════════════════════════════
+class OlderReleaseTests(PortfolioDynamicsTestCase):
+    """Выпуск, сделанный ДО появления новой колонки, обязан читаться.
+
+    Отчёт инкрементальный: предыдущий файл — вход для следующего. Значит,
+    любая новая колонка обязана быть необязательной при чтении, иначе первый
+    же запуск после обновления падает на вчерашнем файле, и починить это можно
+    только руками.
+    """
+
+    def drop_column(self, path, sheet_name, column):
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        ws = wb[sheet_name]
+        for index in range(1, ws.max_column + 1):
+            if ws.cell(row=1, column=index).value == column:
+                ws.delete_cols(index)
+                break
+        else:
+            self.fail("колонки %r нет в листе %r" % (column, sheet_name))
+        wb.save(path)
+        return path
+
+    def test_release_without_the_remaining_column_still_loads(self):
+        previous = self.drop_column(self.bootstrap_release(), "fact_limit", "limit_remaining")
+
+        loaded = etl.load_previous_release(previous)
+
+        self.assertIn("limit_remaining", loaded.fact_limit.columns)
+        self.assertTrue(loaded.fact_limit["limit_remaining"].isna().all())
+
+    def test_the_missing_column_is_mentioned_in_the_log(self):
+        previous = self.drop_column(self.bootstrap_release(), "fact_limit", "limit_remaining")
+
+        with self.assertLogs("portfolio_dynamics", level="INFO") as captured:
+            etl.load_previous_release(previous)
+
+        self.assertTrue(any("limit_remaining" in line for line in captured.output))
+
+    def test_a_report_builds_on_such_a_release(self):
+        """Читается — мало: на нём должен собираться следующий выпуск."""
+        previous = self.drop_column(self.bootstrap_release(), "fact_limit", "limit_remaining")
+
+        data = self.build(previous=previous)
+
+        self.assertIn("limit_remaining", data.fact_limit.columns)
+        self.assertFalse(data.fact_limit.empty)
+
+    def test_a_genuinely_missing_column_is_still_an_error(self):
+        """Послабление касается только новых колонок, а не любых пропаж."""
+        previous = self.drop_column(self.bootstrap_release(), "fact_limit", "limit_amount")
+
+        with self.assertRaises(etl.PortfolioDynamicsError):
+            etl.load_previous_release(previous)
+
+
 class IncrementalTests(PortfolioDynamicsTestCase):
     def test_notes_survive_a_rerun(self):
         """Заметки — единственная ручная колонка на машинном листе, merge обязателен."""

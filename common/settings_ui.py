@@ -15,6 +15,7 @@ from typing import List, Optional
 
 from rich import box
 from rich.table import Table
+from rich.text import Text
 
 import config
 from common import file_discovery, settings, ui
@@ -306,6 +307,15 @@ def _manual_portfolios_screen() -> bool:
 HISTORY_FILE_KEY = "portfolio_dynamics_history_file"
 
 
+def _history_candidates():
+    """Книги с листами «Динамика <ТИП>» в загрузках и папках отчёта."""
+    from reports.portfolio_dynamics import history
+    directories = [settings.get("downloads_dir"),
+                   settings.get("portfolio_dynamics_dir"),
+                   settings.get("portfolio_dynamics_output_dir")]
+    return history.find_candidates([Path(d) for d in directories if d])
+
+
 def _history_screen() -> bool:
     """Выбор файла старого формата, из которого подтянуть историю по типам.
 
@@ -327,7 +337,25 @@ def _history_screen() -> bool:
         ui.console.print(f"Сейчас задан файл: [bold]{current}[/bold]")
         ui.console.print("[grey70]Enter — оставить, «-» — больше не подтягивать, "
                          "либо укажите другой путь.[/grey70]")
-    raw = ui.ask("Путь к файлу с историей")
+    # Искать по имени бесполезно: у старого отчёта оно произвольное. Зато листы
+    # «Динамика <ТИП>» видны в оглавлении книги мгновенно — поэтому кандидаты
+    # ищутся по СОДЕРЖИМОМУ в загрузках и папках отчёта, и человеку остаётся
+    # выбрать номер, а не вспоминать и набирать путь целиком.
+    candidates = _history_candidates()
+    if candidates:
+        ui.console.print("[bold]Похожие файлы (листы «Динамика <ТИП>»):[/bold]")
+        for number, (found, sheets) in enumerate(candidates, start=1):
+            ui.console.print(Text.assemble(
+                ("  %d) " % number, "bold"), (found.name, ""),
+                ("  [%s]" % ", ".join(sheets), "grey50"),
+                ("\n     %s" % found.parent, "grey50"),
+            ))
+        raw = ui.ask("Номер файла из списка или путь к своему")
+    else:
+        ui.console.print("[grey50]Автоматически ничего похожего не нашлось — "
+                         "искали в папке загрузок, папке исходных файлов отчёта и "
+                         "папке выгрузки. Укажите путь вручную.[/grey50]")
+        raw = ui.ask("Путь к файлу с историей")
 
     if not raw.strip():
         return False
@@ -336,7 +364,11 @@ def _history_screen() -> bool:
         ui.success("История из старого отчёта больше не подтягивается.")
         return True
 
-    path = Path(raw.strip().strip('"')).expanduser()
+    token = raw.strip()
+    if token.isdigit() and 1 <= int(token) <= len(candidates):
+        path = candidates[int(token) - 1][0]
+    else:
+        path = Path(token.strip('"')).expanduser()
     if not path.exists():
         ui.error(f"Файл не найден: {path}")
         return False

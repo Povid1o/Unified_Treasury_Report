@@ -46,6 +46,7 @@ class InboxTestCase(unittest.TestCase):
         }), encoding="utf-8")
         os.environ[settings.SETTINGS_FILE_ENV] = str(settings_file)
         config.reload()
+        inbox.forget_probe_cache()
         self.source = config.PORTFOLIO_DYNAMICS_T0_SOURCE
 
     def tearDown(self):
@@ -84,14 +85,88 @@ class ScanTests(InboxTestCase):
         (self.downloads / "отчёт из другой системы.xlsx").write_bytes(b"not ours")
         (self.downloads / "~$Позиция за период [01.01.2026] - [18.09.2026].xlsx").write_bytes(b"")
 
-        found = inbox.scan_downloads(self.source, self.downloads)
+        found = inbox.scan_slices(self.source, self.downloads)
 
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].business_date, dt.date(2026, 9, 18))
 
     def test_missing_downloads_folder_is_not_an_error(self):
         """Папку загрузок могли не примонтировать — это не повод падать."""
-        self.assertEqual(inbox.scan_downloads(self.source, self.tmp / "нет такой"), [])
+        self.assertEqual(inbox.scan_slices(self.source, self.tmp / "нет такой"), [])
+
+
+class ContentProbeTests(InboxTestCase):
+    """Выгрузку, которую ПЕРЕИМЕНОВАЛИ, отчёт всё равно обязан находить.
+
+    Имя — не свойство данных: браузер дописывает «(1)», человек правит имя
+    руками, выгружающая система однажды меняет формулировку. Пока поиск шёл
+    только по шаблону имени, любой такой случай означал «файл лежит в
+    загрузках, а отчёт его не видит» — без единого слова о причине.
+    """
+
+    def renamed(self, period_end: str, name: str) -> Path:
+        return write_export(self.downloads / name, slice_rows(30, 60),
+                            period_end=period_end)
+
+    def test_renamed_export_is_found_by_its_contents(self):
+        self.renamed("18.09.2026", "выгрузка (1).xlsx")
+
+        found = inbox.scan_slices(self.source, self.downloads)
+
+        self.assertEqual([c.business_date for c in found], [dt.date(2026, 9, 18)])
+
+    def test_the_find_is_announced(self):
+        """Молча брать файл с «неправильным» именем нельзя: человек должен
+        понимать, почему отчёт собрался именно из него."""
+        self.renamed("18.09.2026", "выгрузка (1).xlsx")
+
+        with self.assertLogs("portfolio_dynamics", level="INFO") as captured:
+            inbox.scan_slices(self.source, self.downloads)
+
+        self.assertTrue(any("выгрузка (1).xlsx" in line and "содержимому" in line
+                            for line in captured.output))
+
+    def test_a_foreign_workbook_is_not_taken(self):
+        """Признак — шапка выгрузки, а не просто дата: диапазон дат есть в любом отчёте."""
+        from openpyxl import Workbook
+        workbook = Workbook()
+        workbook.active["A1"] = "Отчёт за период [01.01.2026] - [18.09.2026]"
+        workbook.active["A3"] = "Совсем другие колонки"
+        workbook.save(self.downloads / "чужой отчёт.xlsx")
+
+        self.assertEqual(inbox.scan_slices(self.source, self.downloads), [])
+
+    def test_a_broken_file_is_not_an_error(self):
+        (self.downloads / "битый.xlsx").write_bytes(b"not a workbook at all")
+        self.renamed("18.09.2026", "выгрузка (1).xlsx")
+
+        found = inbox.scan_slices(self.source, self.downloads)
+
+        self.assertEqual([c.path.name for c in found], ["выгрузка (1).xlsx"])
+
+    def test_a_renamed_pair_gives_a_working_run(self):
+        """Главное: переименованные файлы доходят до отчёта, а не просто находятся."""
+        self.renamed("18.09.2026", "позиции свежие.xlsx")
+        self.renamed("11.09.2026", "позиции прошлые.xlsx")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(etl.read_business_date(t0), dt.date(2026, 9, 18))
+        self.assertEqual(etl.read_business_date(t7), dt.date(2026, 9, 11))
+
+    def test_a_position_export_is_never_mistaken_for_a_limits_file(self):
+        """У двух выгрузок разные шапки, и поиск по содержимому обязан их различать."""
+        self.renamed("18.09.2026", "выгрузка (1).xlsx")
+
+        found = inbox.scan_limits(config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE, self.downloads)
+
+        self.assertEqual(found, [])
+
+    def test_name_search_alone_can_be_asked_for(self):
+        """deep=False нужен диагностике, чтобы показать, что дало имя, а что содержимое."""
+        self.renamed("18.09.2026", "выгрузка (1).xlsx")
+
+        self.assertEqual(inbox.scan_slices(self.source, self.downloads, deep=False), [])
 
 
 class RealFilenameTests(InboxTestCase):
@@ -107,7 +182,7 @@ class RealFilenameTests(InboxTestCase):
         self.real_download("18.09.2026")
         self.real_download("11.09.2026")
 
-        found = {c.business_date for c in inbox.scan_downloads(self.source, self.downloads)}
+        found = {c.business_date for c in inbox.scan_slices(self.source, self.downloads)}
         self.assertEqual(found, {dt.date(2026, 9, 18), dt.date(2026, 9, 11)})
 
     def test_full_run_from_downloads(self):
@@ -194,7 +269,7 @@ class LimitsImportTests(InboxTestCase):
                 for old in self.downloads.glob("СОСТОЯНИЕ*"):
                     old.unlink()
                 write_limits_file(self.downloads / name, DEFAULT_ROWS)
-                found = inbox.scan_downloads(
+                found = inbox.scan_limits(
                     config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE, self.downloads)
                 self.assertEqual([c.business_date for c in found], [dt.date(2026, 9, 21)])
 
@@ -217,6 +292,38 @@ class LimitsImportTests(InboxTestCase):
 
         self.assertTrue(plan.complete)
         self.assertIsNone(plan.limits)
+
+    def test_limits_file_in_the_folder_does_not_pass_for_a_slice(self):
+        """Список дат считает тем же планом, что и запуск, — значит, и файл
+        лимитов он обязан исключать так же. Иначе папка «срез + лимиты»
+        выглядит укомплектованной, дата предлагается как готовая, а при
+        запуске оказывается, что второго среза нет."""
+        from test_limits import DEFAULT_ROWS, write_limits_file
+        folder = self.data / "2026-09-21"
+        folder.mkdir()
+        self.in_folder("2026-09-21", "21.09.2026")
+        write_limits_file(folder / "Состояние лимитов на дату 21_09_2026 - Результат.xlsx",
+                          DEFAULT_ROWS)
+
+        rows = inbox.available_dates(
+            self.source, None, limits_source=config.PORTFOLIO_DYNAMICS_LIMITS_SOURCE)
+
+        self.assertEqual(rows, [], "одного среза мало, сколько бы файлов ни лежало рядом")
+
+    def test_the_offered_date_really_builds(self):
+        """Список и запуск обязаны видеть одно и то же."""
+        from test_limits import DEFAULT_ROWS, write_limits_file
+        self.download("21.09.2026")
+        self.download("14.09.2026")
+        write_limits_file(
+            self.downloads / "Состояние лимитов на дату 21_09_2026 - Результат.xlsx",
+            DEFAULT_ROWS)
+
+        rows = pd_report._available_dates(self.args())
+
+        self.assertEqual([r.date for r in rows], [dt.date(2026, 9, 21)])
+        t0, _t7 = pd_report._resolve_slice_paths(self.args())
+        self.assertIn("21.09.2026", t0.name)
 
 
 class PlanTests(InboxTestCase):
@@ -475,12 +582,117 @@ class AvailableDatesTests(InboxTestCase):
         by_date = {r.date: r for r in rows}
 
         self.assertEqual(rows[0].date, dt.date(2026, 9, 18))
-        self.assertEqual(by_date[dt.date(2026, 9, 18)].origin, "загрузки")
+        # T0 придёт из загрузок, а пару к нему даёт срез, уже разложенный по
+        # папкам-датам: он ближе, чем дубль того же файла в загрузках.
+        self.assertEqual(by_date[dt.date(2026, 9, 18)].origin, "папки-даты + загрузки")
         self.assertEqual(by_date[dt.date(2026, 9, 11)].origin, "папка")
 
     def test_dates_without_a_pair_are_not_offered(self):
         self.download("18.09.2026")  # без более раннего среза пары нет
         self.assertEqual(inbox.available_dates(self.source, self.downloads), [])
+
+    def test_a_date_whose_pair_lies_in_another_folder_is_offered(self):
+        """Ровно тот случай, из-за которого свежая выгрузка «пропадала»: T-7
+        уже разложен по своей папке-дате, в загрузках его больше нет."""
+        self.in_folder("2026-09-11", "11.09.2026")
+        self.download("18.09.2026")
+
+        rows = inbox.available_dates(self.source, self.downloads)
+
+        self.assertEqual([r.date for r in rows],
+                         [dt.date(2026, 9, 18), dt.date(2026, 9, 11)][:len(rows)])
+        self.assertIn(dt.date(2026, 9, 18), [r.date for r in rows])
+
+
+class SlicesAlreadyFiledTests(InboxTestCase):
+    """Пара собирается и тогда, когда T-7 уже разложен по своей папке-дате.
+
+    Приёмка сама раскладывает каждый срез по папке его даты и вычищает
+    загрузки. Если после этого пару искать только в папке отчётной даты и в
+    загрузках, то через неделю работы свежая выгрузка перестаёт собираться:
+    T-7 лежит в СВОЕЙ папке, и отчёт объявляет, что файла нет, — стоя ровно в
+    той папке, куда сам его и положил.
+    """
+
+    def test_t7_is_taken_from_its_own_date_folder(self):
+        self.in_folder("2026-09-11", "11.09.2026")
+        self.download("18.09.2026")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(etl.read_business_date(t0), dt.date(2026, 9, 18))
+        self.assertEqual(etl.read_business_date(t7), dt.date(2026, 9, 11))
+
+    def test_the_source_folder_keeps_its_copy(self):
+        """Из чужой папки файл копируется: там он единственный экземпляр
+        отчёта на свою дату, и «перенести» значило бы сломать прошлый."""
+        self.in_folder("2026-09-11", "11.09.2026")
+        self.download("18.09.2026")
+
+        pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(len(self.names("2026-09-11")), 1, "срез остался у себя")
+        self.assertEqual(len(self.names("2026-09-18")), 2, "и появился в папке отчёта")
+
+    def test_it_is_written_down_in_the_log(self):
+        self.in_folder("2026-09-11", "11.09.2026")
+        self.download("18.09.2026")
+
+        with self.assertLogs("portfolio_dynamics", level="INFO") as captured:
+            pd_report._resolve_slice_paths(self.args())
+
+        self.assertTrue(any("2026-09-11" in line and "взят из папки" in line
+                            for line in captured.output))
+
+    def test_a_second_week_in_a_row(self):
+        """Сценарий целиком: неделю назад собрали отчёт, теперь скачали одну
+        свежую выгрузку — и она обязана собраться, а не пересобрать прошлую."""
+        self.download("04.09.2026")
+        self.download("11.09.2026")
+        pd_report._resolve_slice_paths(self.args())      # неделя 1
+        self.assertEqual(self.downloads_names(), [], "загрузки вычищены")
+
+        self.download("18.09.2026")                      # неделя 2
+        t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(etl.read_business_date(t0), dt.date(2026, 9, 18))
+        self.assertEqual(etl.read_business_date(t7), dt.date(2026, 9, 11))
+
+    def test_the_older_pair_can_still_be_rebuilt(self):
+        """Пересборка прошлой даты не должна ломаться от того, что появилась новая."""
+        self.download("04.09.2026")
+        self.download("11.09.2026")
+        pd_report._resolve_slice_paths(self.args())
+        self.download("18.09.2026")
+        pd_report._resolve_slice_paths(self.args())
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args(date="2026-09-11"))
+
+        self.assertEqual(etl.read_business_date(t0), dt.date(2026, 9, 11))
+        self.assertEqual(etl.read_business_date(t7), dt.date(2026, 9, 4))
+
+    def test_the_nearest_earlier_slice_wins_across_folders(self):
+        """T-7 — САМЫЙ СВЕЖИЙ из более ранних, где бы он ни лежал."""
+        self.in_folder("2026-08-28", "28.08.2026")
+        self.in_folder("2026-09-11", "11.09.2026")
+        self.download("18.09.2026")
+
+        _t0, t7 = pd_report._resolve_slice_paths(self.args())
+
+        self.assertEqual(etl.read_business_date(t7), dt.date(2026, 9, 11))
+
+    def test_flat_layout_is_unaffected(self):
+        """Без папок-дат искать по соседним папкам нечего и незачем."""
+        settings.set_value("portfolio_dynamics_use_date_folders", False)
+        config.reload()
+        source = config.PORTFOLIO_DYNAMICS_T0_SOURCE
+        self.download("11.09.2026")
+        self.download("18.09.2026")
+
+        plan = inbox.plan_import(source, self.downloads, dt.date(2026, 9, 18))
+
+        self.assertTrue(plan.complete)
+        self.assertEqual(plan.reuse, [])
 
 
 class ReportIntegrationTests(InboxTestCase):

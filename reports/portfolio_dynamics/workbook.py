@@ -90,6 +90,7 @@ SCHEMA = {
         ("red_max_util", "Красная зона, до", "num", "да", "> yellow_max_util, обычно = limit_amount", "Верхняя граница красной зоны, АБСОЛЮТНАЯ сумма в %s. Выше — превышение лимита." % UNIT),
         ("valid_from", "Действует с", "date", "да", "ISO дата", "Дата вступления лимита в силу — аудиторский след."),
         ("updated_by", "Кем изменено", "text", "да", "", "ФИО/логин сотрудника, изменившего строку."),
+        ("limit_remaining", "Остаток лимита сверху", "num", "нет", ">= 0, пусто — не пришло", "Свободный остаток лимита по данным САМОЙ системы лимитов, %s: колонка «Остаток лимита сверху» из выгрузки «Состояние лимитов». Не расчёт отчёта, а вторая, независимая величина — разница limit_amount минус эта колонка должна сходиться с объёмом типа в fact_type_daily. Пусто, если тип не пришёл в файле или лимит был разделён на подлимиты." % UNIT),
     ],
     "fact_type_daily": [
         ("business_date", "Дата", "date", "PK", "ISO дата, рабочий день", "Отчётная дата. Вместе с portfolio_type образует составной ключ."),
@@ -259,6 +260,7 @@ README_LINES = [
     ("Границы зон в fact_limit заданы АБСОЛЮТНЫМИ суммами: green_max_util < yellow_max_util < red_max_util.", None),
     ("Сравнивается с ними объём ТИПА из fact_type_daily: <= green — зелёная; <= yellow — жёлтая; <= red — красная; выше — ПРЕВЫШЕНИЕ.", None),
     ("Светофор находится на листе view_by_type, потому что лимит и объём типа лежат на одном грейне. В view_monitor колонка «Лимит» показывает лимит типа, к которому относится портфель.", None),
+    ("Колонка limit_remaining в fact_limit — СПРАВОЧНАЯ: это остаток лимита по данным самой системы лимитов. Ни одна формула её не использует; она нужна, чтобы сверить занятое по двум независимым источникам (limit_amount минус остаток должно сходиться с объёмом типа).", None),
     ("", None),
     ("Правила, которые нельзя нарушать", "h"),
     ("1. Строка 1 каждого листа с данными — технические заголовки snake_case. Их читает код. Не переименовывать, не переставлять, не добавлять строку над ними.", None),
@@ -341,9 +343,10 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         wb, "fact_limit", SCHEMA["fact_limit"], lim_rows, "manual", "tbl_fact_limit",
         widths={"portfolio_type": 18, "limit_amount": 20, "green_max_util": 17,
                 "yellow_max_util": 17, "red_max_util": 17, "updated_by": 20,
-                "valid_from": 14},
+                "valid_from": 14, "limit_remaining": 22},
         formats={"limit_amount": FMT_AMT, "green_max_util": FMT_AMT,
-                 "yellow_max_util": FMT_AMT, "red_max_util": FMT_AMT})
+                 "yellow_max_util": FMT_AMT, "red_max_util": FMT_AMT,
+                 "limit_remaining": FMT_AMT})
 
     ws_td = _write_table(
         wb, "fact_type_daily", SCHEMA["fact_type_daily"], td_rows, "machine", "tbl_fact_type_daily",

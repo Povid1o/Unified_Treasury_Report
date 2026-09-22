@@ -221,3 +221,72 @@ def warn_if_scale_looks_wrong(imported: pd.DataFrame, current: Dict[str, float])
                 portfolio_type, f"{value:,.0f}", f"{today:,.0f}",
                 ratio if ratio > 1 else 1 / ratio,
             )
+
+
+# ── Поиск файла с историей ───────────────────────────────────────────────────
+# Открывать книгу целиком, чтобы понять, наша ли она, незачем: имена листов
+# лежат в оглавлении файла и читаются мгновенно. Поэтому кандидатов можно
+# искать по СОДЕРЖИМОМУ, а не по имени — имя у старого отчёта произвольное
+# («Динамика портфелей.xlsx», «Отчёт КУАП итог (2).xlsx»), и требовать от
+# человека вспомнить его точно — ровно та причина, по которой возможность
+# импорта до сих пор было не найти.
+_EXCEL_SUFFIXES = (".xlsx", ".xlsm")
+_MAX_FILES_TO_PROBE = 400
+
+
+def history_sheets(path: Path) -> List[str]:
+    """Листы вида «Динамика <ТИП>» в книге. Пусто — файл не тот (или не книга)."""
+    path = Path(path)
+    if path.suffix.lower() not in _EXCEL_SUFFIXES:
+        return []
+    try:
+        from openpyxl import load_workbook
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            names = list(workbook.sheetnames)
+        finally:
+            workbook.close()
+    except Exception:  # битый файл, чужой формат, нет прав — просто не наш
+        return []
+    prefix = excel_io.normalize_label(SHEET_PREFIX)
+    return [name for name in names
+            if excel_io.normalize_label(name).startswith(prefix) and len(name.strip()) > len(SHEET_PREFIX)]
+
+
+def find_candidates(directories: List[Path], limit: int = 10) -> List[Tuple[Path, List[str]]]:
+    """Книги с листами «Динамика <ТИП>» в указанных папках, свежие сначала.
+
+    Папки перебираются без рекурсии и в порядке, в котором переданы: загрузки,
+    папка отчёта, папка выгрузки. Недоступная папка пропускается молча — это
+    поиск, а не проверка путей.
+    """
+    seen = set()
+    files: List[Path] = []
+    for directory in directories:
+        if directory is None:
+            continue
+        directory = Path(directory)
+        if not directory.is_dir():
+            continue
+        try:
+            entries = [f for f in directory.iterdir()
+                       if f.is_file() and not f.name.startswith("~$")
+                       and f.suffix.lower() in _EXCEL_SUFFIXES]
+        except OSError:
+            continue
+        entries.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+        for entry in entries:
+            resolved = entry.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            files.append(entry)
+
+    found: List[Tuple[Path, List[str]]] = []
+    for path in files[:_MAX_FILES_TO_PROBE]:
+        sheets = history_sheets(path)
+        if sheets:
+            found.append((path, sheets))
+            if len(found) >= limit:
+                break
+    return found

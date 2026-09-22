@@ -273,3 +273,68 @@ class EndToEndTests(HistoryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FindCandidatesTests(HistoryTestCase):
+    """Поиск отчёта старого формата по СОДЕРЖИМОМУ.
+
+    Имя у него произвольное («Динамика портфелей (2).xlsx», «КУАП итог.xlsx»),
+    и требовать от человека вспомнить и набрать путь — ровно та причина, по
+    которой возможность импорта было не найти. Листы «Динамика <ТИП>» видны в
+    оглавлении книги, поэтому искать можно без всяких догадок об имени.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.downloads = self.tmp / "downloads"
+        self.downloads.mkdir(exist_ok=True)
+
+    def test_old_report_is_found_whatever_it_is_called(self):
+        write_history_file(self.downloads / "какой-то файл (3).xlsx", DEFAULT_SHEETS)
+
+        found = history.find_candidates([self.downloads])
+
+        self.assertEqual([p.name for p, _sheets in found], ["какой-то файл (3).xlsx"])
+
+    def test_the_sheets_are_reported(self):
+        """Человек должен видеть, ЧТО в файле, а не только его имя."""
+        write_history_file(self.downloads / "архив.xlsx", DEFAULT_SHEETS)
+
+        _path, sheets = history.find_candidates([self.downloads])[0]
+
+        self.assertEqual(sorted(sheets),
+                         ["Динамика AFS", "Динамика HTM", "Динамика TSS"])
+
+    def test_a_workbook_without_such_sheets_is_not_offered(self):
+        write_export(self.downloads / "позиции.xlsx",
+                     [("Позиция: AFS_A", None, None, None), ("Bond", 1 * MLN, 3.0, 2.5)],
+                     period_end="18.09.2026")
+
+        self.assertEqual(history.find_candidates([self.downloads]), [])
+
+    def test_a_broken_file_is_skipped_quietly(self):
+        (self.downloads / "битый.xlsx").write_bytes(b"not a workbook")
+        write_history_file(self.downloads / "архив.xlsx", DEFAULT_SHEETS)
+
+        found = history.find_candidates([self.downloads])
+
+        self.assertEqual([p.name for p, _s in found], ["архив.xlsx"])
+
+    def test_missing_folder_is_not_an_error(self):
+        self.assertEqual(history.find_candidates([self.tmp / "нет такой"]), [])
+
+    def test_several_folders_are_searched_without_repeats(self):
+        write_history_file(self.downloads / "архив.xlsx", DEFAULT_SHEETS)
+
+        found = history.find_candidates([self.downloads, self.downloads])
+
+        self.assertEqual(len(found), 1)
+
+    def test_what_is_found_can_actually_be_imported(self):
+        """Находить файл, который потом не читается, — хуже, чем не находить."""
+        write_history_file(self.downloads / "архив.xlsx", DEFAULT_SHEETS)
+
+        path, _sheets = history.find_candidates([self.downloads])[0]
+        frame = history.parse_history_file(path)
+
+        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])

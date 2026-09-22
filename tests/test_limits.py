@@ -238,6 +238,92 @@ class RemainingColumnTests(LimitsTestCase):
         self.assertEqual(limits.check_utilisation(parsed, {"AFS": 300_000}), [])
 
 
+class RemainingInFactLimitTests(LimitsTestCase):
+    """«Остаток лимита сверху» должен доезжать до листа fact_limit колонкой.
+
+    Он не расчёт отчёта, а вторая величина из самой системы лимитов, поэтому
+    его нельзя ни пересчитать, ни восстановить — либо он записан, либо потерян.
+    """
+
+    REAL_ROWS = [
+        ("Облигации AFS", 400_000 * RUB, 100_000 * RUB),
+        ("Облигации AFS", 90_000 * RUB, 10_000 * RUB),   # меньший — отбрасывается
+        ("Облигации", 250_000 * RUB, 60_000 * RUB),
+        ("Облигации HTM", 900_000 * RUB, 200_000 * RUB),
+    ]
+
+    def build(self, known_types, rows=None, previous=None):
+        return limits.build_fact_limit(
+            self.parse(self.REAL_ROWS if rows is None else rows), known_types,
+            previous if previous is not None else pd.DataFrame(columns=etl.LIMIT_COLUMNS),
+            dt.date(2026, 9, 21), "Состояние лимитов на дату 21_09_2026",
+        )
+
+    def by_type(self, frame):
+        return frame.set_index("portfolio_type")
+
+    def test_remaining_reaches_fact_limit(self):
+        frame = self.by_type(self.build(["AFS", "HTM", "TSS"]))
+
+        self.assertEqual(frame.loc["AFS", "limit_remaining"], 100_000)
+        self.assertEqual(frame.loc["TSS", "limit_remaining"], 60_000)
+        self.assertEqual(frame.loc["HTM", "limit_remaining"], 200_000)
+
+    def test_remaining_comes_from_the_row_whose_limit_was_taken(self):
+        """AFS в файле дважды: остаток обязан быть от той же строки, что и лимит."""
+        frame = self.by_type(self.build(["AFS"]))
+
+        self.assertEqual(frame.loc["AFS", "limit_amount"], 400_000)
+        self.assertEqual(frame.loc["AFS", "limit_remaining"], 100_000)
+
+    def test_the_column_is_last_so_formulas_do_not_move(self):
+        """Формулы витрин адресуют fact_limit буквами: $B — лимит, $C..$E — зоны."""
+        self.assertEqual(etl.LIMIT_COLUMNS[:5],
+                         ["portfolio_type", "limit_amount", "green_max_util",
+                          "yellow_max_util", "red_max_util"])
+        self.assertEqual(etl.LIMIT_COLUMNS[-1], "limit_remaining")
+
+    def test_missing_column_leaves_it_empty(self):
+        frame = self.by_type(self.build(["AFS"], rows=[("Облигации AFS", 400_000 * RUB)]))
+
+        self.assertTrue(pd.isna(frame.loc["AFS", "limit_remaining"]))
+        self.assertEqual(frame.loc["AFS", "limit_amount"], 400_000)
+
+    def test_a_type_without_a_file_row_has_no_remaining(self):
+        previous = pd.DataFrame([
+            ["ОСОБЫЙ", 5_000, 3_500, 4_500, 5_000, dt.date(2026, 1, 1), "Иванов И.И.", 1_200],
+        ], columns=etl.LIMIT_COLUMNS)
+
+        frame = self.by_type(self.build(["AFS", "ОСОБЫЙ"], previous=previous))
+
+        self.assertEqual(frame.loc["ОСОБЫЙ", "limit_remaining"], 1_200,
+                         "перенос из предыдущего выпуска идёт строкой целиком")
+
+    def test_a_split_limit_leaves_the_remaining_empty(self):
+        """Остаток в файле относится к СОВОКУПНОМУ лимиту. Рядом с долей от него
+        он означал бы неправду, а неправда в колонке хуже пустой колонки."""
+        settings.set_value("portfolio_dynamics_nested_limits", "HTM_KUAP=100000")
+        config.reload()
+
+        frame = self.by_type(self.build(["AFS", "HTM", "HTM_KUAP", "TSS"]))
+
+        self.assertEqual(frame.loc["HTM", "limit_amount"], 800_000)
+        self.assertTrue(pd.isna(frame.loc["HTM", "limit_remaining"]))
+        self.assertTrue(pd.isna(frame.loc["HTM_KUAP", "limit_remaining"]))
+        self.assertEqual(frame.loc["AFS", "limit_remaining"], 100_000,
+                         "у неделёного типа остаток остаётся на месте")
+
+    def test_the_skip_is_explained_in_the_log(self):
+        settings.set_value("portfolio_dynamics_nested_limits", "HTM_KUAP=100000")
+        config.reload()
+
+        with self.assertLogs("portfolio_dynamics", level="INFO") as captured:
+            self.build(["AFS", "HTM", "HTM_KUAP", "TSS"])
+
+        self.assertTrue(any("Остаток лимита сверху" in line and "подлимит" in line.lower()
+                            for line in captured.output))
+
+
 class ZoneTests(LimitsTestCase):
     def test_zone_percents_match_the_agreed_table(self):
         for portfolio_type, (green, yellow, red) in EXPECTED_PERCENTS.items():
@@ -282,7 +368,7 @@ class BuildFactLimitTests(LimitsTestCase):
     def test_type_absent_from_the_file_keeps_its_previous_limit(self):
         """Неполный файл не должен обнулять уже согласованные лимиты."""
         previous = pd.DataFrame([
-            ["ОСОБЫЙ", 5_000, 3_500, 4_500, 5_000, dt.date(2026, 1, 1), "Иванов И.И."],
+            ["ОСОБЫЙ", 5_000, 3_500, 4_500, 5_000, dt.date(2026, 1, 1), "Иванов И.И.", 1_200],
         ], columns=etl.LIMIT_COLUMNS)
 
         with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
@@ -295,7 +381,7 @@ class BuildFactLimitTests(LimitsTestCase):
 
     def test_changed_limit_is_logged(self):
         previous = pd.DataFrame([
-            ["AFS", 10_000, 7_000, 9_000, 10_000, dt.date(2026, 1, 1), "Иванов И.И."],
+            ["AFS", 10_000, 7_000, 9_000, 10_000, dt.date(2026, 1, 1), "Иванов И.И.", 2_000],
         ], columns=etl.LIMIT_COLUMNS)
 
         with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:

@@ -19,6 +19,8 @@
 Границы зон лимитом не приходят: они считаются процентами от него по
 таблице ZONE_PERCENTS.
 """
+import datetime as dt
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -31,8 +33,8 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    KNOWN_PORTFOLIO_TYPES, LIMIT_COLUMNS, PortfolioDynamicsError, canonical_type,
-    logger, parse_number, parse_nested_limits, parse_type_parents,
+    KNOWN_PORTFOLIO_TYPES, LIMIT_COLUMNS, PROBE_SUFFIXES, PortfolioDynamicsError,
+    canonical_type, logger, parse_number, parse_nested_limits, parse_type_parents,
 )
 
 COL_LIMIT_TYPE = "Тип лимита"
@@ -97,6 +99,66 @@ def resolve_type(raw_name, aliases: Dict[str, str]) -> str:
         return max(inside, key=len)
 
     return canonical_type(raw_name)
+
+
+# Дата в шапке файла лимитов: «на дату 21.09.2026» / «21_09_2026».
+_DATE_IN_TEXT = re.compile(r"(\d{2})[._-](\d{2})[._-](\d{4})")
+_PROBE_ROWS = 20
+
+
+def probe_limits_date(path: Path) -> Optional[dt.date]:
+    """Дата выгрузки лимитов по СОДЕРЖИМОМУ книги. None — файл не тот.
+
+    Нужна, когда файл переименовали и имя под шаблон больше не подходит.
+    Требуется И колонка «Тип лимита», И дата в верхних строках: без первого
+    признака за выгрузку лимитов принялся бы любой файл с датой в шапке, без
+    второго — дату брать было бы неоткуда, а угадывать её по времени файла
+    нельзя: молча устаревший лимит хуже отсутствующего.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in PROBE_SUFFIXES:
+        return None
+    wanted = excel_io.normalize_label(COL_LIMIT_TYPE)
+    try:
+        from openpyxl import load_workbook
+        workbook = load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return None
+    try:
+        for worksheet in workbook.worksheets:
+            found_date = None
+            has_column = False
+            for row in worksheet.iter_rows(max_row=_PROBE_ROWS, values_only=True):
+                for value in row:
+                    if value is None:
+                        continue
+                    if isinstance(value, dt.datetime):
+                        found_date = found_date or value.date()
+                        continue
+                    if isinstance(value, dt.date):
+                        found_date = found_date or value
+                        continue
+                    text = str(value)
+                    if not has_column and excel_io.normalize_label(text) == wanted:
+                        has_column = True
+                    if found_date is None:
+                        match = _DATE_IN_TEXT.search(text)
+                        if match:
+                            try:
+                                found_date = dt.date(int(match.group(3)), int(match.group(2)),
+                                                     int(match.group(1)))
+                            except ValueError:
+                                pass
+            if has_column and found_date is not None:
+                return found_date
+    except Exception:
+        return None
+    finally:
+        try:
+            workbook.close()
+        except Exception:
+            pass
+    return None
 
 
 def _find_header(path: Path) -> Tuple[str, pd.DataFrame, int, Dict[str, int]]:
@@ -279,6 +341,27 @@ def zones_for(portfolio_type: str, limit_amount: float) -> Tuple[float, float, f
     return tuple(round(limit_amount * p, 2) for p in percents)
 
 
+def _remaining_for(portfolio_type: str, limit_amount: float,
+                   limits_as_in_file: Dict[str, float],
+                   remaining_by_type: Dict[str, Optional[float]],
+                   split_types: List[str]) -> Optional[float]:
+    """Остаток лимита для строки fact_limit. None — записывать нечего.
+
+    Остаток пишется, только когда записанный лимит совпал с тем, что стоит в
+    файле. Если лимит поделён на подлимиты («Сколько отдано вложенным типам»),
+    остаток из файла относится к СОВОКУПНОМУ лимиту, и рядом с долей от него
+    он означал бы неправду — а неправда в колонке хуже пустой колонки.
+    """
+    remaining = remaining_by_type.get(portfolio_type)
+    if remaining is None or pd.isna(remaining):
+        return None
+    in_file = limits_as_in_file.get(portfolio_type)
+    if in_file is None or round(in_file, 2) != round(limit_amount, 2):
+        split_types.append(portfolio_type)
+        return None
+    return round(float(remaining), 2)
+
+
 def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
                      previous: pd.DataFrame, business_date, source_name: str) -> pd.DataFrame:
     """Собирает лист fact_limit: лимиты из файла + границы зон по процентам.
@@ -302,6 +385,14 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
 
     from_file = {canonical_type(row.portfolio_type): float(row.limit_amount)
                  for row in parsed.itertuples()}
+    # Остаток приходит той же строкой файла и относится к ТОМУ ЖЕ лимиту, что
+    # в ней указан. Запоминаем и лимит до дележа на подлимиты: после него
+    # остаток к записанной сумме уже не относится (см. ниже).
+    remaining_by_type = {}
+    if "remaining_amount" in parsed.columns:
+        remaining_by_type = {canonical_type(row.portfolio_type): row.remaining_amount
+                             for row in parsed.itertuples()}
+    limits_as_in_file = dict(from_file)
     from_file = _split_nested(from_file, recognised)
     matched = {t: v for t, v in from_file.items() if t in recognised}
     ignored = sorted(set(from_file) - set(matched))
@@ -323,6 +414,7 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
     types_in_report = sorted(set(matched) | known_upper | set(previous_by_type))
 
     records = []
+    split_types = []
     for portfolio_type in types_in_report:
         if portfolio_type in matched:
             limit_amount = matched[portfolio_type]
@@ -331,6 +423,9 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
                 "portfolio_type": portfolio_type, "limit_amount": round(limit_amount, 2),
                 "green_max_util": green, "yellow_max_util": yellow, "red_max_util": red,
                 "valid_from": business_date, "updated_by": source_name,
+                "limit_remaining": _remaining_for(
+                    portfolio_type, limit_amount, limits_as_in_file,
+                    remaining_by_type, split_types),
             })
             continue
 
@@ -342,8 +437,15 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
         records.append({
             "portfolio_type": portfolio_type, "limit_amount": 0,
             "green_max_util": 0, "yellow_max_util": 0, "red_max_util": 0,
-            "valid_from": business_date, "updated_by": None,
+            "valid_from": business_date, "updated_by": None, "limit_remaining": None,
         })
+
+    if split_types:
+        logger.info(
+            "Лимиты: «%s» не записан для типов %s — их лимит поделён на подлимиты, "
+            "а остаток в файле указан к совокупному лимиту и к записанной сумме "
+            "больше не относится.", COL_LIMIT_REMAINING, ", ".join(split_types),
+        )
 
     missing = sorted(t for t in types_in_report if t not in matched)
     if missing:
