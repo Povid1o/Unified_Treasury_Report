@@ -110,9 +110,10 @@ class PortfolioDynamicsReport(Report):
             previous_path = etl.find_previous_release(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
 
         limits_path = _resolve_limits_path(t0_path, args)
+        history_path, force_history = _history_request(args)
         data = etl.build_data(t0_path, t7_path, previous_path=previous_path,
                               bootstrap=bootstrap, limits_path=limits_path,
-                              history_path=_resolve_history_path(args))
+                              history_path=history_path, force_history=force_history)
 
         output_path = Path(args.output) if args.output else _default_output_path(data.business_date)
         checks = workbook.evaluate_checks(data)
@@ -289,7 +290,18 @@ def _print_history_source() -> None:
     else:
         ui.console.print("  [yellow]![/yellow] предыдущего выпуска нет — история начнётся "
                          "с одной даты")
-    if configured and str(configured).strip():
+    accumulated = 0
+    if previous is not None:
+        try:
+            accumulated = etl.history_dates(etl.load_previous_release(previous).fact_type_daily)
+        except Exception:  # диагностика не должна падать на битом выпуске
+            accumulated = 0
+        ui.console.print(f"  [grey70]дат в истории: {accumulated}[/grey70]")
+    if configured and str(configured).strip() and accumulated >= etl.HISTORY_ACCUMULATED_DATES:
+        ui.console.print(f"  [grey50]импорт из отчёта старого формата ({configured}) больше не "
+                         f"нужен: история уже накоплена (от {etl.HISTORY_ACCUMULATED_DATES} "
+                         "дат) и переносится из выпуска в выпуск[/grey50]")
+    elif configured and str(configured).strip():
         found = history.resolve_path(configured, _history_search_dirs())
         if found is None:
             ui.console.print(f"  [bold red]✗[/bold red] импорт из отчёта старого формата: "
@@ -462,8 +474,7 @@ def _dates_table(rows) -> Table:
 
 def _history_search_dirs() -> list:
     """Где искать отчёт старого формата: загрузки, папка отчёта, папка выгрузки."""
-    return [Path(config.DOWNLOADS_DIR), Path(config.PORTFOLIO_DYNAMICS_DIR),
-            Path(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)]
+    return history.search_dirs()
 
 
 def _pick_history_file() -> Optional[str]:
@@ -603,31 +614,19 @@ def _resolve_slice_paths(args: argparse.Namespace) -> tuple:
     return _two_latest_flat(source)
 
 
-def _resolve_history_path(args: argparse.Namespace) -> Optional[Path]:
-    """Файл старого формата для разового импорта истории: аргумент или настройка.
+def _history_request(args: argparse.Namespace) -> tuple:
+    """(путь к файлу старого формата или None, задан ли он явно).
 
-    Путь, заданный аргументом (или введённый только что в диалоге), обязан
-    найтись — человек явно попросил этот файл. Путь из НАСТРОЙКИ — нет: импорт
-    истории разовый и необязательный, и устаревшая настройка не должна валить
-    весь отчёт, когда оба среза и предыдущий выпуск на месте.
+    Явно — аргументом --history или ответом в диалоге первого выпуска: тогда
+    файл читается всегда и обязан найтись. Из настройки — только пока история
+    в предыдущем выпуске не накоплена; дальше она переносится из выпуска в
+    выпуск, и устаревший путь в настройке ничему не мешает.
     """
     explicit = getattr(args, "history", None)
     raw = explicit or config.PORTFOLIO_DYNAMICS_HISTORY_FILE
     if not raw or not str(raw).strip():
-        return None
-    path = history.resolve_path(raw, _history_search_dirs())
-    if path is None:
-        if explicit:
-            raise etl.PortfolioDynamicsError(f"Файл с историей не найден: {raw}.")
-        etl.logger.warning(
-            "Файл с историей не найден: %s — история из отчёта старого формата не "
-            "подтягивается, отчёт собирается без неё. Поправьте путь в «Настройки» → "
-            "«история из старого отчёта» или очистите его.", raw,
-        )
-        return None
-    if str(path) != str(raw).strip().strip('"'):
-        etl.logger.info("Файл с историей: %s", path)
-    return path
+        return None, False
+    return str(raw).strip(), bool(explicit)
 
 
 def _resolve_limits_path(t0_path: Path, args: argparse.Namespace) -> Optional[Path]:

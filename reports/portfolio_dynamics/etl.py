@@ -1107,17 +1107,59 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
     )
 
 
-def _import_history(previous: PreviousRelease, history_path: Optional[Path]) -> int:
+# Сколько дат в истории предыдущего выпуска означает «история уже накоплена».
+# Тогда файл старого формата больше не читается: история переносится из
+# выпуска в выпуск, а импорт был разовым. Порог — в датах, а не в строках:
+# строк на дату столько, сколько типов, и «10 строк» — это всего 2–3 дня.
+HISTORY_ACCUMULATED_DATES = 10
+
+
+def history_dates(frame: pd.DataFrame) -> int:
+    """Сколько разных дат в истории по типам."""
+    return 0 if frame is None or frame.empty else int(frame["business_date"].nunique())
+
+
+def _import_history(previous: PreviousRelease, history_path, force: bool = False) -> int:
     """Дополняет историю предыдущего выпуска строками из отчёта старого формата.
 
     Меняет previous.fact_type_daily на месте: дальше он идёт в _build_type_daily
     обычным путём, и импортированные даты ничем не отличаются от накопленных.
 
+    Импорт РАЗОВЫЙ: когда в предыдущем выпуске уже накоплено
+    HISTORY_ACCUMULATED_DATES дат, история берётся оттуда, а файл старого
+    формата не читается вовсе — его можно спокойно удалить из загрузок, и
+    отчёт не станет каждый день предупреждать, что файла нет. force — путь
+    задан явно (--history или ответом в диалоге): тогда импорт выполняется
+    всегда, а отсутствие файла — ошибка.
+
     Импорт внутри функции: history.py читает константы из etl.py, и импорт на
     уровне модуля замкнул бы их в кольцо.
     """
-    if history_path is None:
+    if history_path is None or not str(history_path).strip():
         return 0
+
+    accumulated = history_dates(previous.fact_type_daily)
+    if not force and accumulated >= HISTORY_ACCUMULATED_DATES:
+        logger.info(
+            "История: в предыдущем выпуске уже %d дат — она переносится оттуда, файл "
+            "старого формата (%s) не читается. Подтянуть его ещё раз: --history <файл>.",
+            accumulated, Path(str(history_path)).name,
+        )
+        return 0
+
+    from reports.portfolio_dynamics import history as history_module
+
+    path = history_module.resolve_path(history_path, history_module.search_dirs())
+    if path is None:
+        if force:
+            raise PortfolioDynamicsError(f"Файл с историей не найден: {history_path}.")
+        logger.warning(
+            "Файл с историей не найден: %s — история из отчёта старого формата не "
+            "подтягивается, отчёт собирается без неё. Поправьте путь в «Настройки» → "
+            "«история из старого отчёта» или очистите его.", history_path,
+        )
+        return 0
+    history_path = path
 
     from reports.portfolio_dynamics import history as history_module
 
@@ -1286,7 +1328,8 @@ def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.Data
 
 def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = None,
                bootstrap: bool = False, limits_path: Optional[Path] = None,
-               history_path: Optional[Path] = None) -> PortfolioDynamicsData:
+               history_path: Optional[Path] = None,
+               force_history: bool = False) -> PortfolioDynamicsData:
     """Полный цикл ETL: два среза + предыдущий выпуск -> четыре таблицы схемы v3.0.
 
     limits_path — выгрузка «Состояние лимитов» на отчётную дату. Есть файл —
@@ -1295,7 +1338,9 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
 
     history_path — отчёт СТАРОГО формата, из которого один раз подтягивается
     уже накопленная история объёмов по типам. Импорт только дополняет: даты,
-    накопленные своими запусками, не перезаписываются.
+    накопленные своими запусками, не перезаписываются. Когда история в
+    предыдущем выпуске уже накоплена, файл не читается (см. _import_history);
+    force_history — путь указан явно, импорт выполняется всё равно.
     """
     t0 = parse_slice(t0_path, "T0")
     t7 = parse_slice(t7_path, "T-7")
@@ -1342,7 +1387,7 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
     limit_types += list(parse_type_parents()) + list(parse_type_parents().values())
 
     _drop_unknown_types(previous)
-    imported_rows = _import_history(previous, history_path)
+    imported_rows = _import_history(previous, history_path, force=force_history)
     dim, new_codes = _build_dim(t0, previous, bootstrap, extra_types=limit_types)
     _record_unmapped(dim)
     limits = _resolve_limits(dim, previous, business_date, bootstrap, limits_path, parsed_limits)
@@ -1357,7 +1402,7 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
             dict(zip(today_rows["portfolio_type"].astype(str), today_rows["volume_amount"])),
         )
 
-    if history_path is not None:
+    if imported_rows:
         from reports.portfolio_dynamics import history as history_module
         today = history[history["business_date"] == business_date]
         history_module.warn_if_scale_looks_wrong(

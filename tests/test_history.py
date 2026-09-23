@@ -387,34 +387,74 @@ class ResolvePathTests(HistoryTestCase):
         self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])
 
 
-class ReportHistoryPathTests(HistoryTestCase):
-    """Устаревший путь в настройке не должен валить весь отчёт."""
+class ImportOnceTests(HistoryTestCase):
+    """Импорт разовый: накопилась история в выпуске — файл больше не читается.
 
-    def _args(self, history_arg=None):
-        import argparse
-        return argparse.Namespace(history=history_arg)
+    Иначе путь из настройки читался бы на каждом запуске, а удалённый из
+    загрузок файл давал бы предупреждение каждый день.
+    """
 
-    def _configure(self, value):
-        settings.set_value("portfolio_dynamics_history_file", value)
-        config.reload()
+    def previous_with(self, dates: int) -> etl.PreviousRelease:
+        previous = etl.PreviousRelease.empty()
+        previous.fact_type_daily = pd.DataFrame(
+            [{"business_date": dt.date(2026, 8, 1) + dt.timedelta(days=i),
+              "portfolio_type": "AFS", "volume_amount": 300.0} for i in range(dates)],
+            columns=etl.TYPE_DAILY_COLUMNS,
+        )
+        return previous
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "downloads").mkdir(exist_ok=True)
+        self.file = write_history_file(self.tmp / "downloads" / "Лимиты (1).xlsx", DEFAULT_SHEETS)
+
+    def test_short_history_is_topped_up_from_file(self):
+        previous = self.previous_with(etl.HISTORY_ACCUMULATED_DATES - 1)
+
+        self.assertEqual(etl._import_history(previous, str(self.file)), 9)
+
+    def test_accumulated_history_is_carried_without_reading_file(self):
+        previous = self.previous_with(etl.HISTORY_ACCUMULATED_DATES)
+        before = previous.fact_type_daily.copy()
+
+        self.assertEqual(etl._import_history(previous, str(self.file)), 0)
+        pd.testing.assert_frame_equal(previous.fact_type_daily, before)
+
+    def test_missing_file_is_silent_once_history_is_accumulated(self):
+        previous = self.previous_with(etl.HISTORY_ACCUMULATED_DATES)
+
+        # assertNoLogs появился только в 3.10, а на рабочих машинах 3.9.
+        with self.assertLogs(etl.logger, level="INFO") as captured:
+            etl._import_history(previous, str(self.tmp / "удалён.xlsx"))
+        self.assertFalse([r for r in captured.records if r.levelname == "WARNING"])
+
+    def test_explicit_path_is_imported_anyway(self):
+        previous = self.previous_with(etl.HISTORY_ACCUMULATED_DATES)
+
+        self.assertEqual(etl._import_history(previous, str(self.file), force=True), 9)
+
+    def test_path_without_extension_works(self):
+        previous = self.previous_with(0)
+
+        self.assertEqual(etl._import_history(previous, str(self.tmp / "downloads" / "Лимиты (1)")), 9)
 
     def test_broken_setting_is_skipped_with_warning(self):
-        from reports.portfolio_dynamics import report
-        self._configure(str(self.tmp / "downloads" / "нет такого файла"))
+        previous = self.previous_with(0)
 
         with self.assertLogs(etl.logger, level="WARNING"):
-            self.assertIsNone(report._resolve_history_path(self._args()))
-
-    def test_setting_without_extension_works(self):
-        from reports.portfolio_dynamics import report
-        (self.tmp / "downloads").mkdir(exist_ok=True)
-        real = write_history_file(self.tmp / "downloads" / "Лимиты (1).xlsx", DEFAULT_SHEETS)
-        self._configure(str(self.tmp / "downloads" / "Лимиты (1)"))
-
-        self.assertEqual(report._resolve_history_path(self._args()), real)
+            self.assertEqual(etl._import_history(previous, str(self.tmp / "нет такого")), 0)
 
     def test_explicit_argument_must_exist(self):
-        from reports.portfolio_dynamics import report
-
         with self.assertRaises(etl.PortfolioDynamicsError):
-            report._resolve_history_path(self._args(str(self.tmp / "нет такого")))
+            etl._import_history(self.previous_with(0), str(self.tmp / "нет такого"), force=True)
+
+    def test_report_marks_cli_argument_as_explicit(self):
+        import argparse
+        from reports.portfolio_dynamics import report
+        settings.set_value("portfolio_dynamics_history_file", str(self.file))
+        config.reload()
+
+        self.assertEqual(report._history_request(argparse.Namespace(history=None)),
+                         (str(self.file), False))
+        self.assertEqual(report._history_request(argparse.Namespace(history="x.xlsx")),
+                         ("x.xlsx", True))

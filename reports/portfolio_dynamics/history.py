@@ -254,6 +254,12 @@ def history_sheets(path: Path) -> List[str]:
             if excel_io.normalize_label(name).startswith(prefix) and len(name.strip()) > len(SHEET_PREFIX)]
 
 
+def search_dirs() -> List[Path]:
+    """Где искать отчёт старого формата: загрузки, папка отчёта, папка выгрузки."""
+    return [Path(config.DOWNLOADS_DIR), Path(config.PORTFOLIO_DYNAMICS_DIR),
+            Path(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)]
+
+
 def resolve_path(raw, directories: Optional[List[Path]] = None) -> Optional[Path]:
     """Путь из настройки или аргумента -> существующий файл. None — не нашёлся.
 
