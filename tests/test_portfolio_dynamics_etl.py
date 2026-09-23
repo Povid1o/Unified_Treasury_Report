@@ -5,6 +5,8 @@
 и средневзвешенная (а не средняя) дюрация.
 """
 import datetime as dt
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -17,6 +19,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
+from common import settings  # noqa: E402
 from reports.portfolio_dynamics import etl, workbook  # noqa: E402
 
 # Объёмы во входных файлах пишем в рублях, как в реальной выгрузке.
@@ -93,6 +96,13 @@ class PortfolioDynamicsTestCase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
+        # Свои настройки, а не настройки разработчика: отчёт пишет файл
+        # разметки типов рядом с settings.json, и тест не должен сорить в проекте.
+        self._saved_env = os.environ.get(settings.SETTINGS_FILE_ENV)
+        settings_file = self.tmp / "settings.json"
+        settings_file.write_text(json.dumps({}), encoding="utf-8")
+        os.environ[settings.SETTINGS_FILE_ENV] = str(settings_file)
+        config.reload()
         self.t0_path = write_export(self.tmp / export_name("01.09.2026"), T0_ROWS)
         self.t7_path = write_export(
             self.tmp / export_name("25.08.2026"), T7_ROWS, period_end="25.08.2026"
@@ -101,6 +111,11 @@ class PortfolioDynamicsTestCase(unittest.TestCase):
         self.out_dir.mkdir()
 
     def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop(settings.SETTINGS_FILE_ENV, None)
+        else:
+            os.environ[settings.SETTINGS_FILE_ENV] = self._saved_env
+        config.reload()
         self._tmp.cleanup()
 
     def build(self, previous=None, bootstrap=False, t0_path=None):
@@ -300,8 +315,8 @@ class IncrementalTests(PortfolioDynamicsTestCase):
     def test_past_dates_are_never_rewritten(self):
         previous = self.bootstrap_release()
         _append_history(previous, [
-            (dt.date(2026, 1, 5), "AFS_TR_RUR", 11.0),
-            (dt.date(2026, 1, 5), "HTM_ALCO", 22.0),
+            (dt.date(2026, 1, 5), "AFS", 11.0),
+            (dt.date(2026, 1, 5), "HTM", 22.0),
         ])
         before = pd.read_excel(previous, sheet_name="fact_type_daily")
         before = before[before["business_date"] == pd.Timestamp(2026, 1, 5)]

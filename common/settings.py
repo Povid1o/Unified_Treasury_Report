@@ -353,6 +353,17 @@ SETTINGS: List[Setting] = [
              "каждое изменение пишется в лог.",
     ),
     Setting(
+        key="portfolio_dynamics_types_file", label="Файл разметки портфелей по типам",
+        kind="file", group="portfolio_dynamics",
+        default=lambda get: settings_path().parent / "portfolio_types.json",
+        help="JSON вида {\"TSS\": [коды], \"AFS\": [...], \"HTM\": [...], \"HTM_KUAP\": "
+             "[...]} — главный источник разметки: перебивает и правила, и «Разметку "
+             "отдельных портфелей». Можно маски («AFS_*»). Файла нет — отчёт создаст "
+             "его сам при первом запуске. Портфели, которых в файле нет, отчёт "
+             "дописывает в раздел «_не_размечены» с угаданным типом — остаётся "
+             "перенести код в нужный список.",
+    ),
+    Setting(
         key="portfolio_dynamics_history_file", label="Файл с историей (старый формат)",
         kind="file", group="portfolio_dynamics", default="",
         help="Отчёт старого формата, из которого один раз подтягивается накопленная "
@@ -794,7 +805,7 @@ _SOURCE_GLOBS = {
 _CREATED_ON_WRITE = {
     "logs_dir", "ofz_output_path", "ovp_output_dir", "balance_struct_output_dir",
     "chpd_output_dir", "nim_output_dir", "transfert_output_dir",
-    "portfolio_dynamics_output_dir",
+    "portfolio_dynamics_output_dir", "portfolio_dynamics_types_file",
 }
 
 

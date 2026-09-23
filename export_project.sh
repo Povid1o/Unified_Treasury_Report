@@ -43,6 +43,7 @@ zip -r -X -P "$PASSWORD" "$OUT_FILE" "$PROJECT_NAME" \
      "*.DS_Store" \
      "$PROJECT_NAME/.DS_Store" \
      "$PROJECT_NAME/.claude/*" \
+     "$PROJECT_NAME/portfolio_types.json" \
      "$PROJECT_NAME"/*.zip \
   >/dev/null
 

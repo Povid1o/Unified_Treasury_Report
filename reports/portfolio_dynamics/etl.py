@@ -827,6 +827,8 @@ def parse_portfolio_overrides(raw: Optional[str] = None) -> Dict[str, str]:
 def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
     """Тип портфеля по его коду. Порядок правил — от частного к общему.
 
+    0. Файл разметки портфелей по типам (portfolio_types.json) — главный
+       источник: что в нём указано, то и тип, без всяких догадок.
     1. Точечное исключение из настроек («Разметка отдельных портфелей»).
     2. Самый ДЛИННЫЙ известный тип, которым код начинается: HTM_KUAP_CORE ->
        HTM_KUAP, а не HTM. Это должно идти раньше правил по подстроке, иначе
@@ -837,6 +839,11 @@ def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
     4. Если ничего не подошло — префикс до первого «_» (AFS_TR_RUR -> AFS).
     """
     code = str(portfolio_code).upper()
+
+    from reports.portfolio_dynamics import type_map
+    mapped = type_map.explicit_type(code)
+    if mapped:
+        return mapped
 
     override = parse_portfolio_overrides().get(code)
     if override:
@@ -855,6 +862,58 @@ def guess_type(portfolio_code: str, known_types: Iterable[str] = ()) -> str:
     # Канонизируем и здесь: код TTS_OFZ, оставшийся с прежнего написания,
     # должен дать тот же тип, что и TSS_OFZ.
     return canonical_type(code.split("_", 1)[0])
+
+
+def _allowed_types() -> set:
+    """Типы, которые бывают в отчёте: ключи файла разметки (TSS, AFS, HTM, HTM_KUAP)."""
+    from reports.portfolio_dynamics import type_map
+    return set(type_map.registry())
+
+
+def _drop_unknown_types(previous: PreviousRelease) -> None:
+    """Убирает из перенесённых лимитов и истории типы, которых в отчёте не бывает.
+
+    Прежнее угадывание заводило типы по кодам портфелей («OFZ», «BOND») —
+    с нулевым лимитом и своей строкой в истории. Раз перечень типов теперь
+    задан файлом разметки, такие строки — мусор, из-за которого свод по типам
+    показывает лишние строки, а проверки лимитов падают.
+    """
+    allowed = _allowed_types()
+    dropped = set()
+    for name in ("fact_limit", "fact_type_daily"):
+        frame = getattr(previous, name)
+        if frame.empty:
+            continue
+        types = frame["portfolio_type"].map(
+            lambda t: canonical_type(t) if pd.notna(t) and str(t).strip() else "")
+        keep = types.isin(allowed)
+        if keep.all():
+            continue
+        dropped.update(types[~keep])
+        setattr(previous, name, frame[keep].reset_index(drop=True))
+    dropped.discard("")
+    if dropped:
+        logger.warning(
+            "Из лимитов и истории предыдущего выпуска убраны типы, которых нет в файле "
+            "разметки (%s): %s. Если какой-то из них настоящий — добавьте его ключом "
+            "в файл разметки.", ", ".join(sorted(allowed)), ", ".join(sorted(dropped)),
+        )
+
+
+def _record_unmapped(dim: pd.DataFrame) -> None:
+    """Портфели без явной разметки — в раздел «_не_размечены» файла разметки."""
+    from reports.portfolio_dynamics import type_map
+    guesses = {str(code): (str(t) if pd.notna(t) and str(t).strip() else None)
+               for code, t in zip(dim["portfolio_code"], dim["portfolio_type"])
+               if not type_map.explicit_type(code)}
+    added = type_map.record_unmapped(guesses)
+    if guesses:
+        logger.warning(
+            "Портфелей без явной разметки в файле %s: %d (новых %d) — тип им угадан "
+            "по коду. Они перечислены в разделе «%s» с угаданным типом: перенесите "
+            "каждый код в список своего типа.",
+            type_map.types_file(), len(guesses), len(added), type_map.UNMAPPED_KEY,
+        )
 
 
 def _next_sort_order(dim: pd.DataFrame) -> int:
@@ -876,12 +935,16 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
     known_types = set(previous.fact_limit["portfolio_type"].astype(str)) if not previous.fact_limit.empty else set()
     # Типы из файла лимитов — самый надёжный источник: это и есть реестр типов.
     known_types.update(str(t).upper() for t in extra_types if str(t).strip())
+    # Какие типы вообще бывают, решает файл разметки (TSS, AFS, HTM, HTM_KUAP):
+    # угаданное по коду «OFZ» или «BOND» типом не становится никогда.
+    allowed = _allowed_types()
     if bootstrap:
         # Первый выпуск: реестра типов ещё нет, поэтому недостающие типы
         # достраиваются по кодам портфелей. Именно ДОБАВЛЯЮТСЯ, а не заменяют:
         # типы из настроек и файла лимитов точнее угадывания по префиксу.
-        known_types.update(guess_type(code, known_types)
-                           for code in t0.frame["portfolio_code"])
+        known_types.update(t for t in (guess_type(code, known_types)
+                                       for code in t0.frame["portfolio_code"])
+                           if t in allowed)
 
     known_codes = set(dim["portfolio_code"].astype(str))
     # Дополнительные портфели ведутся руками и в выгрузке не встречаются —
@@ -906,7 +969,7 @@ def _build_dim(t0: PortfolioSlice, previous: PreviousRelease, bootstrap: bool,
             "portfolio_code": code,
             "portfolio_name": manual["name"] if manual else code,
             "portfolio_type": manual["type"] if manual else (
-                guessed if guessed in known_types else None),
+                guessed if guessed in known_types and guessed in allowed else None),
             "include_in_total": True,
             "is_limit_controlled": True,
             "sort_order": sort_order,
@@ -938,18 +1001,22 @@ def _apply_type_rules(dim: pd.DataFrame, known_types) -> None:
     """
     if dim.empty:
         return
-    allowed = {canonical_type(t) for t in known_types if str(t).strip()}
-    allowed.update(KNOWN_PORTFOLIO_TYPES)
+    allowed = _allowed_types()
 
     changes = []
     for index, row in dim.iterrows():
         derived = guess_type(row["portfolio_code"], known_types)
-        if derived not in allowed:
-            continue
         current = canonical_type(row["portfolio_type"]) if str(row["portfolio_type"] or "").strip() else ""
-        if current == derived:
+        if derived not in allowed:
+            # Правила ничего осмысленного не дали. Верную разметку не трогаем,
+            # а тип, которого в отчёте не бывает, снимаем: пусть портфель
+            # честно висит неразмеченным, чем уводит объём в несуществующий тип.
+            if not current or current in allowed:
+                continue
+            derived = None
+        if current == (derived or ""):
             continue
-        changes.append(f"{row['portfolio_code']}: {current or 'пусто'} -> {derived}")
+        changes.append(f"{row['portfolio_code']}: {current or 'пусто'} -> {derived or 'пусто'}")
         dim.at[index, "portfolio_type"] = derived
 
     if changes:
@@ -971,11 +1038,14 @@ def _apply_portfolio_overrides(dim: pd.DataFrame) -> None:
     overrides = parse_portfolio_overrides()
     if not overrides or dim.empty:
         return
+    from reports.portfolio_dynamics import type_map
     for index, row in dim.iterrows():
         code = str(row["portfolio_code"]).upper()
         wanted = overrides.get(code)
         if wanted is None or str(row["portfolio_type"] or "").upper() == wanted:
             continue
+        if type_map.explicit_type(code):
+            continue  # файл разметки главнее настройки
         logger.warning(
             "Портфель %s размечен как %s по настройке «Разметка отдельных портфелей» "
             "(было: %s).", row["portfolio_code"], wanted, row["portfolio_type"] or "пусто",
@@ -1020,9 +1090,12 @@ def _build_limits(dim: pd.DataFrame, previous: PreviousRelease, business_date: d
     # заведённого вручную, он указан человеком, и повторное угадывание завело бы
     # в fact_limit лишний тип (OFZ_EXTRA -> «OFZ») с нулевым объёмом.
     types = {canonical_type(t) for t in dim["portfolio_type"].dropna() if str(t).strip()}
+    allowed = _allowed_types()
     for code, portfolio_type in zip(dim["portfolio_code"], dim["portfolio_type"]):
         if not str(portfolio_type or "").strip():
-            types.add(guess_type(code, types))
+            guessed = guess_type(code, types)
+            if guessed in allowed:
+                types.add(guessed)
     types = sorted(types)
     return pd.DataFrame(
         [{
@@ -1268,8 +1341,10 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
     limit_types += list(parse_nested_limits())
     limit_types += list(parse_type_parents()) + list(parse_type_parents().values())
 
+    _drop_unknown_types(previous)
     imported_rows = _import_history(previous, history_path)
     dim, new_codes = _build_dim(t0, previous, bootstrap, extra_types=limit_types)
+    _record_unmapped(dim)
     limits = _resolve_limits(dim, previous, business_date, bootstrap, limits_path, parsed_limits)
     snapshot, notes_restored = _build_snapshot(t0, t7, business_date, previous)
     history, carried, added, replaced = _build_type_daily(snapshot, dim, limits, previous, business_date)

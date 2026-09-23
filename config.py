@@ -74,6 +74,7 @@ PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
 PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS: list
 PORTFOLIO_DYNAMICS_TYPE_RULES: str
 PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES: str
+PORTFOLIO_DYNAMICS_TYPES_FILE: Path
 PORTFOLIO_DYNAMICS_HISTORY_FILE: str
 PORTFOLIO_DYNAMICS_HISTORY_ALIASES: str
 PORTFOLIO_DYNAMICS_HISTORY_SCALE: float
@@ -186,6 +187,8 @@ def _apply_settings() -> None:
     # Разметка портфелей по типам: правила по подстроке в коде и точечные исключения.
     g["PORTFOLIO_DYNAMICS_TYPE_RULES"] = v["portfolio_dynamics_type_rules"]
     g["PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES"] = v["portfolio_dynamics_portfolio_types"]
+    # Справочник «портфель -> тип» отдельным JSON: главный источник разметки.
+    g["PORTFOLIO_DYNAMICS_TYPES_FILE"] = v["portfolio_dynamics_types_file"]
     # Разовый импорт накопленной истории из отчёта старого формата.
     g["PORTFOLIO_DYNAMICS_HISTORY_FILE"] = v["portfolio_dynamics_history_file"]
     g["PORTFOLIO_DYNAMICS_HISTORY_ALIASES"] = v["portfolio_dynamics_history_aliases"]

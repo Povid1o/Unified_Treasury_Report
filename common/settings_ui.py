@@ -10,6 +10,9 @@ Ctrl+C на любом шаге отменяет текущий шаг и воз
 как и везде в консоли; наружу KeyboardInterrupt пробрасывается только с самого
 верхнего экрана, где его ловит console.py.
 """
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import List, Optional
 
@@ -400,6 +403,69 @@ def _history_screen() -> bool:
     return True
 
 
+# ── Разметка портфелей по типам ──────────────────────────────────────────────
+def _open_in_editor(path: Path) -> bool:
+    """Открывает файл программой по умолчанию. False — не вышло (покажем путь)."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(str(path))  # noqa: S606 — свой файл, путь из настроек
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except (OSError, AttributeError):
+        return False
+    return True
+
+
+def _print_type_map(parsed) -> None:
+    table = Table(title="Разметка портфелей по типам", title_style="bold cyan",
+                  box=box.SIMPLE_HEAVY, header_style="bold cyan")
+    table.add_column("Тип", style="bold white", no_wrap=True)
+    table.add_column("Портфелей", justify="right")
+    table.add_column("Коды", style="grey70", overflow="fold")
+    for portfolio_type in parsed.types:
+        codes = sorted([c for c, t in parsed.exact.items() if t == portfolio_type]
+                       + [p for p, t in parsed.patterns if t == portfolio_type])
+        table.add_row(portfolio_type, str(len(codes)), ", ".join(codes) or "—")
+    ui.console.print(table)
+    if parsed.unmapped:
+        ui.console.print(f"[yellow]Не размечены ({len(parsed.unmapped)}):[/yellow] " + ", ".join(
+            f"{code} ({hint})" for code, hint in sorted(parsed.unmapped.items())))
+
+
+def _type_map_screen() -> None:
+    """Показывает справочник «портфель -> тип» и открывает его на правку.
+
+    Файл правится в обычном редакторе: это список кодов по типам, и набирать
+    его построчно через консоль было бы только медленнее. После правки файл
+    здесь же проверяется — ошибка в JSON видна сразу, а не при запуске отчёта.
+    """
+    from reports.portfolio_dynamics import etl, type_map
+    path = type_map.types_file()
+    if not path.is_file():
+        type_map.record_unmapped({}, path)
+        ui.success(f"Создан файл разметки: {path}")
+    ui.console.print(f"[grey70]Файл: {path}[/grey70]")
+    ui.console.print("[grey70]Ключ — тип (TSS, AFS, HTM, HTM_KUAP), значение — список кодов "
+                     "портфелей; можно маски вида «AFS_*». HTM_KUAP — подтип: в объём и "
+                     "лимит HTM входит сам. Портфели, которых в файле нет, отчёт при "
+                     "запуске допишет в «_не_размечены» с угаданным типом.[/grey70]")
+    try:
+        _print_type_map(type_map.load(path))
+    except etl.PortfolioDynamicsError as exc:
+        ui.error(str(exc))
+    if not _open_in_editor(path):
+        ui.console.print("[grey70]Откройте файл в любом текстовом редакторе.[/grey70]")
+    ui.ask("Поправьте файл, сохраните и нажмите Enter — он будет проверен")
+    try:
+        type_map.forget_cache()
+        _print_type_map(type_map.load(path))
+        ui.success("Файл разметки читается, разметка применится при следующем запуске отчёта.")
+    except etl.PortfolioDynamicsError as exc:
+        ui.error(str(exc))
+
+
 # ── Создание папок по датам ──────────────────────────────────────────────────
 def _source_configs(report: settings.ReportSource) -> List[file_discovery.SourceConfig]:
     """Источники отчёта как SourceConfig — их собирает config по ключам настроек.
@@ -534,7 +600,8 @@ def run_interactive() -> None:
             ui.console.print(_groups_table())
             ui.console.print(
                 "[grey70]п — проверить пути, д — создать папки по датам, "
-                "р — дополнительные портфели, и — история из старого отчёта, "
+                "р — дополнительные портфели, т — разметка портфелей по типам, "
+                "и — история из старого отчёта, "
                 "с — сбросить всё к значениям по умолчанию, 0 — выйти[/grey70]"
             )
             choice = ui.ask("Раздел (номер) или действие", default="0").strip().lower()
@@ -551,6 +618,12 @@ def run_interactive() -> None:
                 except KeyboardInterrupt:
                     ui.console.print()
                     ui.cancelled("Выбор файла истории отменён.")
+                continue
+            if choice in ("т", "t"):
+                try:
+                    _type_map_screen()
+                except KeyboardInterrupt:
+                    ui.console.print()
                 continue
             if choice in ("р", "r"):
                 try:
