@@ -364,19 +364,21 @@ def _history_screen() -> bool:
         ui.success("История из старого отчёта больше не подтягивается.")
         return True
 
+    from reports.portfolio_dynamics import history
     token = raw.strip()
     if token.isdigit() and 1 <= int(token) <= len(candidates):
         path = candidates[int(token) - 1][0]
     else:
-        path = Path(token.strip('"')).expanduser()
-    if not path.exists():
-        ui.error(f"Файл не найден: {path}")
-        return False
+        # Путь без «.xlsx» (Проводник скрывает расширения) достраивается, и в
+        # настройку пишется уже полный — иначе отчёт его потом не найдёт.
+        path = history.resolve_path(token)
+        if path is None:
+            ui.error(f"Файл не найден: {token.strip(chr(34))}")
+            return False
 
     # Разбираем сразу: пусть человек увидит, что именно прочиталось, а не
     # узнает о несовпадении формата через сутки при очередном запуске.
     try:
-        from reports.portfolio_dynamics import history
         frame = history.parse_history_file(path)
     except Exception as exc:
         ui.error(str(exc))

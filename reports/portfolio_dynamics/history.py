@@ -101,9 +101,10 @@ def _find_columns(matrix: pd.DataFrame) -> Optional[Tuple[int, int, int]]:
 def parse_history_file(path: Path, scale: Optional[float] = None,
                        aliases: Optional[Dict[str, str]] = None) -> pd.DataFrame:
     """Читает отчёт старого формата -> DataFrame[business_date, portfolio_type, volume_amount]."""
-    path = Path(path)
-    if not path.exists():
+    found = resolve_path(path)
+    if found is None:
         raise PortfolioDynamicsError(f"Файл с историей не найден: {path}")
+    path = found
 
     scale = config.PORTFOLIO_DYNAMICS_HISTORY_SCALE if scale is None else scale
     aliases = parse_aliases() if aliases is None else aliases
@@ -251,6 +252,40 @@ def history_sheets(path: Path) -> List[str]:
     prefix = excel_io.normalize_label(SHEET_PREFIX)
     return [name for name in names
             if excel_io.normalize_label(name).startswith(prefix) and len(name.strip()) > len(SHEET_PREFIX)]
+
+
+def resolve_path(raw, directories: Optional[List[Path]] = None) -> Optional[Path]:
+    """Путь из настройки или аргумента -> существующий файл. None — не нашёлся.
+
+    Проводник Windows по умолчанию скрывает расширения, и путь, набранный по
+    тому, что видно на экране, приходит без «.xlsx» («…\\Лимиты портфелей
+    казначейства (1)»). Поэтому, если файла ровно по такому пути нет, пробуем
+    дописать расширение. Если нет и так — ищем файл с тем же именем в
+    directories: книгу могли переложить из загрузок в папку отчёта.
+
+    Расширение ДОПИСЫВАЕТСЯ, а не заменяется: у имени «отчёт 22.09» with_suffix
+    отрезал бы «.09».
+    """
+    text = str(raw or "").strip().strip('"').strip("'")
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    names = [path.name]
+    if path.suffix.lower() not in _EXCEL_SUFFIXES:
+        names += [path.name + suffix for suffix in _EXCEL_SUFFIXES]
+
+    for name in names:
+        candidate = path.with_name(name)
+        if candidate.is_file():
+            return candidate
+    for directory in directories or []:
+        if directory is None or not Path(directory).is_dir():
+            continue
+        for name in names:
+            candidate = Path(directory) / name
+            if candidate.is_file():
+                return candidate
+    return None
 
 
 def find_candidates(directories: List[Path], limit: int = 10) -> List[Tuple[Path, List[str]]]:

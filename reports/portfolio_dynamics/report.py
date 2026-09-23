@@ -290,9 +290,13 @@ def _print_history_source() -> None:
         ui.console.print("  [yellow]![/yellow] предыдущего выпуска нет — история начнётся "
                          "с одной даты")
     if configured and str(configured).strip():
-        exists = Path(str(configured)).exists()
-        mark = "[bold green]✓[/bold green]" if exists else "[bold red]✗[/bold red]"
-        ui.console.print(f"  {mark} импорт из отчёта старого формата: {configured}")
+        found = history.resolve_path(configured, _history_search_dirs())
+        if found is None:
+            ui.console.print(f"  [bold red]✗[/bold red] импорт из отчёта старого формата: "
+                             f"{configured} — файл не найден, отчёт соберётся без него")
+        else:
+            ui.console.print(f"  [bold green]✓[/bold green] импорт из отчёта старого "
+                             f"формата: {found}")
     else:
         ui.console.print("  [grey50]импорт из отчёта старого формата не настроен "
                          "(«Файл с историей», либо аргумент --history)[/grey50]")
@@ -600,16 +604,29 @@ def _resolve_slice_paths(args: argparse.Namespace) -> tuple:
 
 
 def _resolve_history_path(args: argparse.Namespace) -> Optional[Path]:
-    """Файл старого формата для разового импорта истории: аргумент или настройка."""
-    raw = getattr(args, "history", None) or config.PORTFOLIO_DYNAMICS_HISTORY_FILE
+    """Файл старого формата для разового импорта истории: аргумент или настройка.
+
+    Путь, заданный аргументом (или введённый только что в диалоге), обязан
+    найтись — человек явно попросил этот файл. Путь из НАСТРОЙКИ — нет: импорт
+    истории разовый и необязательный, и устаревшая настройка не должна валить
+    весь отчёт, когда оба среза и предыдущий выпуск на месте.
+    """
+    explicit = getattr(args, "history", None)
+    raw = explicit or config.PORTFOLIO_DYNAMICS_HISTORY_FILE
     if not raw or not str(raw).strip():
         return None
-    path = Path(str(raw).strip().strip('"'))
-    if not path.exists():
-        raise etl.PortfolioDynamicsError(
-            f"Файл с историей не найден: {path}. Уберите путь из настройки «Файл с "
-            "историей (старый формат)» либо поправьте его."
+    path = history.resolve_path(raw, _history_search_dirs())
+    if path is None:
+        if explicit:
+            raise etl.PortfolioDynamicsError(f"Файл с историей не найден: {raw}.")
+        etl.logger.warning(
+            "Файл с историей не найден: %s — история из отчёта старого формата не "
+            "подтягивается, отчёт собирается без неё. Поправьте путь в «Настройки» → "
+            "«история из старого отчёта» или очистите его.", raw,
         )
+        return None
+    if str(path) != str(raw).strip().strip('"'):
+        etl.logger.info("Файл с историей: %s", path)
     return path
 
 

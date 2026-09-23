@@ -338,3 +338,83 @@ class FindCandidatesTests(HistoryTestCase):
         frame = history.parse_history_file(path)
 
         self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])
+
+
+class ResolvePathTests(HistoryTestCase):
+    """Путь из настройки часто набран так, как его показывает Проводник.
+
+    Проводник Windows скрывает расширения, и в настройку попадает
+    «…\\Лимиты портфелей казначейства (1)» без «.xlsx». Из-за этого отчёт
+    падал целиком, хотя файл лежал ровно там, куда указывал путь.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.downloads = self.tmp / "downloads"
+        self.downloads.mkdir(exist_ok=True)
+        self.file = write_history_file(
+            self.downloads / "Лимиты портфелей казначейства (1).xlsx", DEFAULT_SHEETS)
+
+    def test_path_without_extension_is_completed(self):
+        raw = str(self.downloads / "Лимиты портфелей казначейства (1)")
+
+        self.assertEqual(history.resolve_path(raw), self.file)
+
+    def test_extension_is_appended_not_replaced(self):
+        """with_suffix превратил бы «отчёт 22.09» в «отчёт 22.xlsx»."""
+        dotted = write_history_file(self.downloads / "отчёт 22.09.xlsx", DEFAULT_SHEETS)
+
+        self.assertEqual(history.resolve_path(str(self.downloads / "отчёт 22.09")), dotted)
+
+    def test_quoted_path_is_accepted(self):
+        self.assertEqual(history.resolve_path('"%s"' % self.file), self.file)
+
+    def test_moved_file_is_found_by_name_in_search_folders(self):
+        moved_to = self.tmp / "data"
+        moved_to.mkdir()
+        moved = moved_to / self.file.name
+        self.file.rename(moved)
+
+        self.assertEqual(history.resolve_path(str(self.file), [self.downloads, moved_to]), moved)
+
+    def test_missing_file_gives_none(self):
+        self.assertIsNone(history.resolve_path(str(self.downloads / "нет такого")))
+        self.assertIsNone(history.resolve_path(""))
+
+    def test_parse_accepts_path_without_extension(self):
+        frame = history.parse_history_file(self.downloads / "Лимиты портфелей казначейства (1)")
+
+        self.assertEqual(sorted(frame["portfolio_type"].unique()), ["AFS", "HTM", "TSS"])
+
+
+class ReportHistoryPathTests(HistoryTestCase):
+    """Устаревший путь в настройке не должен валить весь отчёт."""
+
+    def _args(self, history_arg=None):
+        import argparse
+        return argparse.Namespace(history=history_arg)
+
+    def _configure(self, value):
+        settings.set_value("portfolio_dynamics_history_file", value)
+        config.reload()
+
+    def test_broken_setting_is_skipped_with_warning(self):
+        from reports.portfolio_dynamics import report
+        self._configure(str(self.tmp / "downloads" / "нет такого файла"))
+
+        with self.assertLogs(etl.logger, level="WARNING"):
+            self.assertIsNone(report._resolve_history_path(self._args()))
+
+    def test_setting_without_extension_works(self):
+        from reports.portfolio_dynamics import report
+        (self.tmp / "downloads").mkdir(exist_ok=True)
+        real = write_history_file(self.tmp / "downloads" / "Лимиты (1).xlsx", DEFAULT_SHEETS)
+        self._configure(str(self.tmp / "downloads" / "Лимиты (1)"))
+
+        self.assertEqual(report._resolve_history_path(self._args()), real)
+
+    def test_explicit_argument_must_exist(self):
+        from reports.portfolio_dynamics import report
+
+        with self.assertRaises(etl.PortfolioDynamicsError):
+            report._resolve_history_path(self._args(str(self.tmp / "нет такого")))
