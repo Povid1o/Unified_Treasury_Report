@@ -89,8 +89,10 @@ def build_demo_data() -> PortfolioDynamicsData:
         if row[0] == business_date:
             row[2] = by_type[row[1]]
 
+    # У HTM_ALCO дюрация по КУАП не задана — целевая дюрация пустая.
     snapshot = pd.DataFrame([
-        [business_date, code, volume, round(volume * 0.98), 3.0, 2.5, f"Заметка {code}"]
+        [business_date, code, volume, round(volume * 0.98), 3.0,
+         None if code == "HTM_ALCO" else 2.5, f"Заметка {code}"]
         for code, volume in volumes.items()
     ], columns=SNAPSHOT_COLUMNS)
 
@@ -292,6 +294,14 @@ class EvaluationTests(WorkbookFormulaTestCase):
         self.assertAlmostEqual(self.value("view_monitor", "G6"), 30_000 / 29_400 - 1, places=6)
         self.assertAlmostEqual(self.value("view_monitor", "J6"), 0.5, places=6)  # гэп дюрации
         self.assertEqual(self.value("view_monitor", "K6"), 100_000)              # лимит типа
+
+    def test_empty_target_duration_stays_empty_not_zero(self):
+        """Без дюрации по КУАП цель и гэп пустые, а не 0 и «текущая дюрация»."""
+        rows = {self.value("view_monitor", f"A{r}"): r for r in range(6, 10)}
+        alco = rows["HTM_ALCO"]
+        self.assertEqual(self.value("view_monitor", f"H{alco}"), 3.0)
+        self.assertEqual(self.value("view_monitor", f"I{alco}"), "")
+        self.assertEqual(self.value("view_monitor", f"J{alco}"), "")
 
 
 if __name__ == "__main__":

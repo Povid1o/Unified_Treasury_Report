@@ -484,8 +484,11 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             "E": "=IFERROR(INDEX({v},{m}),\"\")".format(v=S_T7, m=LK.format(r=r)),
             "F": "=IF(OR($D{r}=\"\",$E{r}=\"\"),\"\",$D{r}-$E{r})".format(r=r),
             "G": "=IF(OR($E{r}=\"\",$E{r}=0),\"\",$D{r}/$E{r}-1)".format(r=r),
-            "H": "=IFERROR(INDEX({v},{m}),\"\")".format(v=S_DC, m=LK.format(r=r)),
-            "I": "=IFERROR(INDEX({v},{m}),\"\")".format(v=S_DT, m=LK.format(r=r)),
+            # INDEX по пустой ячейке Excel показывает как 0: без проверки на ""
+            # портфель без дюрации по КУАП получил бы цель 0 и гэп, равный
+            # текущей дюрации.
+            "H": "=IFERROR(IF(INDEX({v},{m})=\"\",\"\",INDEX({v},{m})),\"\")".format(v=S_DC, m=LK.format(r=r)),
+            "I": "=IFERROR(IF(INDEX({v},{m})=\"\",\"\",INDEX({v},{m})),\"\")".format(v=S_DT, m=LK.format(r=r)),
             "J": "=IF(OR($H{r}=\"\",$I{r}=\"\"),\"\",$H{r}-$I{r})".format(r=r),
             "K": "=IFERROR(INDEX({a},MATCH($C{r},{t},0)),\"\")".format(a=L_AMT, t=L_TYPE, r=r),
         }
