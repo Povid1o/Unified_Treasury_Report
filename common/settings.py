@@ -58,6 +58,7 @@ KIND_HINTS = {
     "float": "число > 0",
     "bool": "да / нет",
     "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
+    "durations": "пары «код портфеля=дюрация, лет» через запятую; пусто — ничего не задано",
     "portfolios": "список портфелей (код, название, тип, объём); правится своим экраном",
 }
 
@@ -335,6 +336,25 @@ SETTINGS: List[Setting] = [
              "изменить, удалить).",
     ),
     Setting(
+        key="portfolio_dynamics_read_duration_end", label="Читать конечную дюрацию из выгрузки",
+        kind="bool", group="portfolio_dynamics", default=False,
+        help="Колонка «Дюрация» (конечная) выгрузки позиций. Нет (по умолчанию) — "
+             "колонка не читается, и «Дюрация цель» в отчёте заполняется только "
+             "дюрацией по КУАП (см. «Дюрации по КУАП»), у остальных портфелей "
+             "остаётся пустой. Да — прежнее поведение: конечная дюрация из выгрузки "
+             "идёт в «Дюрацию цель», а дюрация по КУАП, если задана, её перебивает.",
+    ),
+    Setting(
+        key="portfolio_dynamics_kuap_durations", label="Дюрации по КУАП",
+        kind="durations", group="portfolio_dynamics", default="",
+        help="Через запятую, вида «код портфеля=дюрация в годах», например "
+             "«HTM_KUAP_CORE=3.5, AFS_TR_RUR=2». Дюрация, установленная КУАП, "
+             "записывается в колонку «Дюрация цель» (duration_target_yrs) "
+             "указанных портфелей в каждом выпуске и перебивает всё, что пришло "
+             "из выгрузки или «Дополнительных портфелей». Код, которого нет в "
+             "срезе, пропускается с предупреждением в логе. Пусто — не задано.",
+    ),
+    Setting(
         key="portfolio_dynamics_type_rules", label="Правила разметки по имени портфеля",
         kind="pairs", group="portfolio_dynamics",
         default="HTM=HTM, OFZ_PD=TSS, OFZ_PK=TSS, OFZ_CNY=TSS",
@@ -517,6 +537,12 @@ def parse_value(setting: Setting, raw: Any) -> Any:
                 )
         return text
 
+    if setting.kind == "durations":
+        text = str(text).strip()
+        if text:
+            parse_durations(text, setting.key)
+        return text
+
     if setting.kind == "bool":
         if isinstance(raw, bool):
             return raw
@@ -558,6 +584,41 @@ def parse_value(setting: Setting, raw: Any) -> Any:
         return value
 
     raise SettingsError(f"[{setting.key}] Неизвестный вид значения {setting.kind!r}.")
+
+
+def parse_durations(raw: Any, key: str = "durations") -> Dict[str, float]:
+    """«HTM_KUAP_CORE=3.5, AFS_TR_RUR=2» -> {код портфеля: дюрация, лет}.
+
+    Дробную часть можно писать и через запятую («3,5»): пары разделяются
+    запятой, за которой идёт следующий код с «=», поэтому «3,5» внутри
+    значения не рвёт пару.
+    """
+    result: Dict[str, float] = {}
+    text = str(raw or "").strip()
+    if not text:
+        return result
+    # Режем по запятым, стоящим перед «КОД=», — иначе «3,5» развалится на два куска.
+    for item in re.split(r",\s*(?=[^,=]+=)", text):
+        code, sep, value = item.partition("=")
+        code = code.strip().upper()
+        if not sep or not code or not value.strip():
+            raise SettingsError(
+                f"[{key}] Ожидаются пары «код портфеля=дюрация» через запятую, "
+                f"не разобрано: {item.strip()!r}. Пример: HTM_KUAP_CORE=3.5"
+            )
+        try:
+            duration = float(value.strip().replace(" ", "").replace(",", "."))
+        except ValueError as exc:
+            raise SettingsError(
+                f"[{key}] У портфеля {code} некорректная дюрация {value.strip()!r}: "
+                "ожидается число лет."
+            ) from exc
+        if duration < 0:
+            raise SettingsError(f"[{key}] Дюрация портфеля {code} не может быть отрицательной.")
+        if code in result:
+            raise SettingsError(f"[{key}] Портфель {code} указан дважды.")
+        result[code] = duration
+    return result
 
 
 def _parse_portfolios(setting: "Setting", raw: Any) -> List[dict]:

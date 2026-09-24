@@ -91,6 +91,15 @@ class InTheReportTests(ManualPortfolioTestCase):
 
         self.assertEqual(row["volume_t0"], 150)
         self.assertEqual(row["duration_current_yrs"], 4.2)
+        self.assertTrue(pd.isna(row["duration_target_yrs"]),
+                        "текущая дюрация не выдаётся за целевую (КУАП)")
+
+    def test_kuap_duration_reaches_a_manual_portfolio(self):
+        self.set_extra(EXTRA)
+        settings.set_value("portfolio_dynamics_kuap_durations", "OFZ_EXTRA=5")
+        config.reload()
+        row = self.build().fact_portfolio_snapshot.set_index("portfolio_code").loc["OFZ_EXTRA"]
+        self.assertEqual(row["duration_target_yrs"], 5.0)
 
     def test_manual_volume_counts_towards_its_type(self):
         """Иначе объём выпал бы из светофора своего типа."""

@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
-from common import excel_io  # noqa: E402
+from common import excel_io, settings  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("portfolio_dynamics")
@@ -72,6 +72,10 @@ COL_DURATION_END = "Дюрация"
 # duration_current_yrs, «Дюрация» (конечная) -> duration_target_yrs. Имена не
 # совпадают по смыслу с «нач.»/«кон.» — это осознанное решение при согласовании
 # схемы v3.0, колонки не переименовывать и маппинг соблюдать буквально.
+#
+# Конечная «Дюрация» временно не читается (настройка «Читать конечную дюрацию
+# из выгрузки», по умолчанию выключена): колонка duration_target_yrs теперь
+# заполняется дюрацией, установленной КУАП, — см. apply_kuap_durations.
 
 POSITION_MARKER = excel_io.normalize_label("Позиция:")
 TOTAL_MARKERS = tuple(excel_io.normalize_label(x) for x in ("Итого", "Всего", "Grand Total", "Total"))
@@ -389,8 +393,16 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
     scale = config.PORTFOLIO_DYNAMICS_VALUE_SCALE if value_scale is None else value_scale
     sheet_name, matrix, header_row, columns = _find_sheet_and_header(path)
 
+    if not config.PORTFOLIO_DYNAMICS_READ_DURATION_END:
+        # Колонка есть в выгрузке, но её значения намеренно не используются:
+        # убираем её из найденных, и дальше она ведёт себя как отсутствующая.
+        columns.pop(COL_DURATION_END, None)
+
     stats = SliceStats(sheet_name=sheet_name, header_row=header_row + 1, columns=dict(columns))
-    for missing in (COL_VALUE, COL_DURATION_START, COL_DURATION_END):
+    expected = [COL_VALUE, COL_DURATION_START]
+    if config.PORTFOLIO_DYNAMICS_READ_DURATION_END:
+        expected.append(COL_DURATION_END)
+    for missing in expected:
         if missing not in columns:
             logger.warning(
                 "[%s] %s: колонка «%s» не найдена на листе %r — соответствующие "
@@ -1214,6 +1226,7 @@ def _build_snapshot(t0: PortfolioSlice, t7: PortfolioSlice, business_date: dt.da
     volumes_t7 = t7.frame[["portfolio_code", "volume"]].rename(columns={"volume": "volume_t7"})
     snapshot = snapshot.merge(volumes_t7, on="portfolio_code", how="left")
     snapshot = _add_manual_portfolios(snapshot, previous)
+    snapshot = apply_kuap_durations(snapshot)
     snapshot.insert(0, "business_date", business_date)
 
     notes = previous.notes.copy()
@@ -1260,7 +1273,11 @@ def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) ->
             "volume_t0": record["volume"],
             "volume_t7": previous_t0.get(record["code"], record["volume"]),
             "duration_current_yrs": record["duration"],
-            "duration_target_yrs": record["duration"],
+            # Пока конечная дюрация не читается, «Дюрация цель» — только КУАП;
+            # копировать в неё текущую дюрацию значило бы выдать её за целевую.
+            "duration_target_yrs": (
+                record["duration"] if config.PORTFOLIO_DYNAMICS_READ_DURATION_END else None
+            ),
         })
 
     if not additions:
@@ -1268,6 +1285,49 @@ def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) ->
     logger.info("Дополнительных портфелей добавлено в срез: %d (%s)",
                 len(additions), ", ".join(a["portfolio_code"] for a in additions))
     return pd.concat([snapshot, pd.DataFrame(additions)], ignore_index=True)
+
+
+def parse_kuap_durations(raw: Optional[str] = None) -> Dict[str, float]:
+    """«HTM_KUAP_CORE=3.5» -> {код портфеля: дюрация по КУАП, лет}."""
+    raw = config.PORTFOLIO_DYNAMICS_KUAP_DURATIONS if raw is None else raw
+    try:
+        return settings.parse_durations(raw, "portfolio_dynamics_kuap_durations")
+    except settings.SettingsError as exc:
+        raise PortfolioDynamicsError(
+            f"{exc} Поправьте настройку «Дюрации по КУАП»."
+        ) from exc
+
+
+def apply_kuap_durations(snapshot: pd.DataFrame) -> pd.DataFrame:
+    """Записывает дюрацию, установленную КУАП, в duration_target_yrs.
+
+    Значение из настройки перебивает то, что пришло из выгрузки или из
+    «Дополнительных портфелей»: это явное решение КУАП. Портфели, которых
+    в настройке нет, не трогаются.
+    """
+    durations = parse_kuap_durations()
+    if not durations:
+        return snapshot
+
+    snapshot = snapshot.copy()
+    codes = snapshot["portfolio_code"].astype(str).str.upper()
+    applied = []
+    for code, duration in durations.items():
+        mask = codes == code
+        if mask.any():
+            snapshot.loc[mask, "duration_target_yrs"] = duration
+            applied.append(code)
+    unknown = [code for code in durations if code not in applied]
+
+    if applied:
+        logger.info("Дюрация по КУАП проставлена портфелям: %d (%s)",
+                    len(applied), ", ".join(applied))
+    if unknown:
+        logger.warning(
+            "В «Дюрациях по КУАП» заданы портфели, которых нет в срезе T0: %s — пропущены. "
+            "Проверьте коды в настройке.", ", ".join(unknown),
+        )
+    return snapshot
 
 
 def _build_type_daily(snapshot: pd.DataFrame, dim: pd.DataFrame, limits: pd.DataFrame,
