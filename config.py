@@ -72,6 +72,8 @@ PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
 PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
 PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
 PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS: list
+PORTFOLIO_DYNAMICS_READ_DURATION_END: bool
+PORTFOLIO_DYNAMICS_KUAP_DURATIONS: str
 PORTFOLIO_DYNAMICS_TYPE_RULES: str
 PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES: str
 PORTFOLIO_DYNAMICS_TYPES_FILE: Path
@@ -184,6 +186,10 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
     # Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
     g["PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS"] = v["portfolio_dynamics_manual_portfolios"]
+    # Конечная дюрация из выгрузки временно не читается: «Дюрация-КУАП» —
+    # это дюрация, установленная КУАП, из отдельной настройки.
+    g["PORTFOLIO_DYNAMICS_READ_DURATION_END"] = v["portfolio_dynamics_read_duration_end"]
+    g["PORTFOLIO_DYNAMICS_KUAP_DURATIONS"] = v["portfolio_dynamics_kuap_durations"]
     # Разметка портфелей по типам: правила по подстроке в коде и точечные исключения.
     g["PORTFOLIO_DYNAMICS_TYPE_RULES"] = v["portfolio_dynamics_type_rules"]
     g["PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES"] = v["portfolio_dynamics_portfolio_types"]

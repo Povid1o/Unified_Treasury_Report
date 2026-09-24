@@ -171,9 +171,23 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
 
         self.assertAlmostEqual(row["duration_current_yrs"], (3.0 * 30 + 1.0 * 10) / 40)
         self.assertNotAlmostEqual(row["duration_current_yrs"], (3.0 + 1.0) / 2)
+
+    def test_end_duration_is_weighted_when_reading_is_enabled(self):
+        settings.set_value("portfolio_dynamics_read_duration_end", True)
+        config.reload()
+        row = etl.parse_slice(self.t0_path, "T0").frame.set_index("portfolio_code").loc["AFS_TR_RUR"]
         self.assertAlmostEqual(row["duration_target_yrs"], (2.5 * 30 + 1.5 * 10) / 40)
 
+    def test_end_duration_is_not_read_by_default(self):
+        """Колонка «Дюрация» есть в выгрузке, но по умолчанию не читается."""
+        self.assertFalse(config.PORTFOLIO_DYNAMICS_READ_DURATION_END)
+        frame = etl.parse_slice(self.t0_path, "T0").frame
+        self.assertTrue(frame["duration_target_yrs"].isna().all())
+        self.assertTrue(frame["duration_current_yrs"].notna().all())
+
     def test_security_without_duration_keeps_its_volume_but_not_its_weight(self):
+        settings.set_value("portfolio_dynamics_read_duration_end", True)
+        config.reload()
         path = write_export(self.tmp / export_name("03.09.2026"), [
             ("Позиция: AFS_TR_RUR", None, None, None),
             ("Bond", 30 * MLN, 3.0, None),
@@ -184,6 +198,49 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
         self.assertAlmostEqual(row["volume"], 40.0)
         self.assertAlmostEqual(row["duration_current_yrs"], 3.0)
         self.assertIsNone(row["duration_target_yrs"])
+
+
+class KuapDurationTests(PortfolioDynamicsTestCase):
+    """«Дюрация-КУАП» — дюрация, установленная КУАП, из настройки."""
+
+    def set_kuap(self, raw):
+        settings.set_value("portfolio_dynamics_kuap_durations", raw)
+        config.reload()
+
+    def target(self, data):
+        frame = data.fact_portfolio_snapshot.set_index("portfolio_code")
+        return frame["duration_target_yrs"]
+
+    def test_kuap_duration_is_written_to_listed_portfolios_only(self):
+        self.set_kuap("afs_tr_rur=3,5")
+        target = self.target(self.build(bootstrap=True))
+        self.assertEqual(target["AFS_TR_RUR"], 3.5)
+        others = target.drop("AFS_TR_RUR")
+        self.assertTrue(others.isna().all(), "без КУАП и без чтения выгрузки цель пустая")
+
+    def test_kuap_duration_overrides_the_export(self):
+        settings.set_value("portfolio_dynamics_read_duration_end", True)
+        self.set_kuap("AFS_TR_RUR=7")
+        target = self.target(self.build(bootstrap=True))
+        self.assertEqual(target["AFS_TR_RUR"], 7.0)
+        self.assertTrue(target.drop("AFS_TR_RUR").notna().all(), "остальные — из выгрузки")
+
+    def test_unknown_code_is_reported_not_fatal(self):
+        self.set_kuap("NO_SUCH_PORTFOLIO=2")
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            self.build(bootstrap=True)
+        self.assertTrue(any("NO_SUCH_PORTFOLIO" in line for line in captured.output))
+
+    def test_setting_is_validated(self):
+        for bad in ("AFS_TR_RUR", "AFS_TR_RUR=много", "AFS_TR_RUR=-1", "A=1, A=2"):
+            with self.assertRaises(settings.SettingsError, msg=bad):
+                settings.set_value("portfolio_dynamics_kuap_durations", bad)
+
+    def test_several_portfolios_with_decimal_commas(self):
+        self.assertEqual(
+            settings.parse_durations("A=3,5, B=1.25,C=2"),
+            {"A": 3.5, "B": 1.25, "C": 2.0},
+        )
 
     def test_subtotal_in_marker_row_wins_and_mismatch_is_reported(self):
         path = write_export(self.tmp / export_name("04.09.2026"), [
