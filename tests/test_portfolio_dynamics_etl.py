@@ -201,7 +201,7 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
 
 
 class KuapDurationTests(PortfolioDynamicsTestCase):
-    """«Дюрация цель» — дюрация, установленная КУАП, из настройки."""
+    """«Дюрация-КУАП» — дюрация, установленная КУАП, из настройки."""
 
     def set_kuap(self, raw):
         settings.set_value("portfolio_dynamics_kuap_durations", raw)

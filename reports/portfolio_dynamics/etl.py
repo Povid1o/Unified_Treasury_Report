@@ -1273,7 +1273,7 @@ def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) ->
             "volume_t0": record["volume"],
             "volume_t7": previous_t0.get(record["code"], record["volume"]),
             "duration_current_yrs": record["duration"],
-            # Пока конечная дюрация не читается, «Дюрация цель» — только КУАП;
+            # Пока конечная дюрация не читается, «Дюрация-КУАП» — только КУАП;
             # копировать в неё текущую дюрацию значило бы выдать её за целевую.
             "duration_target_yrs": (
                 record["duration"] if config.PORTFOLIO_DYNAMICS_READ_DURATION_END else None
