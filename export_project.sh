@@ -2,7 +2,9 @@
 # ═══════════════════════════════════════════════════════════════════════════
 #  export_project.sh — экспорт проекта в zip с паролем для переноса по почте.
 #
-#  Пакует весь проект, КРОМЕ venv / .git / кэшей / output / logs / .claude,
+#  Пакует весь проект, КРОМЕ venv / .git / кэшей / output / logs / .claude
+#  и локальных файлов пользователя (settings.json, portfolio_types.json —
+#  иначе распаковка поверх рабочей копии затёрла бы её настройки и разметку),
 #  в защищённый паролем архив (пароль см. PASSWORD ниже).
 #
 #  Запуск:
@@ -44,6 +46,7 @@ zip -r -X -P "$PASSWORD" "$OUT_FILE" "$PROJECT_NAME" \
      "$PROJECT_NAME/.DS_Store" \
      "$PROJECT_NAME/.claude/*" \
      "$PROJECT_NAME/portfolio_types.json" \
+     "$PROJECT_NAME/settings.json" \
      "$PROJECT_NAME"/*.zip \
   >/dev/null
 

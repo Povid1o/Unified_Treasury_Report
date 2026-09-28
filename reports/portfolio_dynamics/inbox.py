@@ -12,9 +12,10 @@ data/<Отчёт>/<дата>/ — и между этими двумя точка
 содержимому книги ничего не открывается: перебирать и читать все .xlsx в
 чужой папке долго и бесцеремонно, а имя выгрузки и так однозначно.
 
-Пара срезов на дату D собирается так: T0 — файл с датой D, T-7 — самый
-свежий файл с датой строго раньше D. Ни переименовывать, ни раскладывать в
-правильном порядке ничего не нужно.
+Пара срезов на дату D собирается так: T0 — файл с датой D, T-7 — файл с
+датой D минус сдвиг сравнения (7 дней), а если такого нет — ближайший более
+ранний (см. etl.pick_t7). Ни переименовывать, ни раскладывать в правильном
+порядке ничего не нужно.
 
 Каждый срез кладётся ДВАЖДЫ: в папку отчётной даты (где он нужен как часть
 пары) и в папку своей собственной даты. Иначе файл за 11.09, попавший в
@@ -33,9 +34,10 @@ from typing import List, Optional, Tuple
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+import config  # noqa: E402
 from common.file_discovery import SourceConfig, find_date_folders  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    PROBE_SUFFIXES, PortfolioDynamicsError, logger, probe_business_date,
+    PROBE_SUFFIXES, PortfolioDynamicsError, logger, pick_t7, probe_business_date,
     read_business_date,
 )
 from reports.portfolio_dynamics.limits import probe_limits_date  # noqa: E402
@@ -367,7 +369,7 @@ def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
 
     slice_files = [f for f in _files_in_folder(source, folder) if not _is_limits(limits_source, f)]
     in_folder = _dated(slice_files, source)
-    if source.uses_date_folders and len(slice_files) >= 2:
+    if source.uses_date_folders and len(slice_files) >= 2 and _folder_is_complete(in_folder, target_date):
         # Папка-дата уже укомплектована срезами — за ними в загрузки не идём,
         # но файл лимитов всё равно может там лежать и быть нужен.
         plan.existing = slice_files
@@ -412,7 +414,7 @@ def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
         plan.problem = f"Срез на {target_date.isoformat()} не найден {where}."
         return plan
 
-    t7 = next((c for c in pool if c.business_date < target_date), None)
+    t7 = _pick_t7_candidate(pool, target_date)
     if t7 is None:
         plan.problem = (
             f"Для среза на {target_date.isoformat()} не нашлось более раннего среза (T-7) "
@@ -434,6 +436,26 @@ def plan_import(source: SourceConfig, downloads_dir: Optional[Path],
     plan.limits, limits_import = _plan_limits(limits_source, downloads_dir, folder, target_date)
     plan.to_import.extend(limits_import)
     return plan
+
+
+def _pick_t7_candidate(pool: List[Candidate], target_date: dt.date) -> Optional[Candidate]:
+    picked = pick_t7([(c.business_date, c) for c in pool], target_date)
+    return picked[1] if picked else None
+
+
+def _folder_is_complete(in_folder: List[Candidate], target_date: dt.date) -> bool:
+    """Папка-дата уже содержит правильную пару и искать дальше незачем?
+
+    Два файла в папке — ещё не пара: туда мог попасть срез посреди недели
+    (например, скопированный прошлым запуском), а недельный лежит в своей
+    папке или в загрузках. Тогда папку надо добрать, а не принимать как есть.
+    Если среза на отчётную дату в папке нет вовсе, решать тут нечего — папку
+    берём как есть, а расхождение дат ловит разбор папки.
+    """
+    if not any(c.business_date == target_date for c in in_folder):
+        return True
+    wanted = target_date - dt.timedelta(days=config.PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK)
+    return any(c.business_date == wanted for c in in_folder)
 
 
 def _is_limits(limits_source: Optional[SourceConfig], path: Path) -> bool:

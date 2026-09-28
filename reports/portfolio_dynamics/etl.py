@@ -323,6 +323,46 @@ def is_limits_file(path: Path) -> bool:
     return bool(pattern) and re.search(pattern, Path(path).name) is not None
 
 
+def pick_t7(dated: list, t0_date: dt.date, lookback: Optional[int] = None):
+    """Какой из более ранних срезов взять как T-7: (дата, объект) или None.
+
+    Нужен срез ровно на t0_date - lookback. Если такого нет (праздник, выгрузку
+    не сделали) — ближайший к нему более ранний: сравнение хотя бы за неделю.
+    И только если и таких нет — самый свежий из тех, что раньше T0, с
+    предупреждением. «Просто самый свежий» по умолчанию брать нельзя: срез,
+    выгруженный посреди недели, иначе перебивает недельный, и сдвиг сравнения
+    молча становится 4 дня вместо 7.
+
+    Порядок в dated сохраняется при равных датах — выигрывает тот, что раньше в
+    списке (так вызывающий код задаёт предпочтение «своей» папки).
+    """
+    if lookback is None:
+        lookback = config.PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK
+    wanted = t0_date - dt.timedelta(days=lookback)
+    earlier = sorted((item for item in dated if item[0] < t0_date),
+                     key=lambda item: item[0], reverse=True)
+    if not earlier:
+        return None
+    not_later = [item for item in earlier if item[0] <= wanted]
+    if not_later:
+        chosen = not_later[0]
+        if chosen[0] != wanted:
+            logger.warning(
+                "Среза на %s (T0 %s минус %d дн.) нет — как T-7 взят ближайший более "
+                "ранний, на %s.", wanted.isoformat(), t0_date.isoformat(), lookback,
+                chosen[0].isoformat(),
+            )
+        return chosen
+    chosen = earlier[0]
+    logger.warning(
+        "Среза на %s (T0 %s минус %d дн.) и раньше нет — как T-7 взят самый свежий "
+        "из имеющихся, на %s; сдвиг сравнения будет %d дн.",
+        wanted.isoformat(), t0_date.isoformat(), lookback, chosen[0].isoformat(),
+        (t0_date - chosen[0]).days,
+    )
+    return chosen
+
+
 def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, Path]:
     """Из файлов одной папки-даты выбирает, какой срез T0, а какой T-7.
 
@@ -354,15 +394,18 @@ def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, 
         )
 
     dated.sort(key=lambda item: item[0], reverse=True)
+    t0_date, t0_path = dated[0]
+    # Срез на ту же дату, что T0, — не кандидат в T-7, но и не повод молча
+    # взять что-то третье: такую пару ниже отвергает отдельная проверка.
+    t7_date, t7_path = pick_t7(dated[1:], t0_date) or dated[1]
     if len(dated) > 2:
-        ignored = ", ".join(f.name for _d, f in dated[2:])
+        ignored = ", ".join(f.name for _d, f in dated if f not in (t0_path, t7_path))
         logger.warning(
-            "В папке%s больше двух файлов — взяты два самых свежих среза (%s и %s), "
+            "В папке%s больше двух файлов — взяты срезы %s (T0) и %s (T-7), "
             "остальные проигнорированы: %s",
-            where, dated[0][1].name, dated[1][1].name, ignored,
+            where, t0_path.name, t7_path.name, ignored,
         )
 
-    (t0_date, t0_path), (t7_date, t7_path) = dated[0], dated[1]
     if t0_date == t7_date:
         raise PortfolioDynamicsError(
             f"Оба файла{where} — срезы на одну и ту же дату {t0_date.isoformat()} "

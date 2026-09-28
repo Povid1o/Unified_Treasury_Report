@@ -770,5 +770,68 @@ class ReportIntegrationTests(InboxTestCase):
         self.assertIn("[18.09.2026]", t0.name)
 
 
+class T7ByLookbackTests(InboxTestCase):
+    """T-7 — срез ровно на неделю раньше, а не просто самый свежий из ранних.
+
+    Иначе срез, выгруженный посреди недели (24.09 при отчёте на 28.09), молча
+    перебивает недельный (21.09), и сравнение идёт за 4 дня вместо 7.
+    """
+
+    def test_weekly_slice_wins_over_a_fresher_midweek_one(self):
+        self.in_folder("2026-09-21", "21.09.2026")
+        self.in_folder("2026-09-24", "24.09.2026")
+        self.download("28.09.2026")
+
+        plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 28))
+
+        taken = [src.name for src, _dst in plan.reuse]
+        self.assertEqual(taken, [export_name("21.09.2026")])
+
+    def test_folder_with_a_midweek_pair_is_topped_up(self):
+        """Прошлый запуск уже положил в папку 28.09 срез за 24.09 — папка с
+        двумя файлами не должна из-за этого считаться готовой."""
+        self.in_folder("2026-09-21", "21.09.2026")
+        self.in_folder("2026-09-28", "28.09.2026")
+        self.in_folder("2026-09-28", "24.09.2026")
+
+        t0, t7 = pd_report._resolve_slice_paths(self.args(date="2026-09-28"))
+
+        self.assertIn("28.09.2026", t0.name)
+        self.assertIn("21.09.2026", t7.name)
+
+    def test_without_the_exact_date_the_nearest_earlier_is_taken(self):
+        self.download("28.09.2026")
+        self.download("24.09.2026")
+        self.download("18.09.2026")
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 28))
+
+        taken = sorted(src.name for src, _dst in plan.to_import)
+        self.assertIn(export_name("18.09.2026"), taken)
+        self.assertNotIn(export_name("24.09.2026"), taken)
+        self.assertTrue(any("ближайший более ранний" in line for line in captured.output))
+
+    def test_only_a_midweek_slice_is_still_used_with_a_warning(self):
+        self.download("28.09.2026")
+        self.download("24.09.2026")
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            plan = inbox.plan_import(self.source, self.downloads, dt.date(2026, 9, 28))
+
+        self.assertTrue(plan.complete)
+        self.assertTrue(any("сдвиг сравнения будет 4" in line for line in captured.output))
+
+    def test_folder_split_picks_the_weekly_slice_among_three(self):
+        for period_end in ("21.09.2026", "24.09.2026", "28.09.2026"):
+            self.in_folder("2026-09-28", period_end)
+
+        t0, t7 = etl.split_slice_files(sorted((self.data / "2026-09-28").glob("*.xlsx")),
+                                       "2026-09-28")
+
+        self.assertIn("28.09.2026", t0.name)
+        self.assertIn("21.09.2026", t7.name)
+
+
 if __name__ == "__main__":
     unittest.main()
