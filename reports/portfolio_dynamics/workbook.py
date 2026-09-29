@@ -206,6 +206,49 @@ def _write_table(wb: Workbook, sheet_name: str, cols, rows, kind: str, table_nam
     return ws
 
 
+def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
+                        lim_rows: List[List[Any]]) -> List[List[Any]]:
+    """Строки view_monitor (колонки A..K) значениями — то, что покажут формулы.
+
+    Повторяет формулы витрины один в один, включая поведение Excel: INDEX по
+    пустой ячейке объёма или лимита даёт 0, а "" формулы — пустую ячейку.
+    Если формулы view_monitor меняются, эта функция меняется вместе с ними.
+    """
+    def _key(value: Any) -> Optional[str]:
+        # MATCH(...,0) не различает регистр и берёт первое совпадение.
+        return None if value is None else str(value).upper()
+
+    snap: Dict[str, List[Any]] = {}
+    for row in sn_rows:
+        snap.setdefault(_key(row[SNAPSHOT_COLUMNS.index("portfolio_code")]), row)
+    limit: Dict[str, Any] = {}
+    for row in lim_rows:
+        limit.setdefault(_key(row[LIMIT_COLUMNS.index("portfolio_type")]), row[LIMIT_COLUMNS.index("limit_amount")])
+
+    def _num(value: Any) -> Any:
+        return 0 if value is None else value
+
+    out = []
+    for row in dim_rows:
+        code, name, ptype = row[0], row[1], row[2]
+        s = snap.get(_key(code)) if code is not None else None
+        if s is None:
+            t0 = t7 = dur_cur = dur_target = None
+        else:
+            t0 = _num(s[SNAPSHOT_COLUMNS.index("volume_t0")])
+            t7 = _num(s[SNAPSHOT_COLUMNS.index("volume_t7")])
+            dur_cur = s[SNAPSHOT_COLUMNS.index("duration_current_yrs")]
+            dur_target = s[SNAPSHOT_COLUMNS.index("duration_target_yrs")]
+        delta = None if t0 is None or t7 is None else t0 - t7
+        delta_pct = None if t7 is None or t7 == 0 else t0 / t7 - 1
+        dur_gap = None if dur_cur is None or dur_target is None else dur_cur - dur_target
+        key = _key(ptype)
+        type_limit = _num(limit[key]) if ptype is not None and key in limit else None
+        out.append([code, name, ptype, t0, t7, delta, delta_pct,
+                    dur_cur, dur_target, dur_gap, type_limit])
+    return out
+
+
 def _dv(ws, rng: str, **kw) -> DataValidation:
     d = DataValidation(allow_blank=True, showErrorMessage=True, **kw)
     ws.add_data_validation(d)
@@ -230,6 +273,7 @@ README_LINES = [
     ("fact_type_daily — история объёмов по типам.", None),
     ("fact_portfolio_snapshot — срез по портфелям на отчётную дату.", None),
     ("view_monitor — витрина по портфелям: объём T0/T-7, дельты, дюрация, лимит типа.", None),
+    ("view_monitor_raw — то же, что view_monitor, но значениями без формул: для загрузок, которые не пересчитывают книгу. Строка 1 — названия колонок, со 2-й — данные. Не реагирует на правки B3/D3 в view_monitor.", None),
     ("view_by_type — свод по типам: динамика, утилизация, светофор, сверка с детальным срезом.", None),
     ("checks — автоматические проверки качества. Все строки должны быть OK перед отправкой в BI.", None),
     ("dict — словарь данных: типы, обязательность, правила, грейн. Машиночитаемый контракт.", None),
@@ -513,6 +557,33 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
 
     V_TYPE = "view_monitor!$C$%d:$C$%d" % (FIRST, LAST)
     V_T0 = "view_monitor!$D$%d:$D$%d" % (FIRST, LAST)
+
+    # ════════════════════════════════════════════════════════ view_monitor_raw
+    # Та же витрина, но значениями: ни формул, ни именованных диапазонов, ни
+    # условного форматирования и защиты — чтобы загрузка, которая не умеет
+    # пересчитывать книгу, читала готовые числа, а не пустые формулы. Шапки
+    # над таблицей нет: строка 1 — сразу названия колонок, со 2-й — данные.
+    ws = wb.create_sheet("view_monitor_raw")
+    for j, h in enumerate(VH, start=1):
+        c = ws.cell(row=1, column=j, value=h)
+        c.font = F_H
+        c.fill = FILL_VIEW
+        c.border = BORDER
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[1].height = 32
+    raw_formats = {4: FMT_AMT, 5: FMT_AMT, 6: FMT_AMT, 7: FMT_PCT,
+                   8: FMT_DUR, 9: FMT_DUR, 10: FMT_DUR, 11: FMT_AMT}
+    for i, values in enumerate(view_monitor_values(dim_rows, sn_rows, lim_rows)):
+        for j, v in enumerate(values, start=1):
+            cc = ws.cell(row=2 + i, column=j, value=v)
+            cc.font = F_BASE
+            cc.border = BORDER
+            if j in raw_formats:
+                cc.number_format = raw_formats[j]
+    for col, w in {"A": 18, "B": 36, "C": 12, "D": 14, "E": 14, "F": 13, "G": 10,
+                   "H": 13, "I": 13, "J": 12, "K": 14}.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "C2"
 
     # ════════════════════════════════════════════════════════ view_by_type
     ws = wb.create_sheet("view_by_type")

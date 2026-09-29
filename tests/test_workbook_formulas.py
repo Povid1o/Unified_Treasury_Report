@@ -226,6 +226,45 @@ class StructureTests(WorkbookFormulaTestCase):
             self.assertEqual(last_row, max(rows + 1, 2), f"{sheet_name}: ref={ref}")
 
 
+class RawMonitorTests(WorkbookFormulaTestCase):
+    """view_monitor_raw — витрина значениями для загрузок без пересчёта."""
+
+    def setUp(self):
+        wb = load_workbook(self.path)
+        self.raw = wb["view_monitor_raw"]
+        self.sheetnames = wb.sheetnames
+
+    def test_sheet_sits_next_to_view_monitor_and_nothing_else_moved(self):
+        i = self.sheetnames.index("view_monitor")
+        self.assertEqual(self.sheetnames[i + 1], "view_monitor_raw")
+        self.assertEqual([s for s in self.sheetnames if s != "view_monitor_raw"],
+                         ["README", "_lists", "dim_portfolio", "fact_limit", "fact_type_daily",
+                          "fact_portfolio_snapshot", "view_monitor", "view_by_type", "checks", "dict"])
+
+    def test_no_formulas_or_conditional_formatting(self):
+        formulas_left = [c.coordinate for row in self.raw.iter_rows() for c in row
+                         if isinstance(c.value, str) and c.value.startswith("=")]
+        self.assertEqual(formulas_left, [])
+        self.assertEqual(len(self.raw.conditional_formatting), 0)
+
+    def test_first_row_is_the_header_without_anything_above(self):
+        view = load_workbook(self.path)["view_monitor"]
+        header = [view.cell(row=5, column=j).value for j in range(1, 12)]
+        self.assertEqual([c.value for c in self.raw[1]], header)
+        self.assertEqual(self.raw.max_column, 11)
+        self.assertEqual(self.raw.max_row, 1 + len(self.data.dim_portfolio))
+
+    def test_values(self):
+        rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:11]] for r in range(2, 6)}
+        ofz = rows["AFS_OFZ"]
+        self.assertEqual(ofz[:6], ["AFS_OFZ", "ОФЗ, AFS", "AFS", 30_000, 29_400, 600])
+        self.assertAlmostEqual(ofz[6], 30_000 / 29_400 - 1, places=9)
+        self.assertEqual(ofz[7:], [3.0, 2.5, 0.5, 100_000])
+        # Без дюрации по КУАП — пустые ячейки, а не 0 и не "".
+        alco = rows["HTM_ALCO"]
+        self.assertEqual(alco[7:], [3.0, None, None, 300_000])
+
+
 @unittest.skipUnless(HAS_FORMULAS, "нужен пакет formulas: pip install formulas")
 class EvaluationTests(WorkbookFormulaTestCase):
     """Вычисление книги целиком — запускается, если в окружении есть formulas."""
@@ -302,6 +341,22 @@ class EvaluationTests(WorkbookFormulaTestCase):
         self.assertEqual(self.value("view_monitor", f"H{alco}"), 3.0)
         self.assertEqual(self.value("view_monitor", f"I{alco}"), "")
         self.assertEqual(self.value("view_monitor", f"J{alco}"), "")
+
+    def test_raw_sheet_equals_evaluated_view_monitor(self):
+        """view_monitor_values обязана повторять формулы витрины."""
+        raw = load_workbook(self.path)["view_monitor_raw"]
+        mismatches = []
+        for r in range(6, 10):
+            for col in "ABCDEFGHIJK":
+                expected = self.value("view_monitor", f"{col}{r}")
+                expected = None if expected == "" else expected
+                actual = raw[f"{col}{r - 4}"].value  # на raw нет шапки над таблицей
+                if isinstance(expected, float) or isinstance(actual, float):
+                    if expected is None or actual is None or abs(expected - actual) > 1e-9:
+                        mismatches.append(f"{col}{r}: {actual!r} != {expected!r}")
+                elif actual != expected:
+                    mismatches.append(f"{col}{r}: {actual!r} != {expected!r}")
+        self.assertEqual(mismatches, [])
 
 
 if __name__ == "__main__":
