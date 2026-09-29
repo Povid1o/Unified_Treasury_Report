@@ -514,7 +514,8 @@ python console.py portfolio-dynamics --t0-input a.xlsx --t7-input b.xlsx --boots
 python -m unittest tests.test_ovp_etl tests.test_portfolio_dynamics_etl \
     tests.test_settings tests.test_date_folders tests.test_inbox \
     tests.test_limits tests.test_history tests.test_manual_portfolios \
-    tests.test_workbook_formulas tests.test_python_compatibility
+    tests.test_workbook_formulas tests.test_python_compatibility \
+    tests.test_openpyxl_warnings
 ```
 
 `tests/test_python_compatibility.py` проверяет, что весь код компилируется на

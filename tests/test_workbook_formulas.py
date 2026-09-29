@@ -248,11 +248,18 @@ class RawMonitorTests(WorkbookFormulaTestCase):
         self.assertEqual(len(self.raw.conditional_formatting), 0)
 
     def test_first_row_is_the_header_without_anything_above(self):
-        view = load_workbook(self.path)["view_monitor"]
-        header = [view.cell(row=5, column=j).value for j in range(1, 12)]
-        self.assertEqual([c.value for c in self.raw[1]], header)
+        self.assertEqual([c.value for c in self.raw[1]], [
+            "Код", "Портфель", "Тип", "Объём T0", "Объём T-7", "Изменение объёма",
+            "Изменение объёма, %", "Дюрация тек.", "Дюрация-КУАП", "Изменение дюрации",
+            "Лимит типа"])
         self.assertEqual(self.raw.max_column, 11)
         self.assertEqual(self.raw.max_row, 1 + len(self.data.dim_portfolio))
+
+    def test_header_has_no_delta_symbol(self):
+        """Загрузчик в БД не понимает «Δ» — на «Δ, %» он падает целиком."""
+        for cell in self.raw[1]:
+            self.assertNotIn("Δ", cell.value)
+            self.assertNotIn("δ", cell.value)
 
     def test_values(self):
         rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:11]] for r in range(2, 6)}

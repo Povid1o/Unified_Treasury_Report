@@ -564,7 +564,11 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     # пересчитывать книгу, читала готовые числа, а не пустые формулы. Шапки
     # над таблицей нет: строка 1 — сразу названия колонок, со 2-й — данные.
     ws = wb.create_sheet("view_monitor_raw")
-    for j, h in enumerate(VH, start=1):
+    # Загрузчик в БД не понимает «Δ»: «Δ объёма» превращается в obem, а на
+    # «Δ, %» падает целиком. Поэтому здесь колонки названы словами.
+    raw_header = {"Δ объёма": "Изменение объёма", "Δ, %": "Изменение объёма, %",
+                  "Δ дюрации": "Изменение дюрации"}
+    for j, h in enumerate([raw_header.get(h, h) for h in VH], start=1):
         c = ws.cell(row=1, column=j, value=h)
         c.font = F_H
         c.fill = FILL_VIEW
