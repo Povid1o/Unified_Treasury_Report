@@ -251,8 +251,8 @@ class RawMonitorTests(WorkbookFormulaTestCase):
         self.assertEqual([c.value for c in self.raw[1]], [
             "Код", "Портфель", "Тип", "Объём T0", "Объём T-7", "Изменение объёма",
             "Изменение объёма, %", "Дюрация тек.", "Дюрация-КУАП", "Изменение дюрации",
-            "Лимит типа"])
-        self.assertEqual(self.raw.max_column, 11)
+            "Лимит типа", "Комментарий"])
+        self.assertEqual(self.raw.max_column, 12)
         self.assertEqual(self.raw.max_row, 1 + len(self.data.dim_portfolio))
 
     def test_header_has_no_delta_symbol(self):
@@ -261,15 +261,42 @@ class RawMonitorTests(WorkbookFormulaTestCase):
             self.assertNotIn("Δ", cell.value)
             self.assertNotIn("δ", cell.value)
 
+    def test_portfolios_are_ordered_htm_afs_tss(self):
+        """Сначала HTM, потом AFS, потом TSS; внутри типа — по sort_order."""
+        codes = [self.raw[f"A{r}"].value for r in range(2, 6)]
+        self.assertEqual(codes, ["HTM_LONG", "HTM_ALCO", "AFS_OFZ", "AFS_CORP"])
+        # Справочник в том же порядке: витрина ссылается на него по позиции.
+        dim = load_workbook(self.path)["dim_portfolio"]
+        self.assertEqual([dim[f"A{r}"].value for r in range(2, 6)], codes)
+
+    def test_order_for_views_handles_every_kind_of_type(self):
+        dim = pd.DataFrame([
+            ["X_OTHER", "", "XYZ", True, True, 1],
+            ["TSS_1", "", "TSS", True, True, 5],
+            ["NO_TYPE", "", None, True, True, 2],
+            ["AFS_2", "", "AFS", True, True, 20],
+            ["KUAP", "", "HTM_KUAP", True, True, 3],
+            ["AFS_1", "", "AFS", True, True, 10],
+            ["HTM_1", "", "HTM", True, True, 99],
+        ], columns=DIM_COLUMNS)
+        ordered = list(workbook.order_for_views(dim)["portfolio_code"])
+        self.assertEqual(ordered, ["HTM_1", "KUAP", "AFS_1", "AFS_2", "TSS_1", "X_OTHER", "NO_TYPE"])
+
     def test_values(self):
-        rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:11]] for r in range(2, 6)}
+        rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:12]] for r in range(2, 6)}
         ofz = rows["AFS_OFZ"]
-        self.assertEqual(ofz[:6], ["AFS_OFZ", "ОФЗ, AFS", "AFS", 30_000, 29_400, 600])
-        self.assertAlmostEqual(ofz[6], 30_000 / 29_400 - 1, places=9)
-        self.assertEqual(ofz[7:], [3.0, 2.5, 0.5, 100_000])
+        self.assertEqual(ofz[:3], ["AFS_OFZ", "ОФЗ, AFS", "AFS"])
+        for got, expected in zip(ofz[3:7], [30, 29.4, 0.6, 30_000 / 29_400 - 1]):  # млрд
+            self.assertAlmostEqual(got, expected, places=9)
+        # Без хвостов float: в базу уходит 0.6, а не 0.5999999999999979.
+        self.assertEqual(ofz[5], 0.6)
+        self.assertEqual(ofz[7:10], [3.0, 2.5, 0.5])
+        self.assertAlmostEqual(ofz[10], 100, places=9)
+        self.assertEqual(ofz[11], "Заметка AFS_OFZ")
         # Без дюрации по КУАП — пустые ячейки, а не 0 и не "".
         alco = rows["HTM_ALCO"]
-        self.assertEqual(alco[7:], [3.0, None, None, 300_000])
+        self.assertEqual(alco[7:10], [3.0, None, None])
+        self.assertAlmostEqual(alco[10], 300, places=9)
 
 
 @unittest.skipUnless(HAS_FORMULAS, "нужен пакет formulas: pip install formulas")
@@ -321,25 +348,32 @@ class EvaluationTests(WorkbookFormulaTestCase):
         rows = {self.value("view_by_type", f"A{r}"): r for r in (6, 7)}
         afs, htm = rows["AFS"], rows["HTM"]
 
-        self.assertEqual(self.value("view_by_type", f"D{afs}"), 55_000)   # объём типа
-        self.assertEqual(self.value("view_by_type", f"H{afs}"), 55_000)   # сумма по портфелям
-        self.assertEqual(self.value("view_by_type", f"I{afs}"), 0)        # расхождение грейнов
+        # В файле суммы в млрд RUB: 55 000 млн = 55 млрд.
+        self.assertAlmostEqual(self.value("view_by_type", f"D{afs}"), 55, places=9)   # объём типа
+        self.assertAlmostEqual(self.value("view_by_type", f"H{afs}"), 55, places=9)   # сумма по портфелям
+        self.assertAlmostEqual(self.value("view_by_type", f"I{afs}"), 0, places=9)    # расхождение грейнов
         self.assertEqual(self.value("view_by_type", f"L{afs}"), "ЗЕЛЁНАЯ")
-        self.assertEqual(self.value("view_by_type", f"M{afs}"), 45_000)   # свободный лимит
+        self.assertAlmostEqual(self.value("view_by_type", f"M{afs}"), 45, places=9)   # свободный лимит
 
         # HTM: 200 000 между жёлтой (270 000)? нет — ниже, значит зелёная зона.
-        self.assertEqual(self.value("view_by_type", f"D{htm}"), 200_000)
+        self.assertAlmostEqual(self.value("view_by_type", f"D{htm}"), 200, places=9)
         self.assertEqual(self.value("view_by_type", f"L{htm}"), "ЗЕЛЁНАЯ")
         self.assertAlmostEqual(self.value("view_by_type", f"K{htm}"), 200_000 / 300_000, places=6)
 
     def test_view_monitor_deltas(self):
-        self.assertEqual(self.value("view_monitor", "A6"), "AFS_OFZ")
-        self.assertEqual(self.value("view_monitor", "D6"), 30_000)
-        self.assertEqual(self.value("view_monitor", "E6"), 29_400)
-        self.assertEqual(self.value("view_monitor", "F6"), 600)
-        self.assertAlmostEqual(self.value("view_monitor", "G6"), 30_000 / 29_400 - 1, places=6)
-        self.assertAlmostEqual(self.value("view_monitor", "J6"), 0.5, places=6)  # гэп дюрации
-        self.assertEqual(self.value("view_monitor", "K6"), 100_000)              # лимит типа
+        # Сначала HTM, потом AFS: AFS_OFZ — третья строка витрины.
+        self.assertEqual(self.value("view_monitor", "A8"), "AFS_OFZ")
+        self.assertAlmostEqual(self.value("view_monitor", "D8"), 30, places=9)     # млрд
+        self.assertAlmostEqual(self.value("view_monitor", "E8"), 29.4, places=9)
+        self.assertAlmostEqual(self.value("view_monitor", "F8"), 0.6, places=9)
+        self.assertAlmostEqual(self.value("view_monitor", "G8"), 30_000 / 29_400 - 1, places=6)
+        self.assertAlmostEqual(self.value("view_monitor", "J8"), 0.5, places=6)  # гэп дюрации
+        self.assertAlmostEqual(self.value("view_monitor", "K8"), 100, places=9)  # лимит типа
+        self.assertEqual(self.value("view_monitor", "L8"), "Заметка AFS_OFZ")    # комментарий
+
+    def test_view_monitor_follows_type_order(self):
+        codes = [self.value("view_monitor", f"A{r}") for r in range(6, 10)]
+        self.assertEqual(codes, ["HTM_LONG", "HTM_ALCO", "AFS_OFZ", "AFS_CORP"])
 
     def test_empty_target_duration_stays_empty_not_zero(self):
         """Без дюрации по КУАП цель и гэп пустые, а не 0 и «текущая дюрация»."""
@@ -354,7 +388,7 @@ class EvaluationTests(WorkbookFormulaTestCase):
         raw = load_workbook(self.path)["view_monitor_raw"]
         mismatches = []
         for r in range(6, 10):
-            for col in "ABCDEFGHIJK":
+            for col in "ABCDEFGHIJKL":
                 expected = self.value("view_monitor", f"{col}{r}")
                 expected = None if expected == "" else expected
                 actual = raw[f"{col}{r - 4}"].value  # на raw нет шапки над таблицей

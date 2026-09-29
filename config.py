@@ -208,8 +208,8 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_LIMIT_SCALE"] = v["portfolio_dynamics_limit_scale"]
     g["PORTFOLIO_DYNAMICS_LIMIT_ALIASES"] = v["portfolio_dynamics_limit_aliases"]
 
-    # Схема v3.0 требует млн RUB, а выгрузка отдаёт объёмы в рублях: делим на это
-    # число. Если формат выгрузки изменится (тысячи, уже млн) — правится в
+    # Внутри ETL суммы в млн RUB, а выгрузка отдаёт объёмы в рублях: делим на это
+    # число (в файл отчёта суммы пишутся в млрд — см. etl.REPORT_UNIT). Если формат выгрузки изменится (тысячи, уже млн) — правится в
     # настройках, в парсере масштаб не хардкодится.
     g["PORTFOLIO_DYNAMICS_VALUE_SCALE"] = v["portfolio_dynamics_value_scale"]
     # Порог сверки подытога в строке "Позиция: ..." с суммой по бумагам и сверки

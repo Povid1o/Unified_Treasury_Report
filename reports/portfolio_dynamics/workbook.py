@@ -35,9 +35,10 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    DIM_COLUMNS, LIMIT_COLUMNS, SNAPSHOT_COLUMNS, TYPE_DAILY_COLUMNS,
+    AMOUNT_UNIT_NAME, DIM_COLUMNS, LIMIT_COLUMNS, MLN_IN_UNIT, REPORT_UNIT,
+    SNAPSHOT_COLUMNS, TYPE_DAILY_COLUMNS, VIEW_COMMENT_HEADER,
     PortfolioDynamicsData, PortfolioDynamicsError,
-    aggregated_parents, descendants_of, types_counted_in,
+    aggregated_parents, descendants_of, rescale_amounts, types_counted_in,
 )
 
 logger = get_logger("portfolio_dynamics")
@@ -65,13 +66,14 @@ FILL_TOTAL = PatternFill("solid", fgColor="EDEDED")
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-FMT_AMT = "#,##0;(#,##0);-"
+# Суммы в млрд RUB: два знака после запятой — точность отображения до 10 млн.
+FMT_AMT = "#,##0.00;(#,##0.00);-"
 FMT_PCT = "0.0%;(0.0%);-"
 FMT_PCT3 = "0.00%;(0.00%);-"
 FMT_DUR = "0.00"
 FMT_DATE = "YYYY-MM-DD"
 
-UNIT = "млн RUB"
+UNIT = REPORT_UNIT
 
 SCHEMA = {
     "dim_portfolio": [
@@ -104,7 +106,7 @@ SCHEMA = {
         ("volume_t7", "Объём T-7", "num", "нет", ">= 0", "Объём портфеля на дату среза минус lookback (по умолчанию 7 календарных дней), %s. Приходит из выгрузки, а не считается — истории по портфелям нет." % UNIT),
         ("duration_current_yrs", "Текущая дюрация", "num", "нет", ">= 0", "Фактическая дюрация портфеля на дату среза, лет."),
         ("duration_target_yrs", "Дюрация-КУАП", "num", "нет", ">= 0", "Дюрация портфеля, установленная КУАП (настройка «Дюрации по КУАП»), лет. Пусто — не установлена."),
-        ("note_text", "Цель / заметка", "text", "нет", "до 1000 символов, ЗАПОЛНЯЕТСЯ ВРУЧНУЮ", "Цель или комментарий по портфелю. ВНИМАНИЕ: единственная ручная колонка на машинном листе — загрузчик обязан вычитать её перед перезаписью и вернуть на место по portfolio_code."),
+        ("note_text", "Комментарий", "text", "нет", "до 1000 символов", "Комментарий по портфелю — копия колонки «Комментарий» листа view_monitor на момент формирования файла. Пишется и правится на view_monitor; следующий запуск отчёта переносит его оттуда в новый выпуск."),
     ],
 }
 
@@ -206,9 +208,50 @@ def _write_table(wb: Workbook, sheet_name: str, cols, rows, kind: str, table_nam
     return ws
 
 
+# Порядок типов на витринах view_monitor / view_monitor_raw. HTM_KUAP вложен в
+# HTM и стоит сразу за ним; типы вне списка идут следом по алфавиту, портфели
+# без типа — в конце.
+VIEW_TYPE_ORDER = ("HTM", "HTM_KUAP", "AFS", "TSS")
+
+
+def order_for_views(dim: pd.DataFrame) -> pd.DataFrame:
+    """Справочник в порядке витрин: по типу (VIEW_TYPE_ORDER), внутри типа —
+    по sort_order, затем по коду.
+
+    Сортируется сам справочник, а не только витрина: строка i view_monitor
+    ссылается формулой на строку i dim_portfolio, и по той же позиции
+    следующий запуск читает комментарии.
+    """
+    if dim is None or dim.empty:
+        return dim
+    types = dim["portfolio_type"].map(
+        lambda t: str(t).strip().upper() if pd.notna(t) and str(t).strip() else "")
+    rank = types.map(lambda t: VIEW_TYPE_ORDER.index(t) if t in VIEW_TYPE_ORDER
+                     else (len(VIEW_TYPE_ORDER) if t else len(VIEW_TYPE_ORDER) + 1))
+    keyed = dim.assign(_rank=rank, _type=types,
+                       _order=pd.to_numeric(dim["sort_order"], errors="coerce"),
+                       _code=dim["portfolio_code"].astype(str))
+    keyed = keyed.sort_values(["_rank", "_type", "_order", "_code"], na_position="last",
+                              kind="mergesort")
+    return keyed[list(dim.columns)].reset_index(drop=True)
+
+
+def _portfolio_notes(data: PortfolioDynamicsData) -> Dict[str, str]:
+    """{код: комментарий}: note_text среза, дополненный комментариями портфелей вне среза."""
+    notes = dict(data.portfolio_notes or {})
+    snap = data.fact_portfolio_snapshot
+    if snap is not None and not snap.empty:
+        for code, text in zip(snap["portfolio_code"], snap["note_text"]):
+            text = _cell_value(text)
+            if code is not None and text is not None:
+                notes[str(code)] = str(text)
+    return notes
+
+
 def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
-                        lim_rows: List[List[Any]]) -> List[List[Any]]:
-    """Строки view_monitor (колонки A..K) значениями — то, что покажут формулы.
+                        lim_rows: List[List[Any]],
+                        notes: Optional[Dict[str, str]] = None) -> List[List[Any]]:
+    """Строки view_monitor (колонки A..L) значениями — то, что покажут формулы.
 
     Повторяет формулы витрины один в один, включая поведение Excel: INDEX по
     пустой ячейке объёма или лимита даёт 0, а "" формулы — пустую ячейку.
@@ -245,7 +288,8 @@ def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
         key = _key(ptype)
         type_limit = _num(limit[key]) if ptype is not None and key in limit else None
         out.append([code, name, ptype, t0, t7, delta, delta_pct,
-                    dur_cur, dur_target, dur_gap, type_limit])
+                    dur_cur, dur_target, dur_gap, type_limit,
+                    (notes or {}).get(str(code)) if code is not None else None])
     return out
 
 
@@ -263,7 +307,7 @@ README_LINES = [
     ("Два грейна — это главное, что нужно понять про файл", "h"),
     ("Лимит ставится на ТИП портфеля: это ограничение на суммарный объём всех портфелей этого типа.", None),
     ("fact_type_daily — история объёмов по типам: дата, тип, объём. Именно с ней сравнивается лимит.", None),
-    ("fact_portfolio_snapshot — срез на отчётную дату по каждому ДЕТАЛЬНОМУ портфелю: объём сегодня, объём T-7, дюрации, заметка.", None),
+    ("fact_portfolio_snapshot — срез на отчётную дату по каждому ДЕТАЛЬНОМУ портфелю: объём сегодня, объём T-7, дюрации, комментарий.", None),
     ("Ежедневная история по детальным портфелям не хранится: её выгрузка требовала бы запроса на каждый день за весь период и неоправданна.", None),
     ("Поэтому объём T-7 по портфелю — НЕ вычисляемая величина, а колонка, которая приходит из выгрузки вместе со срезом.", None),
     ("", None),
@@ -279,11 +323,11 @@ README_LINES = [
     ("dict — словарь данных: типы, обязательность, правила, грейн. Машиночитаемый контракт.", None),
     ("_lists — служебные списки для выпадающих значений. Не редактировать без причины.", None),
     ("", None),
-    ("Заметки живут в срезе — и это требует внимания", "h"),
-    ("Колонка note_text на листе fact_portfolio_snapshot — единственная ручная колонка на машинном листе.", None),
-    ("Полная перезапись листа сотрёт заметки, если загрузчик их не сохранит.", None),
-    ("Правило для пайплайна: перед перезаписью прочитать note_text, сматчить по portfolio_code и вернуть значения на место.", None),
-    ("Пустые заметки считает CHK_15 — если их число внезапно выросло, скорее всего забыли этот шаг.", None),
+    ("Комментарии к портфелям", "h"),
+    ("Комментарий пишется в жёлтой колонке «Комментарий» на листе view_monitor — это единственные ячейки витрины, кроме B3/D3, которые можно править.", None),
+    ("Следующий запуск отчёта переносит комментарии из самого свежего выпуска в новый: писать их заново не нужно.", None),
+    ("note_text на fact_portfolio_snapshot и «Комментарий» на view_monitor_raw — копии на момент формирования файла. Правки на view_monitor попадут в них после повторного запуска отчёта (за ту же дату он безопасен).", None),
+    ("Пустые комментарии считает CHK_15 — если их число внезапно выросло, проверьте, что отчёт собран на правильном предыдущем выпуске.", None),
     ("", None),
     ("Сверка двух грейнов", "h"),
     ("Сумма объёмов портфелей по типу (из среза) и объём типа на ту же дату (из истории) приходят из разных выгрузок.", None),
@@ -292,7 +336,7 @@ README_LINES = [
     ("", None),
     ("Кто что пишет", "h"),
     ("Жёлтая шапка = ручной ввод. Код эти листы читает, но никогда не перезаписывает.", None),
-    ("Синяя шапка = машинный лист. Код перезаписывает его целиком; исключение — колонка note_text (жёлтая шапка на синем листе).", None),
+    ("Синяя шапка = машинный лист. Код перезаписывает его целиком.", None),
     ("Зелёная шапка = расчётная витрина на формулах. Не редактировать, только смотреть.", None),
     ("Цвет текста в ячейке: синий — введено руками, чёрный — формула, зелёный — ссылка на другой лист.", None),
     ("", None),
@@ -316,8 +360,8 @@ README_LINES = [
     ("7. Пустая ячейка означает «нет данных». Не ставить прочерки, «н/д», «-» и нули вместо пропуска.", None),
     ("", None),
     ("Порядок работы", "h"),
-    ("Шаг 1. Пайплайн дописывает свежие даты в fact_type_daily и перезаписывает fact_portfolio_snapshot, сохранив note_text.", None),
-    ("Шаг 2. Казначейство ставит отчётную дату в view_monitor!B3, смотрит светофор на view_by_type, правит заметки и fact_limit при изменении лимитов.", None),
+    ("Шаг 1. Пайплайн дописывает свежие даты в fact_type_daily и перезаписывает fact_portfolio_snapshot, перенеся комментарии из прошлого выпуска.", None),
+    ("Шаг 2. Казначейство ставит отчётную дату в view_monitor!B3, смотрит светофор на view_by_type, правит комментарии на view_monitor и fact_limit при изменении лимитов.", None),
     ("Шаг 3. Лист checks должен быть весь OK. Любой FAIL блокирует загрузку в BI.", None),
     ("Шаг 4. Загрузчик читает dim_portfolio, fact_limit, fact_type_daily, fact_portfolio_snapshot. Витрины и checks в BI не грузятся.", None),
 ]
@@ -330,7 +374,7 @@ def _write_readme(wb: Workbook, data: PortfolioDynamicsData, generated_at: dt.da
     lines = list(README_LINES) + [
         ("", None),
         ("Файл сформирован отчётом «Динамика портфелей» (console.py portfolio-dynamics) %s. "
-         "Срез на %s, история по типам — %d строк. Лимиты и заметки перенесены из предыдущего "
+         "Срез на %s, история по типам — %d строк. Лимиты и комментарии перенесены из предыдущего "
          "выпуска: скрипт их не создаёт и не перезаписывает."
          % (generated_at.strftime("%Y-%m-%d %H:%M"), data.business_date.isoformat(),
             len(data.fact_type_daily)), "warn"),
@@ -369,10 +413,15 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     business_date = data.business_date
     lookback = data.lookback_days
 
-    dim_rows = _frame_rows(data.dim_portfolio, DIM_COLUMNS)
-    lim_rows = _frame_rows(data.fact_limit, LIMIT_COLUMNS)
-    td_rows = _frame_rows(data.fact_type_daily, TYPE_DAILY_COLUMNS)
-    sn_rows = _frame_rows(data.fact_portfolio_snapshot, SNAPSHOT_COLUMNS)
+    # ETL считает в млн RUB, в файл суммы уходят в REPORT_UNIT.
+    to_unit = 1.0 / MLN_IN_UNIT[REPORT_UNIT]
+    dim_rows = _frame_rows(order_for_views(data.dim_portfolio), DIM_COLUMNS)
+    lim_rows = _frame_rows(rescale_amounts(data.fact_limit, "fact_limit", to_unit), LIMIT_COLUMNS)
+    td_rows = _frame_rows(rescale_amounts(data.fact_type_daily, "fact_type_daily", to_unit),
+                          TYPE_DAILY_COLUMNS)
+    sn_rows = _frame_rows(rescale_amounts(data.fact_portfolio_snapshot, "fact_portfolio_snapshot",
+                                          to_unit), SNAPSHOT_COLUMNS)
+    notes = _portfolio_notes(data)
 
     wb = Workbook()
     _write_readme(wb, data, generated_at)
@@ -402,10 +451,9 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         "tbl_fact_portfolio_snapshot",
         widths={"business_date": 14, "portfolio_code": 18, "volume_t0": 16,
                 "volume_t7": 16, "duration_current_yrs": 19,
-                "duration_target_yrs": 19, "note_text": 85},
+                "duration_target_yrs": 19, "note_text": 60},
         formats={"volume_t0": FMT_AMT, "volume_t7": FMT_AMT,
-                 "duration_current_yrs": FMT_DUR, "duration_target_yrs": FMT_DUR},
-        manual_cols=("note_text",))
+                 "duration_current_yrs": FMT_DUR, "duration_target_yrs": FMT_DUR})
     for row in ws_sn.iter_rows(min_row=2, min_col=7, max_col=7):
         for c in row:
             c.alignment = Alignment(wrap_text=True, vertical="top")
@@ -419,6 +467,8 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     wb.defined_names.add(DefinedName("BOOL_VALUES", attr_text="_lists!$A$2:$A$3"))
     wb.defined_names.add(DefinedName("BUSINESS_DATE", attr_text="view_monitor!$B$3"))
     wb.defined_names.add(DefinedName("LOOKBACK_DAYS", attr_text="view_monitor!$D$3"))
+    # Метка единиц: по ней следующий запуск понимает, в чём записаны суммы.
+    wb.defined_names.add(DefinedName(AMOUNT_UNIT_NAME, attr_text='"%s"' % REPORT_UNIT))
 
     # ── валидация ────────────────────────────────────────────────────────────
     _dv(ws_dim, "C2:C%d" % SNAPROW, type="list", formula1="=PORTFOLIO_TYPES",
@@ -501,7 +551,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
                         "убедитесь, что выгрузка использует тот же сдвиг.", "schema v3.0")
 
     VH = ["Код", "Портфель", "Тип", "Объём T0", "Объём T-7", "Δ объёма", "Δ, %",
-          "Дюрация тек.", "Дюрация-КУАП", "Δ дюрации", "Лимит типа"]
+          "Дюрация тек.", "Дюрация-КУАП", "Δ дюрации", "Лимит типа", VIEW_COMMENT_HEADER]
     HR = 5
     for j, h in enumerate(VH, start=1):
         c = ws.cell(row=HR, column=j, value=h)
@@ -513,6 +563,9 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     ws.cell(row=HR, column=11).comment = Comment(
         "Лимит типа, к которому относится портфель. Лимит установлен на суммарный объём типа, "
         "поэтому по отдельному портфелю утилизация не считается — смотрите view_by_type.", "schema v3.0")
+    ws.cell(row=HR, column=12).comment = Comment(
+        "Пишите комментарий прямо здесь. Следующий запуск отчёта перенесёт его в новый "
+        "выпуск, заново вводить не нужно.", "schema v3.0")
 
     n = n_portfolios
     FIRST, LAST = HR + 1, HR + n
@@ -544,9 +597,18 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         for col, fmt in (("D", FMT_AMT), ("E", FMT_AMT), ("F", FMT_AMT), ("G", FMT_PCT),
                          ("H", FMT_DUR), ("I", FMT_DUR), ("J", FMT_DUR), ("K", FMT_AMT)):
             ws["%s%d" % (col, r)].number_format = fmt
+        # Комментарий — не формула, а ручной ввод: значение из прошлого выпуска,
+        # ячейка открыта для правки на защищённом листе.
+        cc = ws["L%d" % r]
+        cc.value = notes.get(str(dim_rows[i][0])) if i < len(dim_rows) else None
+        cc.font = F_INPUT
+        cc.fill = FILL_INPUTCELL
+        cc.border = BORDER
+        cc.alignment = Alignment(wrap_text=True, vertical="top")
+        cc.protection = Protection(locked=False)
 
     for col, w in {"A": 18, "B": 36, "C": 12, "D": 14, "E": 14, "F": 13, "G": 10,
-                   "H": 13, "I": 13, "J": 12, "K": 14}.items():
+                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 60}.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "C%d" % FIRST
     delta_rng = "G%d:G%d" % (FIRST, LAST)
@@ -577,15 +639,23 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     ws.row_dimensions[1].height = 32
     raw_formats = {4: FMT_AMT, 5: FMT_AMT, 6: FMT_AMT, 7: FMT_PCT,
                    8: FMT_DUR, 9: FMT_DUR, 10: FMT_DUR, 11: FMT_AMT}
-    for i, values in enumerate(view_monitor_values(dim_rows, sn_rows, lim_rows)):
+    # Разность сумм в млрд даёт хвосты вида 0.5999999999999979. В Excel их прячет
+    # формат, а в базу они уехали бы как есть. 9 знаков в млрд — точность до
+    # рубля, 12 знаков у доли — заведомо точнее любого отображения.
+    raw_round = {4: 9, 5: 9, 6: 9, 7: 12, 11: 9}
+    for i, values in enumerate(view_monitor_values(dim_rows, sn_rows, lim_rows, notes)):
         for j, v in enumerate(values, start=1):
+            if j in raw_round and isinstance(v, float):
+                v = round(v, raw_round[j])
             cc = ws.cell(row=2 + i, column=j, value=v)
             cc.font = F_BASE
             cc.border = BORDER
             if j in raw_formats:
                 cc.number_format = raw_formats[j]
+            if j == 12:
+                cc.alignment = Alignment(wrap_text=True, vertical="top")
     for col, w in {"A": 18, "B": 36, "C": 12, "D": 14, "E": 14, "F": 13, "G": 10,
-                   "H": 13, "I": 13, "J": 12, "K": 14}.items():
+                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 60}.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "C2"
 
@@ -769,7 +839,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         ("CHK_14", "Пустая текущая дюрация в срезе",
          "=COUNTA({c})-COUNTIFS({v},\">0\")".format(c=S_CODE, v=S_DC), "ровно 0",
          "=IF($C{r}=0,\"OK\",\"FAIL\")"),
-        ("CHK_15", "Портфели без заметки (загрузчик мог затереть note_text)",
+        ("CHK_15", "Портфели без комментария",
          "=COUNTA({c})-COUNTA({n})".format(c=S_CODE, n=S_NOTE), "справочно, следить за ростом",
          "=\"OK\""),
         ("CHK_16", "Расхождение свода портфелей и объёма типа выше порога",
@@ -838,7 +908,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     for tname, cols in SCHEMA.items():
         owner = "пайплайн" if TABLE_KIND[tname] == "machine" else "казначейство"
         for name, ru, typ, req, rule, desc in cols:
-            own = "казначейство (ручная)" if name == "note_text" else owner
+            own = "казначейство (на view_monitor)" if name == "note_text" else owner
             for j, v in enumerate([tname, name, ru, typ, req, rule, desc, GRAIN[tname], own], start=1):
                 c = ws.cell(row=r, column=j, value=v)
                 c.font = F_BASE

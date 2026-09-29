@@ -24,6 +24,8 @@ from reports.portfolio_dynamics import etl, workbook  # noqa: E402
 
 # Объёмы во входных файлах пишем в рублях, как в реальной выгрузке.
 MLN = config.PORTFOLIO_DYNAMICS_VALUE_SCALE
+# Сколько млн в единице сумм выходного файла: ETL считает в млн, файл — в млрд.
+FILE_UNIT = etl.MLN_IN_UNIT[etl.REPORT_UNIT]
 
 # Колонки выгрузки: нужные четыре вперемешку с лишними, как в реальном файле.
 EXPORT_HEADER = [
@@ -342,11 +344,47 @@ class OlderReleaseTests(PortfolioDynamicsTestCase):
             etl.load_previous_release(previous)
 
 
+class AmountUnitTests(PortfolioDynamicsTestCase):
+    def test_amounts_are_written_in_billions_and_marked(self):
+        path = self.bootstrap_release()
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        self.assertEqual(wb.defined_names["AMOUNT_UNIT"].attr_text, '"млрд RUB"')
+        snapshot = pd.read_excel(path, sheet_name="fact_portfolio_snapshot").set_index("portfolio_code")
+        # AFS_TR_RUR: 30 + 10 млн = 0.04 млрд.
+        self.assertAlmostEqual(snapshot.loc["AFS_TR_RUR", "volume_t0"], 0.04, places=12)
+        limits = pd.read_excel(path, sheet_name="fact_limit")
+        self.assertTrue((limits["limit_amount"] == 1.0).all())  # 1000 млн
+
+    def test_release_in_billions_reads_back_in_millions(self):
+        loaded = etl.load_previous_release(self.bootstrap_release())
+        self.assertTrue((loaded.fact_limit["limit_amount"] == 1000).all())
+        self.assertAlmostEqual(loaded.snapshot_volumes["AFS_TR_RUR"], 40, places=9)
+
+    def test_legacy_release_in_millions_is_not_scaled(self):
+        """Выпуск до перехода на млрд: метки нет, суммы в млн — их не трогаем,
+        иначе перенесённая история разошлась бы со свежими данными в 1000 раз."""
+        path = self.bootstrap_release()
+        _make_legacy_millions(path)
+
+        loaded = etl.load_previous_release(path)
+        self.assertTrue((loaded.fact_limit["limit_amount"] == 1000).all())
+        self.assertAlmostEqual(loaded.snapshot_volumes["AFS_TR_RUR"], 40, places=9)
+
+        # Прошлая дата, записанная старой версией в млн, переносится как есть.
+        _append_history(path, [(dt.date(2026, 1, 5), "AFS", 11.0)])
+        data = self.build(previous=path)
+        history = data.fact_type_daily
+        carried = history[history["business_date"] == dt.date(2026, 1, 5)]
+        self.assertEqual(list(carried["volume_amount"]), [11.0])
+
+
 class IncrementalTests(PortfolioDynamicsTestCase):
     def test_notes_survive_a_rerun(self):
-        """Заметки — единственная ручная колонка на машинном листе, merge обязателен."""
+        """Комментарий, написанный на view_monitor, переезжает в следующий выпуск."""
         previous = self.bootstrap_release()
-        _write_notes(previous, {"AFS_TR_RUR": "Держим объём до КУАП", "HTM_ALCO": "Не наращиваем"})
+        _write_view_comments(previous, {"AFS_TR_RUR": "Держим объём до КУАП",
+                                        "HTM_ALCO": "Не наращиваем"})
 
         data = self.build(previous=previous)
         notes = dict(zip(data.fact_portfolio_snapshot["portfolio_code"],
@@ -355,6 +393,46 @@ class IncrementalTests(PortfolioDynamicsTestCase):
         self.assertEqual(notes["AFS_TR_RUR"], "Держим объём до КУАП")
         self.assertEqual(notes["HTM_ALCO"], "Не наращиваем")
         self.assertEqual(data.notes_restored, 2)
+
+    def test_notes_are_inherited_release_after_release(self):
+        """Написали один раз — комментарий живёт во всех следующих выпусках и
+        стоит на витрине view_monitor и на view_monitor_raw."""
+        previous = self.bootstrap_release()
+        _write_view_comments(previous, {"HTM_ALCO": "Не наращиваем"})
+        second = self.save(self.build(previous=previous), "dinamika_portfeley_2.xlsx")
+        third = self.save(self.build(previous=second), "dinamika_portfeley_3.xlsx")
+
+        self.assertEqual(_read_view_comments(third, "view_monitor"),
+                         {"AFS_TR_RUR": None, "HTM_ALCO": "Не наращиваем"})
+        self.assertEqual(_read_view_comments(third, "view_monitor_raw"),
+                         {"AFS_TR_RUR": None, "HTM_ALCO": "Не наращиваем"})
+
+    def test_edited_and_deleted_comments_follow_the_view(self):
+        """Правка и удаление на view_monitor побеждают старое значение в note_text."""
+        previous = self.bootstrap_release()
+        _write_view_comments(previous, {"AFS_TR_RUR": "Старый", "HTM_ALCO": "Удалить"})
+        second = self.save(self.build(previous=previous), "dinamika_portfeley_2.xlsx")
+        _write_view_comments(second, {"AFS_TR_RUR": "Новый", "HTM_ALCO": None})
+
+        data = self.build(previous=second)
+        notes = dict(zip(data.fact_portfolio_snapshot["portfolio_code"],
+                         data.fact_portfolio_snapshot["note_text"]))
+
+        self.assertEqual(notes["AFS_TR_RUR"], "Новый")
+        self.assertTrue(pd.isna(notes["HTM_ALCO"]))
+        self.assertNotIn("HTM_ALCO", data.portfolio_notes)
+
+    def test_release_without_comment_column_keeps_note_text(self):
+        """Выпуск, сделанный до колонки «Комментарий»: заметки берутся из note_text."""
+        previous = self.bootstrap_release()
+        _write_notes(previous, {"HTM_ALCO": "Из старого выпуска"})
+        _drop_view_comment_column(previous)
+
+        data = self.build(previous=previous)
+        notes = dict(zip(data.fact_portfolio_snapshot["portfolio_code"],
+                         data.fact_portfolio_snapshot["note_text"]))
+
+        self.assertEqual(notes["HTM_ALCO"], "Из старого выпуска")
 
     def test_second_run_for_the_same_date_replaces_history_rows(self):
         """Идемпотентность: повторный прогон за ту же дату T0 не задваивает строки."""
@@ -377,6 +455,7 @@ class IncrementalTests(PortfolioDynamicsTestCase):
         ])
         before = pd.read_excel(previous, sheet_name="fact_type_daily")
         before = before[before["business_date"] == pd.Timestamp(2026, 1, 5)]
+        before = etl.rescale_amounts(before, "fact_type_daily", FILE_UNIT)
 
         data = self.build(previous=previous)
         after = data.fact_type_daily
@@ -447,7 +526,8 @@ class IncrementalTests(PortfolioDynamicsTestCase):
 
     def test_limits_are_carried_over_untouched(self):
         previous = self.bootstrap_release()
-        before = pd.read_excel(previous, sheet_name="fact_limit")
+        before = etl.rescale_amounts(pd.read_excel(previous, sheet_name="fact_limit"),
+                                     "fact_limit", FILE_UNIT)
 
         data = self.build(previous=previous)
         pd.testing.assert_frame_equal(
@@ -486,14 +566,74 @@ class WorkbookTests(PortfolioDynamicsTestCase):
         self.assertLessEqual(failed, {"CHK_05"})
 
 
+def _view_rows(ws, dim_codes):
+    """{код: номер строки} витрины: строка i витрины — строка i справочника."""
+    header = next(r for r in range(1, ws.max_row + 1) if ws.cell(row=r, column=1).value == "Код")
+    return {code: header + 1 + i for i, code in enumerate(dim_codes)}
+
+
+def _dim_codes(wb):
+    ws = wb["dim_portfolio"]
+    return [ws.cell(row=r, column=1).value for r in range(2, ws.max_row + 1)]
+
+
+def _write_view_comments(path: Path, notes: dict) -> None:
+    """Имитирует ввод комментариев казначейством на view_monitor."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    ws = wb["view_monitor"]
+    rows = _view_rows(ws, _dim_codes(wb))
+    for code, text in notes.items():
+        # .value = ..., а не cell(value=...): value=None там не очищает ячейку.
+        ws.cell(row=rows[code], column=12).value = text
+    wb.save(path)
+
+
+def _read_view_comments(path: Path, sheet: str) -> dict:
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    ws = wb[sheet]
+    if sheet == "view_monitor":
+        rows = _view_rows(ws, _dim_codes(wb))
+    else:  # на raw код лежит значением
+        rows = {ws.cell(row=r, column=1).value: r for r in range(2, ws.max_row + 1)}
+    return {code: ws.cell(row=r, column=12).value for code, r in rows.items()}
+
+
+def _drop_view_comment_column(path: Path) -> None:
+    """Превращает выпуск в «старый»: без колонки «Комментарий» на view_monitor."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    ws = wb["view_monitor"]
+    ws.delete_cols(12)
+    wb.save(path)
+
+
 def _write_notes(path: Path, notes: dict) -> None:
-    """Имитирует ручное заполнение note_text казначейством прямо в файле."""
+    """Имитирует ручное заполнение note_text прямо в файле (как в старых выпусках)."""
     from openpyxl import load_workbook
     wb = load_workbook(path)
     ws = wb["fact_portfolio_snapshot"]
     codes = {ws.cell(row=r, column=2).value: r for r in range(2, ws.max_row + 1)}
     for code, text in notes.items():
         ws.cell(row=codes[code], column=7, value=text)
+    wb.save(path)
+
+
+def _make_legacy_millions(path: Path) -> None:
+    """Переписывает выпуск так, как его сделала бы версия до перехода на млрд."""
+    from openpyxl import load_workbook
+    wb = load_workbook(path)
+    del wb.defined_names["AMOUNT_UNIT"]
+    for sheet, columns in etl.AMOUNT_COLUMNS.items():
+        ws = wb[sheet]
+        header = [c.value for c in ws[1]]
+        for column in columns:
+            j = header.index(column) + 1
+            for r in range(2, ws.max_row + 1):
+                cell = ws.cell(row=r, column=j)
+                if isinstance(cell.value, (int, float)):
+                    cell.value = cell.value * FILE_UNIT
     wb.save(path)
 
 

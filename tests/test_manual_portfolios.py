@@ -20,7 +20,9 @@ sys.path.insert(0, str(BASE_DIR / "tests"))
 import config  # noqa: E402
 from common import settings  # noqa: E402
 from reports.portfolio_dynamics import etl, workbook  # noqa: E402
-from test_portfolio_dynamics_etl import MLN, export_name, write_export  # noqa: E402
+from test_portfolio_dynamics_etl import (  # noqa: E402
+    MLN, _write_view_comments, export_name, write_export,
+)
 
 EXTRA = {"code": "OFZ_EXTRA", "name": "Внебиржевой ОФЗ", "type": "HTM",
          "volume": 150, "duration": 4.2}
@@ -170,13 +172,7 @@ class VolumeChangeTests(ManualPortfolioTestCase):
     def test_note_still_survives_a_rerun(self):
         self.set_extra(EXTRA)
         released = workbook.save_workbook(self.build(), self.out / "dinamika_portfeley_prev.xlsx")
-        from openpyxl import load_workbook
-        wb = load_workbook(released)
-        ws = wb["fact_portfolio_snapshot"]
-        for row in range(2, ws.max_row + 1):
-            if ws.cell(row=row, column=2).value == "OFZ_EXTRA":
-                ws.cell(row=row, column=7, value="Ведём вручную")
-        wb.save(released)
+        _write_view_comments(released, {"OFZ_EXTRA": "Ведём вручную"})
 
         data = self.build(previous=released)
         row = data.fact_portfolio_snapshot.set_index("portfolio_code").loc["OFZ_EXTRA"]

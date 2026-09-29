@@ -20,7 +20,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -59,6 +59,35 @@ SNAPSHOT_COLUMNS = [
     "business_date", "portfolio_code", "volume_t0", "volume_t7",
     "duration_current_yrs", "duration_target_yrs", "note_text",
 ]
+
+# ── Единицы сумм ─────────────────────────────────────────────────────────────
+# Внутри ETL все суммы — млн RUB: в них настроены делители выгрузок, ручные
+# портфели и подлимиты. В файл отчёта суммы пишутся в REPORT_UNIT, и единица
+# записывается в книгу именованной константой AMOUNT_UNIT_NAME. По ней при
+# чтении предыдущего выпуска суммы возвращаются в млн — иначе перенесённая
+# история и лимиты разошлись бы со свежими данными в тысячу раз. У выпусков,
+# сделанных до появления метки, её нет: они в млн RUB.
+MLN_IN_UNIT = {"млн RUB": 1.0, "млрд RUB": 1000.0}
+REPORT_UNIT = "млрд RUB"
+LEGACY_UNIT = "млн RUB"
+AMOUNT_UNIT_NAME = "AMOUNT_UNIT"
+AMOUNT_COLUMNS = {
+    "fact_limit": ["limit_amount", "green_max_util", "yellow_max_util", "red_max_util",
+                   "limit_remaining"],
+    "fact_type_daily": ["volume_amount"],
+    "fact_portfolio_snapshot": ["volume_t0", "volume_t7"],
+}
+
+
+def rescale_amounts(frame: pd.DataFrame, table: str, factor: float) -> pd.DataFrame:
+    """Копия frame, где суммовые колонки таблицы умножены на factor."""
+    frame = frame.copy()
+    if factor == 1.0 or frame.empty:
+        return frame
+    for column in AMOUNT_COLUMNS[table]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce") * factor
+    return frame
 
 # ── Колонки входной выгрузки ─────────────────────────────────────────────────
 # Сравнение идёт по excel_io.normalize_label (без пробелов, casefold, ё->е):
@@ -669,6 +698,61 @@ def _read_sheet(path: Path, sheet_name: str, columns: List[str],
     return frame[columns].copy()
 
 
+def read_amount_unit(path: Path) -> str:
+    """Единица сумм выпуска по метке AMOUNT_UNIT; метки нет — выпуск старый, млн RUB."""
+    from openpyxl import load_workbook
+    try:
+        workbook = load_workbook(path, read_only=True)
+    except Exception as exc:
+        raise PortfolioDynamicsError(
+            f"Не удалось открыть предыдущий выпуск {path}: {exc}") from exc
+    try:
+        name = workbook.defined_names.get(AMOUNT_UNIT_NAME)
+    finally:
+        workbook.close()
+    if name is None:
+        return LEGACY_UNIT
+    unit = str(name.attr_text).strip().strip('"')
+    if unit not in MLN_IN_UNIT:
+        raise PortfolioDynamicsError(
+            f"В предыдущем выпуске {path.name} неизвестная единица сумм {unit!r} "
+            f"(ожидается одна из: {', '.join(MLN_IN_UNIT)})."
+        )
+    return unit
+
+
+VIEW_COMMENT_HEADER = "Комментарий"
+
+
+def _read_view_comments(path: Path, dim_codes: List[Any]) -> Optional[pd.DataFrame]:
+    """Колонка «Комментарий» витрины view_monitor -> DataFrame[portfolio_code, note_text].
+
+    None — в выпуске такой колонки нет (сделан до её появления). Строка i
+    витрины ссылается формулой на строку i справочника, поэтому код портфеля
+    берётся из dim_codes по позиции: закэшированных значений формул в файле,
+    который ни разу не открывали в Excel, нет.
+    """
+    try:
+        matrix = pd.read_excel(path, sheet_name="view_monitor", header=None)
+    except Exception:
+        return None
+    for row_idx in range(len(matrix)):
+        row = [str(v).strip() if pd.notna(v) else "" for v in matrix.iloc[row_idx]]
+        if row and row[0] == "Код" and VIEW_COMMENT_HEADER in row:
+            col_idx = row.index(VIEW_COMMENT_HEADER)
+            break
+    else:
+        return None
+
+    records = []
+    for i, code in enumerate(dim_codes):
+        r = row_idx + 1 + i
+        value = matrix.iat[r, col_idx] if r < len(matrix) else None
+        text = str(value).strip() if value is not None and pd.notna(value) else ""
+        records.append({"portfolio_code": code, "note_text": text or None})
+    return pd.DataFrame(records, columns=["portfolio_code", "note_text"])
+
+
 def load_previous_release(path: Path) -> PreviousRelease:
     """Читает из предыдущего выпуска ровно то, что скрипт не умеет получить из выгрузки."""
     path = Path(path)
@@ -681,13 +765,28 @@ def load_previous_release(path: Path) -> PreviousRelease:
     history = _read_sheet(path, "fact_type_daily", TYPE_DAILY_COLUMNS)
     snapshot = _read_sheet(path, "fact_portfolio_snapshot", SNAPSHOT_COLUMNS)
 
+    unit = read_amount_unit(path)
+    factor = MLN_IN_UNIT[unit]
+    limit = rescale_amounts(limit, "fact_limit", factor)
+    history = rescale_amounts(history, "fact_type_daily", factor)
+    snapshot = rescale_amounts(snapshot, "fact_portfolio_snapshot", factor)
+    if unit != REPORT_UNIT:
+        logger.info("Предыдущий выпуск %s записан в %s — суммы пересчитаны, в новом "
+                    "выпуске они будут в %s.", path.name, unit, REPORT_UNIT)
+
+    # Комментарии пишутся на view_monitor; у выпусков без этой колонки они
+    # лежат только в note_text среза. Позиции строк витрины совпадают со
+    # строками dim_portfolio — поэтому код берётся из справочника, пока его
+    # строки ещё не отфильтрованы.
+    view_notes = _read_view_comments(path, list(dim["portfolio_code"]))
+
     dim = dim[dim["portfolio_code"].notna()].copy()
     limit = limit[limit["portfolio_type"].notna()].copy()
     history = history[history["business_date"].notna() & history["portfolio_type"].notna()].copy()
     history["business_date"] = pd.to_datetime(history["business_date"], errors="coerce").dt.date
     history = history[history["business_date"].notna()]
 
-    notes = snapshot[["portfolio_code", "note_text"]]
+    notes = view_notes if view_notes is not None else snapshot[["portfolio_code", "note_text"]]
     notes = notes[notes["portfolio_code"].notna()].copy()
 
     _canonicalise_types(dim, limit, history, path)
@@ -748,6 +847,9 @@ class PortfolioDynamicsData:
     history_rows_replaced: int = 0
     history_rows_imported: int = 0
     notes_restored: int = 0
+    # Комментарии по КАЖДОМУ портфелю справочника, а не только по попавшим в
+    # срез: портфель, на день выпавший из выгрузки, не должен терять комментарий.
+    portfolio_notes: Dict[str, str] = field(default_factory=dict)
 
 
 def parse_type_parents(raw: Optional[str] = None) -> Dict[str, str]:
@@ -1284,6 +1386,16 @@ def _build_snapshot(t0: PortfolioSlice, t7: PortfolioSlice, business_date: dt.da
     return snapshot[SNAPSHOT_COLUMNS], restored
 
 
+def _notes_for(dim: pd.DataFrame, previous: PreviousRelease) -> Dict[str, str]:
+    """{код портфеля: комментарий} из предыдущего выпуска для портфелей справочника."""
+    codes = set(dim["portfolio_code"].astype(str))
+    notes = {}
+    for code, text in zip(previous.notes["portfolio_code"], previous.notes["note_text"]):
+        if pd.notna(code) and str(code) in codes and pd.notna(text) and str(text).strip():
+            notes[str(code)] = str(text).strip()
+    return notes
+
+
 def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) -> pd.DataFrame:
     """Дописывает в срез портфели, которые ведутся вручную.
 
@@ -1561,4 +1673,5 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
         history_rows_imported=imported_rows,
         history_rows_replaced=replaced,
         notes_restored=notes_restored,
+        portfolio_notes=_notes_for(dim, previous),
     )
