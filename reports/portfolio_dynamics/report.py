@@ -22,10 +22,13 @@
 ищется сам — самый свежий xlsx в выходной папке.
 
 Единственный отчёт, который отдаёт .xlsx вместо .csv: выход — это шаблон
-обмена схемы v3.0 с формулами, витринами и проверками (CONTRACT.md).
+обмена схемы v3.0 с формулами, витринами и проверками (CONTRACT.md). Рядом с
+ним из тех же данных пишется плоский CSV для BI в длинном формате, как у
+«Отчёта по портфелям» (см. flat.py): view_monitor и объёмы типов за отчётную
+дату. Историю объёмов до начала ежедневной дозаписи выгружает --history-csv.
 """
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -36,13 +39,14 @@ from rich.text import Text
 import config
 from common import file_discovery, ui
 from reports.base import Report
-from reports.portfolio_dynamics import etl, history, inbox, workbook
+from reports.portfolio_dynamics import etl, flat, history, inbox, workbook
 
 
 class PortfolioDynamicsReport(Report):
     slug = "portfolio-dynamics"
     title = "Динамика портфелей"
-    description = "Два среза выгрузки позиций (T0 и T-7) -> xlsx схемы v3.0 с историей, лимитами и проверками"
+    description = ("Два среза выгрузки позиций (T0 и T-7) -> xlsx схемы v3.0 с историей, лимитами и "
+                   "проверками + плоский CSV для BI")
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -85,7 +89,22 @@ class PortfolioDynamicsReport(Report):
             help="Первый выпуск: предыдущего файла нет, история заводится с одной даты, "
                  "лимиты — нулевые (заполняются руками).",
         )
-        parser.add_argument("--output", type=str, default=None, help="Путь для сохранения .xlsx")
+        parser.add_argument("--output", type=str, default=None,
+                            help="Путь для сохранения .xlsx; плоский CSV пишется рядом с тем же именем")
+        parser.add_argument(
+            "--history-csv", nargs="?", const="", default=None, metavar="ДАТА",
+            help="Дополнительно выгрузить историю объёмов по типам в отдельный CSV — один раз, "
+                 "перед тем как начать дописывать ежедневные файлы. Берутся даты по ДАТА "
+                 "(YYYY-MM-DD) включительно; без даты — по день перед отчётной датой, "
+                 "чтобы не пересечься с ежедневным файлом этого же запуска.",
+        )
+        parser.add_argument(
+            "--from-xlsx", nargs="?", const="", default=None, metavar="ФАЙЛ",
+            help="Выгрузить историю объёмов по типам из готового выпуска (.xlsx) и больше "
+                 "ничего не делать: срезы не читаются, xlsx и ежедневный CSV не пишутся. "
+                 "Без пути — самый свежий выпуск в папке результатов. Даты — по дату из "
+                 "--history-csv включительно, без неё — вся история.",
+        )
         parser.add_argument(
             "--diagnose", action="store_true",
             help="Ничего не считать: показать, какие папки и файлы отчёт видит и почему "
@@ -97,6 +116,10 @@ class PortfolioDynamicsReport(Report):
             diagnose(args)
             return
 
+        history_until = _history_csv_until(args)
+        if getattr(args, "from_xlsx", None) is not None:
+            _history_from_xlsx(args, history_until)
+            return
         t0_path, t7_path = _resolve_slice_paths(args)
         if t0_path == t7_path:
             raise etl.PortfolioDynamicsError(
@@ -118,8 +141,13 @@ class PortfolioDynamicsReport(Report):
         output_path = Path(args.output) if args.output else _default_output_path(data.business_date)
         checks = workbook.evaluate_checks(data)
         workbook.save_workbook(data, output_path, checks=checks)
+        flat_path = flat.save_flat(data, output_path.with_suffix(".csv"))
+        history_path_csv = None
+        if getattr(args, "history_csv", None) is not None:
+            until = history_until or data.business_date - timedelta(days=1)
+            history_path_csv = flat.save_history(data.fact_type_daily, until, output_path.parent)
 
-        failed = [cid for cid, status, _value in checks if status == "FAIL"]
+        failed = [(cid, value) for cid, status, value in checks if status == "FAIL"]
         if limits_path is None:
             ui.warning(
                 "Файл лимитов не найден — лимиты и границы зон взяты из предыдущего "
@@ -130,10 +158,14 @@ class PortfolioDynamicsReport(Report):
             f"Готово: {len(data.fact_portfolio_snapshot)} портфелей, "
             f"{len(data.fact_type_daily)} строк истории -> {output_path}"
         )
+        ui.success(f"Плоский CSV для BI -> {flat_path}")
+        if history_path_csv is not None:
+            ui.success(f"История объёмов по типам (разовая выгрузка) -> {history_path_csv}")
         if failed:
             ui.warning(
-                f"Лист checks: FAIL в {len(failed)} проверках ({', '.join(failed)}) — "
-                "загрузка в BI заблокирована, см. лист checks в файле."
+                f"Лист checks: FAIL в {len(failed)} проверках: "
+                + ", ".join(f"{cid} (значение {value})" for cid, value in failed)
+                + " — подробности на листе checks в xlsx."
             )
 
     def collect_interactive_args(self) -> Optional[argparse.Namespace]:
@@ -766,6 +798,61 @@ def _nothing_found_message(source: file_discovery.SourceConfig) -> str:
         "  либо указать файлы напрямую: --t0-input <файл> --t7-input <файл>",
     ]
     return "\n".join(lines)
+
+
+def _history_csv_until(args: argparse.Namespace):
+    """Дата из --history-csv; None — без даты (или флаг не задан).
+
+    Разбирается до сборки данных: опечатка в дате не должна обнаружиться после
+    минуты чтения выгрузок.
+    """
+    raw = getattr(args, "history_csv", None)
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise etl.PortfolioDynamicsError(
+            f"--history-csv: некорректная дата '{raw}', ожидается YYYY-MM-DD"
+        ) from exc
+
+
+def _history_from_xlsx(args: argparse.Namespace, until) -> None:
+    """--from-xlsx: история объёмов по типам из готового выпуска в отдельный CSV.
+
+    Для разовой загрузки истории в BI: вся она лежит на листе fact_type_daily
+    одного выпуска, строить отчёты за каждый прошедший день не нужно.
+    """
+    output_dir = Path(config.PORTFOLIO_DYNAMICS_OUTPUT_DIR)
+    if args.from_xlsx:
+        path = history.resolve_path(args.from_xlsx, [output_dir, Path(config.DOWNLOADS_DIR)])
+        if path is None:
+            raise etl.PortfolioDynamicsError(f"--from-xlsx: файл не найден: {args.from_xlsx}")
+    else:
+        path = etl.find_previous_release(output_dir)
+        if path is None:
+            raise etl.PortfolioDynamicsError(
+                f"--from-xlsx: в {output_dir} нет ни одного выпуска "
+                f"{etl.OUTPUT_FILENAME_PREFIX}*.xlsx — укажите путь к файлу явно."
+            )
+    ui.console.print(f"[grey70]История берётся из: [bold]{path}[/bold][/grey70]")
+
+    type_daily = etl.load_previous_release(path).fact_type_daily
+    if type_daily.empty:
+        raise etl.PortfolioDynamicsError(f"В {path.name} лист fact_type_daily пуст — "
+                                         "выгружать нечего.")
+    last = max(type_daily["business_date"])
+    if until is not None and until > last:
+        ui.warning(f"История в {path.name} заканчивается {last.isoformat()} — раньше "
+                   f"запрошенной даты {until.isoformat()}. Выгружено по {last.isoformat()}.")
+
+    out_dir = Path(args.output).parent if getattr(args, "output", None) else output_dir
+    saved = flat.save_history(type_daily, until, out_dir)
+    if saved is None:
+        ui.warning("Файл истории не записан: в выпуске нет дат по "
+                   f"{until.isoformat()} включительно.")
+        return
+    ui.success(f"История объёмов по типам -> {saved}")
 
 
 def _resolve_by_date(source: file_discovery.SourceConfig, date_str: Optional[str]) -> Path:
