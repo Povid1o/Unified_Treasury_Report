@@ -98,6 +98,7 @@ GROUPS: List[Group] = [
     Group("nim", "NIM"),
     Group("transfert", "Трансфертные ставки"),
     Group("portfolio_dynamics", "Динамика портфелей"),
+    Group("portfolio_report", "Отчёт по портфелям"),
 ]
 
 
@@ -475,6 +476,16 @@ SETTINGS: List[Setting] = [
         help="Срез T-7 подбирается на дату T0 минус столько дней (нет такого — "
              "ближайший более ранний). Сам сдвиг в отчёте считается как разница дат "
              "T0 и T-7; это значение идёт в отчёт, только если даты определить не удалось.",
+    ),
+    # ── Отчёт по портфелям ───────────────────────────────────────────────────
+    # Выгрузка та же, что у «Динамики портфелей», поэтому папка исходных файлов,
+    # шаблон имени и приёмка из загрузок берутся из её настроек.
+    Setting(
+        key="portfolio_report_output_dir", label="Папка результатов", kind="dir",
+        group="portfolio_report", default=_under_root("output", "PortfolioReport"),
+        help="Куда складывать CSV. Отсюда же берётся предыдущий выпуск — с ним "
+             "сравнивается Open QTY. Выгрузки «Позиция за период» ищутся там же, где "
+             "у «Динамики портфелей» (её папка исходных файлов и загрузки).",
     ),
 ]
 
@@ -873,6 +884,7 @@ _CREATED_ON_WRITE = {
     "logs_dir", "ofz_output_path", "ovp_output_dir", "balance_struct_output_dir",
     "chpd_output_dir", "nim_output_dir", "transfert_output_dir",
     "portfolio_dynamics_output_dir", "portfolio_dynamics_types_file",
+    "portfolio_report_output_dir",
 }
 
 

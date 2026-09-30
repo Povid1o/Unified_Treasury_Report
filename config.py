@@ -88,6 +88,8 @@ PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
 
+PORTFOLIO_REPORT_OUTPUT_DIR: Path
+
 
 def _apply_settings() -> None:
     """Пересобирает константы модуля из текущих значений настроек."""
@@ -224,6 +226,11 @@ def _apply_settings() -> None:
     # Второй экземпляр среза в папке его собственной даты — чтобы файл, взятый
     # как T-7, потом можно было использовать как T0 своей даты.
     g["PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE"] = v["portfolio_dynamics_archive_own_date"]
+
+    # ── Отчёт по портфелям ───────────────────────────────────────────────────
+    # Источник общий с «Динамикой портфелей» (та же выгрузка «Позиция за
+    # период»), своя только папка результатов.
+    g["PORTFOLIO_REPORT_OUTPUT_DIR"] = v["portfolio_report_output_dir"]
 
 
 def reload() -> None:

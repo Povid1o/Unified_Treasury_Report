@@ -31,6 +31,7 @@ from reports.chpd.report import ChpdReport  # noqa: E402
 from reports.nim.report import NimReport  # noqa: E402
 from reports.transfert_stavka.report import TransfertStavkaReport  # noqa: E402
 from reports.portfolio_dynamics.report import PortfolioDynamicsReport  # noqa: E402
+from reports.portfolio_report.report import PortfolioReport  # noqa: E402
 
 REPORTS = [
     OfzRatesReport(),
@@ -40,6 +41,7 @@ REPORTS = [
     NimReport(),
     TransfertStavkaReport(),
     PortfolioDynamicsReport(),
+    PortfolioReport(),
 ]
 REPORTS_BY_SLUG = {report.slug: report for report in REPORTS}
 
