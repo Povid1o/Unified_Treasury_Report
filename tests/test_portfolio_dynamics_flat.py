@@ -128,6 +128,94 @@ class HistoryFlatTests(unittest.TestCase):
         self.assertEqual(sorted(set(frame["date_"])), ["2026-09-04", "2026-09-11", DAY])
 
 
+class HistorySinceTests(unittest.TestCase):
+    """По какую дату история уже лежит в CSV папки — и с какой даты дописывать."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.day = dt.date(2026, 9, 18)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def touch(self, *names):
+        for name in names:
+            (self.dir / name).write_text("x", encoding="utf-8")
+
+    def test_no_csv_means_the_whole_history(self):
+        self.touch("dinamika_portfeley_2026-09-17.xlsx")  # xlsx не в счёт
+        self.assertIsNone(flat.covered_until(self.dir, self.day))
+        self.assertEqual(flat.history_since(self.dir, self.day), dt.date.min)
+
+    def test_yesterday_means_only_today(self):
+        self.touch("dinamika_portfeley_2026-09-10.csv", "dinamika_portfeley_2026-09-17.csv")
+        self.assertEqual(flat.history_since(self.dir, self.day), self.day)
+
+    def test_gap_is_filled(self):
+        self.touch("dinamika_portfeley_2026-09-11.csv")
+        self.assertEqual(flat.history_since(self.dir, self.day), dt.date(2026, 9, 12))
+
+    def test_own_date_and_later_files_do_not_count(self):
+        """Повторный запуск за ту же дату собирает то же самое, что и первый."""
+        self.touch("dinamika_portfeley_2026-09-18.csv", "dinamika_portfeley_2026-09-25.csv")
+        self.assertIsNone(flat.covered_until(self.dir, self.day))
+
+    def test_one_time_history_export_counts(self):
+        self.touch("dinamika_portfeley_istoriya_2026-01-09_2026-09-16.csv")
+        self.assertEqual(flat.history_since(self.dir, self.day), dt.date(2026, 9, 17))
+
+    def test_other_names_are_ignored(self):
+        self.touch("dinamika_portfeley_2026-09-17 (1).csv", "otchet_po_portfelyam_2026-09-17.csv",
+                   "dinamika_portfeley_2026-13-45.csv")
+        self.assertIsNone(flat.covered_until(self.dir, self.day))
+
+    def test_to_flat_takes_type_volumes_from_the_given_date(self):
+        data = build_demo_data()
+        volumes = lambda frame: sorted(set(frame[frame["axis_3"] == flat.M_TYPE_VOLUME]["date_"]))
+        self.assertEqual(volumes(flat.to_flat(data)), [DAY])
+        self.assertEqual(volumes(flat.to_flat(data, dt.date.min)), ["2026-09-04", "2026-09-11", DAY])
+        self.assertEqual(volumes(flat.to_flat(data, dt.date(2026, 9, 5))), ["2026-09-11", DAY])
+        # Портфели — только на отчётную дату, сколько бы истории ни дописалось.
+        frame = flat.to_flat(data, dt.date.min)
+        self.assertEqual(set(frame[frame["axis_2"] != ""]["date_"]), {DAY})
+
+
+class DailyCsvPicksUpHistoryTests(PortfolioDynamicsTestCase):
+    """Сквозной прогон: первый CSV получает историю из xlsx, следующий — только свой день."""
+
+    def setUp(self):
+        super().setUp()
+        config.PORTFOLIO_DYNAMICS_OUTPUT_DIR = self.out_dir  # отсюда берётся предыдущий выпуск
+        self.release = self.out_dir / "dinamika_portfeley_2026-09-18.xlsx"
+        workbook.save_workbook(build_demo_data(), self.release)  # история 04.09, 11.09, 18.09
+
+    def run_for(self, period_end):
+        day = dt.datetime.strptime(period_end, "%d.%m.%Y").date().isoformat()
+        from test_portfolio_dynamics_etl import T0_ROWS, export_name, write_export
+        t0 = write_export(self.tmp / export_name(period_end), T0_ROWS, period_end=period_end)
+        args = argparse.Namespace(
+            t0_input=str(t0), t7_input=str(self.t7_path), folder=None, date=None,
+            no_import=True, t0_date=None, t7_date=None, previous=None, bootstrap=False,
+            history=None, diagnose=False, history_csv=None, from_xlsx=None,
+            output=str(self.out_dir / f"dinamika_portfeley_{day}.xlsx"))
+        PortfolioDynamicsReport().run(args)
+        frame = pd.read_csv(self.out_dir / f"dinamika_portfeley_{day}.csv",
+                            encoding="utf-8-sig", keep_default_na=False)
+        return sorted(set(frame[frame["axis_3"] == flat.M_TYPE_VOLUME]["date_"]))
+
+    def test_first_csv_gets_history_then_only_its_day(self):
+        self.assertEqual(self.run_for("22.09.2026"),
+                         ["2026-09-04", "2026-09-11", "2026-09-18", "2026-09-22"])
+        self.assertEqual(self.run_for("23.09.2026"), ["2026-09-23"])
+        # Повтор за 23.09 — то же самое, а не вся история заново.
+        self.assertEqual(self.run_for("23.09.2026"), ["2026-09-23"])
+
+    def test_days_after_the_last_csv_are_filled(self):
+        (self.out_dir / "dinamika_portfeley_2026-09-11.csv").write_text("x", encoding="utf-8")
+        self.assertEqual(self.run_for("22.09.2026"), ["2026-09-18", "2026-09-22"])
+
+
 class RunWritesBothFormatsTests(PortfolioDynamicsTestCase):
     def _args(self, **extra):
         values = dict(t0_input=str(self.t0_path), t7_input=str(self.t7_path), folder=None,

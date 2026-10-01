@@ -15,7 +15,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
-from common import excel_io  # noqa: E402
+from common import excel_io, rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("nim")
@@ -47,6 +47,9 @@ MAPPING_OSNOVA: Dict[int, Dict[str, str]] = {
 RUR_VALUTA_LABELS: List[str] = ["% Активы", "% Пассивы"]
 
 OUT_COLUMNS = ["id", "date_", "axis_0", "axis_1", "axis_2", "axis_3", "value", "axis_4", "nversionid", "axis_5"]
+
+# Показатель (axis_1) -> ключ настройки «Округление» (common/rounding.py).
+ROUNDING_KEYS = {"NIM": "nim", "% результат": "result", "% Активы": "assets", "% Пассивы": "liabilities"}
 
 
 class NimDataError(RuntimeError):
@@ -193,6 +196,7 @@ def build_report(file_path: Path) -> pd.DataFrame:
 
     output_data: List[dict] = []
     row_id_counter = 1
+    rules = {a1: rounding.rule("nim", key) for a1, key in ROUNDING_KEYS.items()}
 
     def _append_value(row_idx: int, col_pos: int, formatted_date: str, a1: str, a2: str, a3: str) -> None:
         nonlocal row_id_counter
@@ -201,7 +205,7 @@ def build_report(file_path: Path) -> pd.DataFrame:
             val = float(val)
             if a1 != "% результат":  # умножаем на 100 всё, кроме "% результат"
                 val = val * 100
-            val = round(val, 2)
+            val = rules[a1].apply(val, current=lambda v: round(v, 2))
         except (ValueError, TypeError):
             pass  # текст или NaN — не трогаем
 
@@ -248,8 +252,16 @@ def build_report(file_path: Path) -> pd.DataFrame:
             for col_pos, formatted_date in date_cols:
                 _append_value(row_idx, col_pos, formatted_date, label_text, currency, "")
 
-    result_df = pd.DataFrame(output_data, columns=OUT_COLUMNS)
-    result_df["value"] = pd.to_numeric(result_df["value"], errors="coerce")
+    if all(rule.is_default for rule in rules.values()):
+        result_df = pd.DataFrame(output_data, columns=OUT_COLUMNS)
+        result_df["value"] = pd.to_numeric(result_df["value"], errors="coerce")
+    else:
+        # Настройка «Округление» изменена: числа как есть (целые — целыми),
+        # нечисловое — в NaN, как и прежде.
+        for row in output_data:
+            if rounding._as_number(row["value"]) is None:
+                row["value"] = float("nan")
+        result_df = rounding.frame_with_values(output_data, OUT_COLUMNS)
 
     if result_df.empty:
         raise NimDataError("Итоговый DataFrame пуст — не найдено ни одной строки данных.")

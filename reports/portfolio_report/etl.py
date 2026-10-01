@@ -34,7 +34,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
-from common import excel_io  # noqa: E402
+from common import excel_io, rounding  # noqa: E402
 from common.file_discovery import find_date_folders  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 from reports.portfolio_dynamics import etl as positions  # noqa: E402
@@ -73,6 +73,9 @@ DATA_COLUMNS = [
 #   axis_3 — показатель (METRICS ниже, либо RGBI/RUONIA/RWA);
 #   axis_4 — единица измерения.
 # Пустые значения не пишутся: строка без значения в BI — только шум.
+# Единицу и знаки каждого показателя можно поменять настройкой «Округление»
+# (common/rounding.py, ключ показателя = колонка свода или ключ MarketInputs);
+# axis_4 тогда меняется вместе со значением.
 OUT_COLUMNS = ["id", "date_", "axis_0", "axis_1", "axis_2", "axis_3", "axis_4",
                "value", "nversionid"]
 AXIS_0 = "Портфели"
@@ -432,6 +435,23 @@ def _optional_float(value) -> Optional[float]:
     return positions.parse_number(value)
 
 
+def _to_base_unit(value: float, key: str, unit: Optional[str], path: Path) -> float:
+    """Значение прошлого выпуска -> исходная единица показателя (шт, руб…).
+
+    Выпуск мог быть записан с другой настройкой «Округление» (Open QTY в тыс.
+    шт): без пересчёта вчерашнее значение сравнивалось бы с сегодняшним в
+    другой единице, и изменение Open QTY вышло бы на порядки неверным.
+    """
+    if unit is None:
+        return value
+    shift = rounding.scale_of_label("portfolio_report", key, unit)
+    if shift is None:
+        logger.warning("%s: у показателя %s неизвестная единица «%s» — значение взято как есть.",
+                       Path(path).name, key, unit)
+        return value
+    return rounding.Rule(shift=shift).scale(value) if shift else value
+
+
 def load_previous_release(path: Path) -> PreviousRelease:
     """Вчерашний Open QTY по портфелям и введённые тогда RGBI/RUONIA/RWA."""
     path = Path(path)
@@ -451,14 +471,17 @@ def load_previous_release(path: Path) -> PreviousRelease:
     open_qty: Dict[str, float] = {}
     market: Dict[str, Optional[float]] = {}
     market_names = {title: key for key, title, _unit in MARKET_METRICS}
+    has_unit = "axis_4" in flat.columns
     for row in flat.itertuples(index=False):
         value = _optional_float(row.value)
         if value is None:
             continue
         if row.axis_3 == OPEN_QTY_METRIC and row.axis_2:
+            value = _to_base_unit(value, "open_qty", row.axis_4 if has_unit else None, path)
             open_qty[row.axis_2.strip().upper()] = value
         elif row.axis_1 == MARKET_GROUP and row.axis_3 in market_names:
-            market[market_names[row.axis_3]] = value
+            key = market_names[row.axis_3]
+            market[key] = _to_base_unit(value, key, row.axis_4 if has_unit else None, path)
 
     business_date = release_date(path)
     dates = {d for d in flat["date_"] if d}
@@ -546,19 +569,27 @@ def to_flat(data: PortfolioReportData) -> pd.DataFrame:
     date_ = data.business_date.isoformat()
     rows = []
 
-    def add(group, code, metric, unit, value):
+    rules = {key: rounding.rule("portfolio_report", key)
+             for key, _metric, _unit in METRICS + MARKET_METRICS}
+
+    def add(group, code, key, metric, unit, value):
         if value is None or pd.isna(value):
             return
+        rule = rules[key]
         rows.append({"id": len(rows), "date_": date_, "axis_0": AXIS_0, "axis_1": group,
-                     "axis_2": code, "axis_3": metric, "axis_4": unit,
-                     "value": float(value), "nversionid": ""})
+                     "axis_2": code, "axis_3": metric, "axis_4": rule.label(unit),
+                     "value": float(value) if rule.is_default else rule.apply(float(value)),
+                     "nversionid": ""})
 
     for record in data.frame.to_dict("records"):
         for column, metric, unit in METRICS:
-            add(record["portfolio_type"], record["portfolio_code"], metric, unit, record[column])
+            add(record["portfolio_type"], record["portfolio_code"], column, metric, unit,
+                record[column])
     for key, metric, unit in MARKET_METRICS:
-        add(MARKET_GROUP, "", metric, unit, getattr(data.market, key))
-    return pd.DataFrame(rows, columns=OUT_COLUMNS)
+        add(MARKET_GROUP, "", key, metric, unit, getattr(data.market, key))
+    if all(rule.is_default for rule in rules.values()):
+        return pd.DataFrame(rows, columns=OUT_COLUMNS)
+    return rounding.frame_with_values(rows, OUT_COLUMNS)
 
 
 def save_report(data: PortfolioReportData, output_path: Path) -> Path:

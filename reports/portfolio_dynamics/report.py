@@ -24,11 +24,11 @@
 Единственный отчёт, который отдаёт .xlsx вместо .csv: выход — это шаблон
 обмена схемы v3.0 с формулами, витринами и проверками (CONTRACT.md). Рядом с
 ним из тех же данных пишется плоский CSV для BI в длинном формате, как у
-«Отчёта по портфелям» (см. flat.py): view_monitor и объёмы типов за отчётную
-дату. Историю объёмов до начала ежедневной дозаписи выгружает --history-csv.
+«Отчёта по портфелям» (см. flat.py): view_monitor и объёмы типов за даты,
+которых в CSV папки ещё нет — первый CSV получает всю историю из xlsx сам.
 """
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -93,8 +93,9 @@ class PortfolioDynamicsReport(Report):
                             help="Путь для сохранения .xlsx; плоский CSV пишется рядом с тем же именем")
         parser.add_argument(
             "--history-csv", nargs="?", const="", default=None, metavar="ДАТА",
-            help="Дополнительно выгрузить историю объёмов по типам в отдельный CSV — один раз, "
-                 "перед тем как начать дописывать ежедневные файлы. Берутся даты по ДАТА "
+            help="Дополнительно выгрузить историю объёмов по типам отдельным CSV. Обычно не "
+                 "нужно: ежедневный CSV сам добирает историю, которой ещё нет в CSV папки. "
+                 "Берутся даты по ДАТА "
                  "(YYYY-MM-DD) включительно; без даты — по день перед отчётной датой, "
                  "чтобы не пересечься с ежедневным файлом этого же запуска.",
         )
@@ -141,7 +142,9 @@ class PortfolioDynamicsReport(Report):
         output_path = Path(args.output) if args.output else _default_output_path(data.business_date)
         checks = workbook.evaluate_checks(data)
         workbook.save_workbook(data, output_path, checks=checks)
-        flat_path = flat.save_flat(data, output_path.with_suffix(".csv"))
+        csv_path = output_path.with_suffix(".csv")
+        history_from = flat.history_since(csv_path.parent, data.business_date)
+        flat_path = flat.save_flat(data, csv_path, history_from)
         history_path_csv = None
         if getattr(args, "history_csv", None) is not None:
             until = history_until or data.business_date - timedelta(days=1)
@@ -159,6 +162,7 @@ class PortfolioDynamicsReport(Report):
             f"{len(data.fact_type_daily)} строк истории -> {output_path}"
         )
         ui.success(f"Плоский CSV для BI -> {flat_path}")
+        ui.console.print(f"[grey70]{_history_note(data, history_from)}[/grey70]")
         if history_path_csv is not None:
             ui.success(f"История объёмов по типам (разовая выгрузка) -> {history_path_csv}")
         if failed:
@@ -815,6 +819,21 @@ def _history_csv_until(args: argparse.Namespace):
         raise etl.PortfolioDynamicsError(
             f"--history-csv: некорректная дата '{raw}', ожидается YYYY-MM-DD"
         ) from exc
+
+
+def _history_note(data, history_from) -> str:
+    """Что из истории объёмов типов попало в ежедневный CSV — одной строкой."""
+    day = data.business_date
+    dates = sorted({d for d in data.fact_type_daily["business_date"]
+                    if history_from <= d <= day})
+    if history_from == date.min:
+        first = dates[0].isoformat() if dates else day.isoformat()
+        return (f"Объёмы типов в CSV: вся история из xlsx, {first} — {day.isoformat()}, "
+                f"дат: {len(dates)} (прошлых CSV в папке нет).")
+    if dates == [day] or not dates:
+        return f"Объёмы типов в CSV: только за {day.isoformat()} (история уже есть в прошлых CSV)."
+    return (f"Объёмы типов в CSV: {dates[0].isoformat()} — {day.isoformat()}, дат: {len(dates)} "
+            "(дни после последнего CSV в папке).")
 
 
 def _history_from_xlsx(args: argparse.Namespace, until) -> None:

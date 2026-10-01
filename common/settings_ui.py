@@ -21,7 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 import config
-from common import file_discovery, settings, ui
+from common import file_discovery, rounding, settings, ui
 
 MENU_TITLE = "Настройки"
 MENU_DESCRIPTION = "Пути к папкам, шаблоны имён файлов и константы отчётов — без правки config.py"
@@ -32,7 +32,10 @@ MANUAL_PORTFOLIOS_KEY = "portfolio_dynamics_manual_portfolios"
 
 def _value_repr(key: str) -> str:
     value = settings.get(key)
-    if settings.SETTINGS_BY_KEY[key].kind == "portfolios":
+    setting = settings.SETTINGS_BY_KEY[key]
+    if setting.kind == "rounding":
+        return rounding.describe(setting.group, value)
+    if setting.kind == "portfolios":
         if not value:
             return "не заданы"
         return f"{len(value)} шт.: " + ", ".join(p["code"] for p in value)
@@ -111,6 +114,8 @@ def _paths_table() -> Table:
 
 def _edit_setting(setting: settings.Setting) -> bool:
     """Диалог правки одной настройки. True — значение изменилось."""
+    if setting.kind == "rounding":
+        return _rounding_screen(setting)
     current = settings.get(setting.key)
     default = settings.default_of(setting.key)
     overridden = settings.is_overridden(setting.key)
@@ -188,6 +193,146 @@ def _edit_group(group: settings.Group) -> bool:
         except KeyboardInterrupt:
             ui.console.print()
             ui.cancelled("Правка настройки отменена.")
+
+
+# ── Округление ───────────────────────────────────────────────────────────────
+def _rounding_table(setting: settings.Setting, value: dict) -> Table:
+    title = next(g.title for g in settings.GROUPS if g.key == setting.group)
+    table = Table(
+        title=f"Округление — {title}", title_style="bold cyan", box=box.SIMPLE_HEAVY,
+        show_header=True, header_style="bold cyan",
+        caption="Жёлтым — изменённые; «как сейчас» — выгрузка не меняется ни в одном знаке.",
+        caption_style="grey50",
+    )
+    table.add_column("#", justify="right", style="bold yellow", no_wrap=True, width=3)
+    table.add_column("Показатель", style="bold white", overflow="fold", ratio=2)
+    table.add_column("Единица", overflow="fold")
+    table.add_column("Знаков после запятой", overflow="fold")
+    for i, category in enumerate(rounding.CATALOG[setting.group], start=1):
+        entry = value.get(category.key)
+        unit, decimals = rounding.current_state(category, entry)
+        if entry and "scale" in entry:
+            unit = f"[bold yellow]{unit}[/bold yellow]"
+        if entry and "decimals" in entry:
+            decimals = f"[bold yellow]{decimals}[/bold yellow]"
+        label = category.label
+        if category.note:
+            label += f"\n[grey50]{category.note}[/grey50]"
+        table.add_row(str(i), label, unit, decimals)
+    return table
+
+
+def _ask_scale(category: rounding.Category, entry: dict) -> Optional[int]:
+    """Номер единицы -> её значение. None — оставить как есть."""
+    scales = category.scales()
+    current = entry.get("scale", category.default_scale())
+    ui.console.print("[bold]Единица:[/bold]")
+    for i, scale in enumerate(scales, start=1):
+        marks = []
+        if scale == category.default_scale():
+            marks.append("как сейчас")
+        if scale == current:
+            marks.append("выбрана")
+        tail = f"  [grey50]({', '.join(marks)})[/grey50]" if marks else ""
+        ui.console.print(f"  [bold yellow]{i}[/bold yellow]  {category.scale_title(scale)}{tail}")
+    while True:
+        answer = ui.ask("Номер единицы (Enter — оставить)").strip()
+        if not answer:
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(scales):
+            return scales[int(answer) - 1]
+        ui.warning(f"Укажите номер от 1 до {len(scales)}.")
+
+
+def _ask_decimals(category: rounding.Category, entry: dict):
+    """Знаки: число, «-» (как сейчас) или None (оставить)."""
+    current = entry.get("decimals")
+    shown = f"сейчас: {current}" if current is not None else f"сейчас: как было — {category.now}"
+    while True:
+        answer = ui.ask(f"Знаков после запятой, 0–{rounding.MAX_DECIMALS} "
+                        f"[grey50]({shown}; Enter — оставить, «-» — как было)[/grey50]").strip()
+        if not answer:
+            return None
+        if answer == "-":
+            return "-"
+        if answer.isdigit() and int(answer) <= rounding.MAX_DECIMALS:
+            return int(answer)
+        ui.warning(f"Нужно целое число от 0 до {rounding.MAX_DECIMALS} или «-».")
+
+
+def _save_rounding(setting: settings.Setting, value: dict) -> bool:
+    try:
+        if value:
+            settings.set_value(setting.key, value)
+        elif settings.is_overridden(setting.key):
+            settings.reset(setting.key)
+    except settings.SettingsError as exc:
+        ui.error(str(exc))
+        return False
+    return True
+
+
+def _rounding_screen(setting: settings.Setting) -> bool:
+    """Экран «Округление» одного отчёта. True — что-то изменилось."""
+    categories = rounding.CATALOG[setting.group]
+    changed = False
+    while True:
+        value = {k: dict(v) for k, v in settings.get(setting.key).items()}
+        ui.console.print()
+        ui.console.print(_rounding_table(setting, value))
+        ui.console.print("[grey70]номер — изменить показатель, -<номер> — вернуть его как было, "
+                         "с — вернуть всё как было, 0 — назад[/grey70]")
+        choice = ui.ask("Действие", default="0").strip().lower()
+
+        if choice in ("0", ""):
+            return changed
+
+        if choice in ("с", "c", "s"):
+            if value and _save_rounding(setting, {}):
+                ui.success("Округление возвращено как было: выгрузка снова без изменений.")
+                changed = True
+            continue
+
+        if choice.startswith("-"):
+            index = choice[1:].strip()
+            if not index.isdigit() or not 1 <= int(index) <= len(categories):
+                ui.warning("Укажите номер показателя, например «-1».")
+                continue
+            category = categories[int(index) - 1]
+            if value.pop(category.key, None) is not None and _save_rounding(setting, value):
+                ui.success(f"{category.label}: как было.")
+                changed = True
+            continue
+
+        if not choice.isdigit() or not 1 <= int(choice) <= len(categories):
+            ui.warning("Некорректный выбор, попробуйте снова.")
+            continue
+
+        category = categories[int(choice) - 1]
+        entry = value.get(category.key, {})
+        ui.console.print()
+        ui.console.print(f"[bold white]{category.label}[/bold white]  "
+                         f"[grey50]сейчас: {category.now}[/grey50]")
+        if category.note:
+            ui.console.print(f"[grey70]{category.note}[/grey70]")
+        if category.kind == rounding.NONE:
+            ui.console.print("[grey70]Единица у этого показателя не меняется "
+                             "(проценты, ставки, дюрации) — только знаки.[/grey70]")
+        else:
+            scale = _ask_scale(category, entry)
+            if scale is not None:
+                entry["scale"] = scale
+        decimals = _ask_decimals(category, entry)
+        if decimals == "-":
+            entry.pop("decimals", None)
+        elif decimals is not None:
+            entry["decimals"] = decimals
+        value[category.key] = entry
+        if _save_rounding(setting, value):
+            unit, shown = rounding.current_state(
+                category, settings.get(setting.key).get(category.key))
+            ui.success(f"{category.label}: единица — {unit}, знаков — {shown}.")
+            changed = True
 
 
 # ── Дополнительные портфели ──────────────────────────────────────────────────

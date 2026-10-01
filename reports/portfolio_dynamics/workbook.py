@@ -33,9 +33,10 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
+from common import rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    AMOUNT_UNIT_NAME, DIM_COLUMNS, LIMIT_COLUMNS, MLN_IN_UNIT, REPORT_UNIT,
+    AMOUNT_UNIT_NAME, DIM_COLUMNS, LIMIT_COLUMNS, MLN_IN_UNIT, REPORT_UNIT, report_unit,
     SNAPSHOT_COLUMNS, TYPE_DAILY_COLUMNS, VIEW_COMMENT_HEADER,
     PortfolioDynamicsData, PortfolioDynamicsError,
     aggregated_parents, descendants_of, rescale_amounts, types_counted_in,
@@ -74,6 +75,48 @@ FMT_DUR = "0.00"
 FMT_DATE = "YYYY-MM-DD"
 
 UNIT = REPORT_UNIT
+# Степень десяти единицы: до какого знака округлять, чтобы точность была до рубля.
+UNIT_DIGITS = {"RUB": 0, "тыс. RUB": 3, "млн RUB": 6, "млрд RUB": 9}
+
+
+def _localized(obj: Any, unit: str) -> Any:
+    """Тексты книги (SCHEMA, README) с единицей unit вместо REPORT_UNIT.
+
+    Единица попадает в них только через UNIT, поэтому замены подстроки
+    достаточно. При единице по умолчанию возвращается сам объект — тексты
+    не меняются ни в одном знаке.
+    """
+    if unit == REPORT_UNIT:
+        return obj
+    if isinstance(obj, str):
+        return obj.replace(REPORT_UNIT, unit)
+    if isinstance(obj, dict):
+        return {k: _localized(v, unit) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_localized(v, unit) for v in obj)
+    return obj
+
+
+def _decimals_part(decimals: int) -> str:
+    return "." + "0" * decimals if decimals else ""
+
+
+def _number_formats() -> Dict[str, str]:
+    """Форматы сумм, процентов и дюраций по настройке «Округление».
+
+    Знаки здесь — только отображение: числа на машинных листах хранятся
+    полностью, иначе следующий запуск унаследовал бы уже округлённую историю.
+    """
+    amount = rounding.rule("portfolio_dynamics", "xlsx_amounts").decimals
+    pct = rounding.rule("portfolio_dynamics", "xlsx_percent").decimals
+    dur = rounding.rule("portfolio_dynamics", "xlsx_duration").decimals
+    body_amt = "#,##0" + _decimals_part(amount or 0)
+    body_pct = "0" + _decimals_part(pct or 0) + "%"
+    return {
+        "amount": FMT_AMT if amount is None else "%s;(%s);-" % (body_amt, body_amt),
+        "pct": FMT_PCT if pct is None else "%s;(%s);-" % (body_pct, body_pct),
+        "dur": FMT_DUR if dur is None else "0" + _decimals_part(dur),
+    }
 
 SCHEMA = {
     "dim_portfolio": [
@@ -367,11 +410,12 @@ README_LINES = [
 ]
 
 
-def _write_readme(wb: Workbook, data: PortfolioDynamicsData, generated_at: dt.datetime) -> None:
+def _write_readme(wb: Workbook, data: PortfolioDynamicsData, generated_at: dt.datetime,
+                  unit: str = REPORT_UNIT) -> None:
     ws = wb.active
     ws.title = "README"
     ws.sheet_view.showGridLines = False
-    lines = list(README_LINES) + [
+    lines = list(_localized(README_LINES, unit)) + [
         ("", None),
         ("Файл сформирован отчётом «Динамика портфелей» (console.py portfolio-dynamics) %s. "
          "Срез на %s, история по типам — %d строк. Лимиты и комментарии перенесены из предыдущего "
@@ -413,8 +457,13 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     business_date = data.business_date
     lookback = data.lookback_days
 
-    # ETL считает в млн RUB, в файл суммы уходят в REPORT_UNIT.
-    to_unit = 1.0 / MLN_IN_UNIT[REPORT_UNIT]
+    # ETL считает в млн RUB, в файл суммы уходят в единице из настройки
+    # «Округление» (по умолчанию REPORT_UNIT).
+    unit = report_unit()
+    schema = _localized(SCHEMA, unit)
+    formats = _number_formats()
+    fmt_amt, fmt_pct, fmt_dur = formats["amount"], formats["pct"], formats["dur"]
+    to_unit = 1.0 / MLN_IN_UNIT[unit]
     dim_rows = _frame_rows(order_for_views(data.dim_portfolio), DIM_COLUMNS)
     lim_rows = _frame_rows(rescale_amounts(data.fact_limit, "fact_limit", to_unit), LIMIT_COLUMNS)
     td_rows = _frame_rows(rescale_amounts(data.fact_type_daily, "fact_type_daily", to_unit),
@@ -424,36 +473,36 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     notes = _portfolio_notes(data)
 
     wb = Workbook()
-    _write_readme(wb, data, generated_at)
+    _write_readme(wb, data, generated_at, unit)
     _write_lists(wb)
 
     ws_dim = _write_table(
-        wb, "dim_portfolio", SCHEMA["dim_portfolio"], dim_rows, "manual", "tbl_dim_portfolio",
+        wb, "dim_portfolio", schema["dim_portfolio"], dim_rows, "manual", "tbl_dim_portfolio",
         widths={"portfolio_code": 18, "portfolio_name": 38, "portfolio_type": 16,
                 "include_in_total": 17, "is_limit_controlled": 19})
 
     ws_lim = _write_table(
-        wb, "fact_limit", SCHEMA["fact_limit"], lim_rows, "manual", "tbl_fact_limit",
+        wb, "fact_limit", schema["fact_limit"], lim_rows, "manual", "tbl_fact_limit",
         widths={"portfolio_type": 18, "limit_amount": 20, "green_max_util": 17,
                 "yellow_max_util": 17, "red_max_util": 17, "updated_by": 20,
                 "valid_from": 14, "limit_remaining": 22},
-        formats={"limit_amount": FMT_AMT, "green_max_util": FMT_AMT,
-                 "yellow_max_util": FMT_AMT, "red_max_util": FMT_AMT,
-                 "limit_remaining": FMT_AMT})
+        formats={"limit_amount": fmt_amt, "green_max_util": fmt_amt,
+                 "yellow_max_util": fmt_amt, "red_max_util": fmt_amt,
+                 "limit_remaining": fmt_amt})
 
     ws_td = _write_table(
-        wb, "fact_type_daily", SCHEMA["fact_type_daily"], td_rows, "machine", "tbl_fact_type_daily",
+        wb, "fact_type_daily", schema["fact_type_daily"], td_rows, "machine", "tbl_fact_type_daily",
         widths={"business_date": 14, "portfolio_type": 16, "volume_amount": 18},
-        formats={"volume_amount": FMT_AMT})
+        formats={"volume_amount": fmt_amt})
 
     ws_sn = _write_table(
-        wb, "fact_portfolio_snapshot", SCHEMA["fact_portfolio_snapshot"], sn_rows, "machine",
+        wb, "fact_portfolio_snapshot", schema["fact_portfolio_snapshot"], sn_rows, "machine",
         "tbl_fact_portfolio_snapshot",
         widths={"business_date": 14, "portfolio_code": 18, "volume_t0": 16,
                 "volume_t7": 16, "duration_current_yrs": 19,
                 "duration_target_yrs": 19, "note_text": 60},
-        formats={"volume_t0": FMT_AMT, "volume_t7": FMT_AMT,
-                 "duration_current_yrs": FMT_DUR, "duration_target_yrs": FMT_DUR})
+        formats={"volume_t0": fmt_amt, "volume_t7": fmt_amt,
+                 "duration_current_yrs": fmt_dur, "duration_target_yrs": fmt_dur})
     for row in ws_sn.iter_rows(min_row=2, min_col=7, max_col=7):
         for c in row:
             c.alignment = Alignment(wrap_text=True, vertical="top")
@@ -468,7 +517,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     wb.defined_names.add(DefinedName("BUSINESS_DATE", attr_text="view_monitor!$B$3"))
     wb.defined_names.add(DefinedName("LOOKBACK_DAYS", attr_text="view_monitor!$D$3"))
     # Метка единиц: по ней следующий запуск понимает, в чём записаны суммы.
-    wb.defined_names.add(DefinedName(AMOUNT_UNIT_NAME, attr_text='"%s"' % REPORT_UNIT))
+    wb.defined_names.add(DefinedName(AMOUNT_UNIT_NAME, attr_text='"%s"' % unit))
 
     # ── валидация ────────────────────────────────────────────────────────────
     _dv(ws_dim, "C2:C%d" % SNAPROW, type="list", formula1="=PORTFOLIO_TYPES",
@@ -524,7 +573,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     ws["A1"] = "Мониторинг портфелей"
     ws["A1"].font = F_TITLE
     ws["A2"] = ("Срез по детальным портфелям из fact_portfolio_snapshot. Суммы в %s. "
-                "Светофор — на листе view_by_type: лимит установлен на тип, а не на портфель." % UNIT)
+                "Светофор — на листе view_by_type: лимит установлен на тип, а не на портфель." % unit)
     ws["A2"].font = F_SUB
     ws["A3"] = "Отчётная дата:"
     ws["A3"].font = F_BOLD
@@ -594,8 +643,8 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             cc.value = formula
             cc.font = F_LINK if col in ("A", "B", "C") else F_CALC
             cc.border = BORDER
-        for col, fmt in (("D", FMT_AMT), ("E", FMT_AMT), ("F", FMT_AMT), ("G", FMT_PCT),
-                         ("H", FMT_DUR), ("I", FMT_DUR), ("J", FMT_DUR), ("K", FMT_AMT)):
+        for col, fmt in (("D", fmt_amt), ("E", fmt_amt), ("F", fmt_amt), ("G", fmt_pct),
+                         ("H", fmt_dur), ("I", fmt_dur), ("J", fmt_dur), ("K", fmt_amt)):
             ws["%s%d" % (col, r)].number_format = fmt
         # Комментарий — не формула, а ручной ввод: значение из прошлого выпуска,
         # ячейка открыта для правки на защищённом листе.
@@ -637,12 +686,22 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         c.border = BORDER
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[1].height = 32
-    raw_formats = {4: FMT_AMT, 5: FMT_AMT, 6: FMT_AMT, 7: FMT_PCT,
-                   8: FMT_DUR, 9: FMT_DUR, 10: FMT_DUR, 11: FMT_AMT}
+    raw_formats = {4: fmt_amt, 5: fmt_amt, 6: fmt_amt, 7: fmt_pct,
+                   8: fmt_dur, 9: fmt_dur, 10: fmt_dur, 11: fmt_amt}
     # Разность сумм в млрд даёт хвосты вида 0.5999999999999979. В Excel их прячет
     # формат, а в базу они уехали бы как есть. 9 знаков в млрд — точность до
     # рубля, 12 знаков у доли — заведомо точнее любого отображения.
-    raw_round = {4: 9, 5: 9, 6: 9, 7: 12, 11: 9}
+    # Единица и знаки — из настройки «Округление»: по умолчанию до рубля в
+    # единице книги и 12 знаков у доли; дюрации — как есть.
+    amount_digits = rounding.rule("portfolio_dynamics", "xlsx_amounts").decimals
+    if amount_digits is None:
+        amount_digits = UNIT_DIGITS[unit]
+    pct_digits = rounding.rule("portfolio_dynamics", "xlsx_percent").decimals
+    dur_digits = rounding.rule("portfolio_dynamics", "xlsx_duration").decimals
+    raw_round = {4: amount_digits, 5: amount_digits, 6: amount_digits,
+                 7: 12 if pct_digits is None else pct_digits + 2, 11: amount_digits}
+    if dur_digits is not None:
+        raw_round.update({8: dur_digits, 9: dur_digits, 10: dur_digits})
     for i, values in enumerate(view_monitor_values(dim_rows, sn_rows, lim_rows, notes)):
         for j, v in enumerate(values, start=1):
             if j in raw_round and isinstance(v, float):
@@ -728,9 +787,9 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             cc.value = v
             cc.font = F_LINK if col == "A" else F_CALC
             cc.border = BORDER
-        for col, fmt in (("D", FMT_AMT), ("E", FMT_AMT), ("F", FMT_AMT), ("G", FMT_PCT),
-                         ("H", FMT_AMT), ("I", FMT_PCT3), ("J", FMT_AMT), ("K", FMT_PCT),
-                         ("M", FMT_AMT)):
+        for col, fmt in (("D", fmt_amt), ("E", fmt_amt), ("F", fmt_amt), ("G", fmt_pct),
+                         ("H", fmt_amt), ("I", FMT_PCT3), ("J", fmt_amt), ("K", fmt_pct),
+                         ("M", fmt_amt)):
             ws["%s%d" % (col, r)].number_format = fmt
         ws["B%d" % r].alignment = Alignment(horizontal="center")
         ws["L%d" % r].alignment = Alignment(horizontal="center")
@@ -758,8 +817,8 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         cc.font = F_BOLD
         cc.fill = FILL_TOTAL
         cc.border = BORDER
-    for col, fmt in (("D", FMT_AMT), ("E", FMT_AMT), ("F", FMT_AMT), ("G", FMT_PCT),
-                     ("H", FMT_AMT), ("I", FMT_PCT3), ("J", FMT_AMT), ("K", FMT_PCT), ("M", FMT_AMT)):
+    for col, fmt in (("D", fmt_amt), ("E", fmt_amt), ("F", fmt_amt), ("G", fmt_pct),
+                     ("H", fmt_amt), ("I", FMT_PCT3), ("J", fmt_amt), ("K", fmt_pct), ("M", fmt_amt)):
         ws["%s%d" % (col, TOT)].number_format = fmt
     ws["A%d" % TOT].comment = Comment(
         "Итог считается по типам, у которых есть хотя бы один портфель с include_in_total = TRUE "
@@ -905,7 +964,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         c.border = BORDER
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     r = 2
-    for tname, cols in SCHEMA.items():
+    for tname, cols in schema.items():
         owner = "пайплайн" if TABLE_KIND[tname] == "machine" else "казначейство"
         for name, ru, typ, req, rule, desc in cols:
             own = "казначейство (на view_monitor)" if name == "note_text" else owner

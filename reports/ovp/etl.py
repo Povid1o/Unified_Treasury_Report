@@ -13,7 +13,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
-from common import excel_io  # noqa: E402
+from common import excel_io, rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("ovp")
@@ -420,7 +420,7 @@ def _convert_sheet_matrices(
             sheet_name,
             ", ".join(result["currency"].drop_duplicates()),
         )
-        return result
+        return _apply_rounding(result)
 
     available = [
         sheet_name for sheet_name, _df in sheet_matrices
@@ -468,7 +468,16 @@ def _convert_sheet_matrices(
     if not all_rows:
         raise OvpDataError("Не найдено подходящих данных ни на одном листе.")
 
-    return pd.DataFrame(all_rows, columns=OUT_COLUMNS)
+    return _apply_rounding(pd.DataFrame(all_rows, columns=OUT_COLUMNS))
+
+
+def _apply_rounding(df: pd.DataFrame) -> pd.DataFrame:
+    """Настройка «Округление»: колонка по умолчанию не трогается вовсе."""
+    for column in ("curr_balance", "reserve_msfo"):
+        rule = rounding.rule("ovp", column)
+        if not rule.is_default:
+            df[column] = df[column].map(rule.apply)
+    return df
 
 
 def save_report(df: pd.DataFrame, output_path: Path) -> Path:

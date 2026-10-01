@@ -17,6 +17,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
+from common import rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("transfert_stavka")
@@ -169,6 +170,10 @@ def build_report(short_path: Path, long_path: Path) -> pd.DataFrame:
     result = pd.concat([long_df, short_df], ignore_index=True)[OUT_COLUMNS]
     if result.empty:
         raise TransfertStavkaError("Итоговый DataFrame пуст — не найдено ни одной строки данных.")
+
+    rule = rounding.rule("transfert", "rate")
+    if not rule.is_default:  # по умолчанию колонка не трогается вовсе
+        result["fvalue"] = result["fvalue"].map(rule.apply)
 
     logger.info("Итоговый DataFrame: %d строк", len(result))
     return result

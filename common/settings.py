@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
+from common import rounding
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 
 # Путь к файлу настроек можно переопределить переменной окружения — это нужно
@@ -60,6 +62,7 @@ KIND_HINTS = {
     "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
     "durations": "пары «код портфеля=дюрация, лет» через запятую; пусто — ничего не задано",
     "portfolios": "список портфелей (код, название, тип, объём); правится своим экраном",
+    "rounding": "единица и знаки после запятой по каждому показателю; правится своим экраном",
 }
 
 # Поля записи дополнительного портфеля (kind="portfolios").
@@ -489,6 +492,21 @@ SETTINGS: List[Setting] = [
     ),
 ]
 
+# ── Округление: по пункту в каждом разделе отчёта ────────────────────────────
+# Пустое значение — прежний вывод отчёта без единого изменения (см.
+# common/rounding.py), поэтому по умолчанию настройки пустые.
+ROUNDING_SUFFIX = "_rounding"
+SETTINGS += [
+    Setting(
+        key=group + ROUNDING_SUFFIX, label="Округление", kind="rounding", group=group,
+        default={},
+        help="Единица и число знаков после запятой по каждому показателю отчёта. "
+             "По умолчанию — как сейчас: выгрузка не меняется ни в одном знаке. "
+             "Правится своим экраном: номер показателя -> единица -> знаки.",
+    )
+    for group in rounding.CATALOG
+]
+
 SETTINGS_BY_KEY: Dict[str, Setting] = {s.key: s for s in SETTINGS}
 SETTINGS_BY_GROUP: Dict[str, List[Setting]] = {
     g.key: [s for s in SETTINGS if s.group == g.key] for g in GROUPS
@@ -538,6 +556,12 @@ def parse_value(setting: Setting, raw: Any) -> Any:
 
     if setting.kind == "portfolios":
         return _parse_portfolios(setting, raw)
+
+    if setting.kind == "rounding":
+        try:
+            return rounding.parse(setting.group, raw, setting.key)
+        except rounding.RoundingError as exc:
+            raise SettingsError(str(exc)) from exc
 
     if setting.kind == "pairs":
         text = str(text).strip()

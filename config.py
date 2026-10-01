@@ -90,6 +90,9 @@ PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
 
 PORTFOLIO_REPORT_OUTPUT_DIR: Path
 
+# Раздел настроек -> {показатель: {"scale", "decimals"}}; пусто — как сейчас.
+ROUNDING: dict
+
 
 def _apply_settings() -> None:
     """Пересобирает константы модуля из текущих значений настроек."""
@@ -231,6 +234,13 @@ def _apply_settings() -> None:
     # Источник общий с «Динамикой портфелей» (та же выгрузка «Позиция за
     # период»), своя только папка результатов.
     g["PORTFOLIO_REPORT_OUTPUT_DIR"] = v["portfolio_report_output_dir"]
+
+    # ── Округление ───────────────────────────────────────────────────────────
+    # Читается через common/rounding.rule(отчёт, показатель).
+    g["ROUNDING"] = {
+        key[:-len(_settings.ROUNDING_SUFFIX)]: v[key]
+        for key in v if key.endswith(_settings.ROUNDING_SUFFIX)
+    }
 
 
 def reload() -> None:

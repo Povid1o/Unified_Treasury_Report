@@ -15,7 +15,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
-from common import excel_io  # noqa: E402
+from common import excel_io, rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("balance_struct")
@@ -367,7 +367,12 @@ def enrich_df(parsed_df: pd.DataFrame, precision: int = 3) -> pd.DataFrame:
         df = df[~unmapped_mask].copy()
 
     df["date_"] = df["date_"].dt.strftime("%Y-%m-%d")
-    df["value"] = df["value"].apply(lambda x: smart_round(x, precision))
+    rule = rounding.rule("balance_struct", "value")
+    if rule.is_default:
+        df["value"] = df["value"].apply(lambda x: smart_round(x, precision))
+    else:
+        df["value"] = df["value"].apply(
+            lambda x: rule.apply(x, current=lambda v: smart_round(v, precision)))
     df["axis_0"] = "План фондирования"
 
     return df[["date_", "axis_0", "axis_1", "axis_2", "axis_3", "value", "axis_4", "nversionid"]]

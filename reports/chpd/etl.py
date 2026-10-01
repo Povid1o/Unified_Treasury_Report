@@ -13,7 +13,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
-from common import excel_io  # noqa: E402
+from common import excel_io, rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("chpd")
@@ -146,6 +146,9 @@ def build_long(df: pd.DataFrame, brief: bool = False) -> pd.DataFrame:
     rows: List[dict] = []
     active_context: List[Optional[str]] = [None, None, None, None]
     unresolved: List[str] = []
+    volume_rule = rounding.rule("chpd", "volume")
+    share_rule = rounding.rule("chpd", "share")
+    volume_unit = volume_rule.label("млрд руб")
 
     for idx, raw_leaf in enumerate(df.index):
         leaf_name = str(raw_leaf).strip()
@@ -195,14 +198,14 @@ def build_long(df: pd.DataFrame, brief: bool = False) -> pd.DataFrame:
                 date_formatted = base_date_str
 
             if vol_value is not None and isinstance(vol_value, (int, float)):
-                vol_value = int(round(vol_value))
+                vol_value = volume_rule.apply(vol_value, current=lambda v: int(round(v)))
             if perc_value is not None and isinstance(perc_value, (int, float)):
-                perc_value = int(round(perc_value * 100))
+                perc_value = share_rule.apply(perc_value * 100, current=lambda v: int(round(v)))
 
             rows.append({
                 "id": len(rows), "date_": date_formatted, "axis_0": "ЧПД",
                 "axis_1": ax1, "axis_2": ax2, "axis_3": ax3, "axis_4": ax4_val,
-                "value": vol_value, "nversionid": "", "axis_5": "млрд руб",
+                "value": vol_value, "nversionid": "", "axis_5": volume_unit,
             })
 
             if perc_value is not None:
@@ -218,7 +221,9 @@ def build_long(df: pd.DataFrame, brief: bool = False) -> pd.DataFrame:
             len(unresolved), unresolved,
         )
 
-    return pd.DataFrame(rows, columns=OUT_COLUMNS)
+    if volume_rule.is_default and share_rule.is_default:
+        return pd.DataFrame(rows, columns=OUT_COLUMNS)
+    return rounding.frame_with_values(rows, OUT_COLUMNS)
 
 
 def build_report(file_path: Path) -> pd.DataFrame:

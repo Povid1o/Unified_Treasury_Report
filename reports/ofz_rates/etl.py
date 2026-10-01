@@ -20,6 +20,7 @@ import config  # noqa: E402
 load_dotenv(config.CBONDS_ENV_PATH)
 
 from CBonds_API.cbonds_api_test import AVAILABLE_INDICES, CBondsAPI  # noqa: E402
+from common import rounding  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("ofz_rates")
@@ -114,6 +115,7 @@ def fetch_yield_curve_group(
     более узкого get_yield_curve, у которого нет параметров date_from/date_to.
     """
     rows = []
+    yield_rule = rounding.rule("ofz", "yield")
     for tenor in OFZ_YIELD_TENORS:
         index_key = f"RUB_Yield_Curve_{tenor}"
 
@@ -147,7 +149,8 @@ def fetch_yield_curve_group(
                     "name_st": tenor,
                     "unit": "%",
                     "type_val": "Значение",
-                    "fvalue": round(float(item["value"]), 2),
+                    "fvalue": yield_rule.apply(float(item["value"]),
+                                               current=lambda v: round(v, 2)),
                 }
             )
 

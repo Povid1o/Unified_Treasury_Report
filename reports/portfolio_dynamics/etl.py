@@ -67,7 +67,11 @@ SNAPSHOT_COLUMNS = [
 # чтении предыдущего выпуска суммы возвращаются в млн — иначе перенесённая
 # история и лимиты разошлись бы со свежими данными в тысячу раз. У выпусков,
 # сделанных до появления метки, её нет: они в млн RUB.
-MLN_IN_UNIT = {"млн RUB": 1.0, "млрд RUB": 1000.0}
+# Единицу сумм xlsx можно сменить настройкой «Округление» -> «xlsx: все суммы»
+# (см. report_unit); REPORT_UNIT — единица по умолчанию. Метка AMOUNT_UNIT
+# пишется в книгу всегда, поэтому выпуск в любой из этих единиц читается
+# следующим запуском правильно.
+MLN_IN_UNIT = {"RUB": 0.000001, "тыс. RUB": 0.001, "млн RUB": 1.0, "млрд RUB": 1000.0}
 REPORT_UNIT = "млрд RUB"
 LEGACY_UNIT = "млн RUB"
 AMOUNT_UNIT_NAME = "AMOUNT_UNIT"
@@ -77,6 +81,12 @@ AMOUNT_COLUMNS = {
     "fact_type_daily": ["volume_amount"],
     "fact_portfolio_snapshot": ["volume_t0", "volume_t7"],
 }
+
+
+def report_unit() -> str:
+    """Единица сумм в xlsx по текущим настройкам; по умолчанию REPORT_UNIT."""
+    from common import rounding
+    return rounding.rule("portfolio_dynamics", "xlsx_amounts").label(REPORT_UNIT)
 
 
 def rescale_amounts(frame: pd.DataFrame, table: str, factor: float) -> pd.DataFrame:
@@ -770,9 +780,9 @@ def load_previous_release(path: Path) -> PreviousRelease:
     limit = rescale_amounts(limit, "fact_limit", factor)
     history = rescale_amounts(history, "fact_type_daily", factor)
     snapshot = rescale_amounts(snapshot, "fact_portfolio_snapshot", factor)
-    if unit != REPORT_UNIT:
+    if unit != report_unit():
         logger.info("Предыдущий выпуск %s записан в %s — суммы пересчитаны, в новом "
-                    "выпуске они будут в %s.", path.name, unit, REPORT_UNIT)
+                    "выпуске они будут в %s.", path.name, unit, report_unit())
 
     # Комментарии пишутся на view_monitor; у выпусков без этой колонки они
     # лежат только в note_text среза. Позиции строк витрины совпадают со
