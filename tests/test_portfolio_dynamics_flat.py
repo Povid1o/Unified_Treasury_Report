@@ -72,6 +72,13 @@ class DailyFlatTests(unittest.TestCase):
         self.assertAlmostEqual(self._type("AFS", flat.M_TYPE_VOLUME), 55.0)
         self.assertAlmostEqual(self._type("HTM", flat.M_TYPE_LIMIT), 300.0)
 
+    def test_limit_utilisation_per_type(self):
+        """Утилизация = лимит минус остаток; у HTM остатка нет — нет и строки."""
+        self.assertAlmostEqual(self._type("AFS", flat.M_TYPE_UTIL), 55.0)
+        utilisation = self.frame[self.frame["axis_3"] == flat.M_TYPE_UTIL]
+        self.assertEqual(list(utilisation["axis_1"]), ["AFS"])
+        self.assertEqual(set(utilisation["axis_2"]), {""})
+
     def _type(self, portfolio_type, metric):
         rows = self.frame[(self.frame["axis_1"] == portfolio_type) & (self.frame["axis_2"] == "")
                           & (self.frame["axis_3"] == metric)]

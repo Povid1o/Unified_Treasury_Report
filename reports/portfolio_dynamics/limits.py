@@ -34,7 +34,8 @@ import config  # noqa: E402
 from common import excel_io  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
     KNOWN_PORTFOLIO_TYPES, LIMIT_COLUMNS, PROBE_SUFFIXES, PortfolioDynamicsError,
-    canonical_type, logger, parse_number, parse_nested_limits, parse_type_parents,
+    canonical_type, logger, parse_number, parse_nested_limits, parse_nested_remaining,
+    parse_type_parents,
 )
 
 COL_LIMIT_TYPE = "Тип лимита"
@@ -341,25 +342,76 @@ def zones_for(portfolio_type: str, limit_amount: float) -> Tuple[float, float, f
     return tuple(round(limit_amount * p, 2) for p in percents)
 
 
-def _remaining_for(portfolio_type: str, limit_amount: float,
-                   limits_as_in_file: Dict[str, float],
-                   remaining_by_type: Dict[str, Optional[float]],
-                   split_types: List[str]) -> Optional[float]:
-    """Остаток лимита для строки fact_limit. None — записывать нечего.
+def _split_remaining(from_file: Dict[str, Optional[float]]) -> Tuple[Dict[str, Optional[float]], List[str]]:
+    """Делит совокупный остаток лимита так же, как _split_nested делит лимит.
 
-    Остаток пишется, только когда записанный лимит совпал с тем, что стоит в
-    файле. Если лимит поделён на подлимиты («Сколько отдано вложенным типам»),
-    остаток из файла относится к СОВОКУПНОМУ лимиту, и рядом с долей от него
-    он означал бы неправду — а неправда в колонке хуже пустой колонки.
+    «Остаток лимита сверху» в выгрузке относится к СОВОКУПНОМУ лимиту HTM —
+    тому, что покрывает и HTM, и HTM_KUAP. Если лимит поделён на подлимиты,
+    остаток надо поделить так же: часть вложенного типа задаётся настройкой
+    «Остаток лимита у вложенных типов» (HTM_KUAP=30), объемлющему достаётся
+    остальное: 200 - 30 = 170.
+
+    Остаток вложенного типа не задан — не пишется ни его остаток, ни остаток
+    объемлющего: совокупный остаток рядом с долей лимита означал бы неправду,
+    а неправда в колонке хуже пустой колонки.
+
+    Возвращает остатки по типам и типы, остаток которых записать не удалось.
     """
-    remaining = remaining_by_type.get(portfolio_type)
-    if remaining is None or pd.isna(remaining):
-        return None
-    in_file = limits_as_in_file.get(portfolio_type)
-    if in_file is None or round(in_file, 2) != round(limit_amount, 2):
-        split_types.append(portfolio_type)
-        return None
-    return round(float(remaining), 2)
+    result = {t: None if v is None or pd.isna(v) else float(v) for t, v in from_file.items()}
+    allocations = parse_nested_limits()
+    given = parse_nested_remaining()
+    for child in sorted(set(given) - set(allocations)):
+        logger.warning(
+            "Остаток %s=%s задан, но подлимит для %s не выделен (настройка «Сколько "
+            "отдано вложенным типам») — остаток из настроек не используется.",
+            child, f"{given[child]:,.0f}", child,
+        )
+    if not allocations:
+        return result, []
+
+    parents = parse_type_parents()
+    unresolved: List[str] = []
+    for child, allocated in allocations.items():
+        child_remaining = given.get(child)
+        # Лимит вложенного типа задан настройкой, поэтому и остаток — только
+        # оттуда: строка этого типа в файле относится к другому лимиту.
+        result[child] = child_remaining
+        if child_remaining is not None and child_remaining > allocated:
+            logger.warning(
+                "Остаток %s = %s больше его подлимита %s — проверьте настройку "
+                "«Остаток лимита у вложенных типов».",
+                child, f"{child_remaining:,.0f}", f"{allocated:,.0f}",
+            )
+
+        parent = parents.get(child)
+        if parent is None:
+            continue
+        total = result.get(parent)
+        if child_remaining is None:
+            if total is not None:
+                unresolved += [parent, child]
+            result[parent] = None
+            continue
+        if total is None:
+            continue
+
+        result[parent] = total - child_remaining
+        logger.info(
+            "Совокупный остаток лимита %s = %s разделён: %s -> %s, остальной %s -> %s.",
+            parent, f"{total:,.0f}", child, f"{child_remaining:,.0f}",
+            parent, f"{total - child_remaining:,.0f}",
+        )
+        if total - child_remaining < 0:
+            logger.warning(
+                "Остаток лимита %s после вычета остатка %s отрицательный (%s) — "
+                "остаток вложенного типа в настройках больше совокупного по файлу.",
+                parent, child, f"{total - child_remaining:,.0f}",
+            )
+    return result, unresolved
+
+
+def _rounded(value: Optional[float]) -> Optional[float]:
+    return None if value is None else round(float(value), 2)
 
 
 def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
@@ -386,14 +438,13 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
     from_file = {canonical_type(row.portfolio_type): float(row.limit_amount)
                  for row in parsed.itertuples()}
     # Остаток приходит той же строкой файла и относится к ТОМУ ЖЕ лимиту, что
-    # в ней указан. Запоминаем и лимит до дележа на подлимиты: после него
-    # остаток к записанной сумме уже не относится (см. ниже).
+    # в ней указан. Лимит делится на подлимиты — остаток делится вместе с ним.
     remaining_by_type = {}
     if "remaining_amount" in parsed.columns:
         remaining_by_type = {canonical_type(row.portfolio_type): row.remaining_amount
                              for row in parsed.itertuples()}
-    limits_as_in_file = dict(from_file)
     from_file = _split_nested(from_file, recognised)
+    remaining_by_type, split_types = _split_remaining(remaining_by_type)
     matched = {t: v for t, v in from_file.items() if t in recognised}
     ignored = sorted(set(from_file) - set(matched))
     if ignored:
@@ -414,7 +465,6 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
     types_in_report = sorted(set(matched) | known_upper | set(previous_by_type))
 
     records = []
-    split_types = []
     for portfolio_type in types_in_report:
         if portfolio_type in matched:
             limit_amount = matched[portfolio_type]
@@ -423,9 +473,7 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
                 "portfolio_type": portfolio_type, "limit_amount": round(limit_amount, 2),
                 "green_max_util": green, "yellow_max_util": yellow, "red_max_util": red,
                 "valid_from": business_date, "updated_by": source_name,
-                "limit_remaining": _remaining_for(
-                    portfolio_type, limit_amount, limits_as_in_file,
-                    remaining_by_type, split_types),
+                "limit_remaining": _rounded(remaining_by_type.get(portfolio_type)),
             })
             continue
 
@@ -440,11 +488,13 @@ def build_fact_limit(parsed: pd.DataFrame, known_types: List[str],
             "valid_from": business_date, "updated_by": None, "limit_remaining": None,
         })
 
+    split_types = [t for t in split_types if t in matched]
     if split_types:
         logger.info(
             "Лимиты: «%s» не записан для типов %s — их лимит поделён на подлимиты, "
-            "а остаток в файле указан к совокупному лимиту и к записанной сумме "
-            "больше не относится.", COL_LIMIT_REMAINING, ", ".join(split_types),
+            "а остаток в файле указан к совокупному лимиту. Чтобы поделить и его, "
+            "задайте остаток вложенного типа в настройке «Остаток лимита у "
+            "вложенных типов».", COL_LIMIT_REMAINING, ", ".join(split_types),
         )
 
     missing = sorted(t for t in types_in_report if t not in matched)

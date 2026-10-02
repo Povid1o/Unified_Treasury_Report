@@ -30,8 +30,10 @@ CSV был несколько дней назад — пропущенные д�
 это дало бы ложный прирост на весь объём T0. Пустых значений здесь нет
 вовсе — строка без значения не пишется.
 
-Лимит типа пишется одной строкой на тип, а не в каждой строке портфеля, как
-на view_monitor: иначе сумма в BI умножила бы лимит на число портфелей.
+Лимит типа и его утилизация (лимит минус «Остаток лимита сверху») пишутся
+одной строкой на тип, а не в каждой строке портфеля, как на view_monitor:
+иначе сумма в BI умножила бы лимит на число портфелей. Остатка нет —
+нет и строки утилизации.
 Объём HTM в fact_type_daily уже включает HTM_KUAP — складывать «Объём типа»
 по всем типам нельзя.
 
@@ -78,6 +80,7 @@ M_NOTE = "Комментарий"
 # Показатели уровня типа.
 M_TYPE_VOLUME = "Объём типа"
 M_TYPE_LIMIT = "Лимит типа"
+M_TYPE_UTIL = "Утилизация лимита типа"
 
 # Базовая единица сумм CSV — та, в которой показатели flat_* описаны в
 # common/rounding.py. Не REPORT_UNIT: единица xlsx настраивается отдельно.
@@ -280,8 +283,14 @@ def to_flat(data: PortfolioDynamicsData, history_from: Optional[dt.date] = None)
             portfolio_type = _cell_value(record["portfolio_type"])
             if portfolio_type is not None:
                 rule = rules["flat_type_limit"]
+                limit = _number(record["limit_amount"])
                 rows.add(day, str(portfolio_type), None, M_TYPE_LIMIT, rule.label(U_AMOUNT),
-                         _to_unit(_number(record["limit_amount"]), rule))
+                         _to_unit(limit, rule))
+                remaining = _number(record.get("limit_remaining"))
+                if limit is not None and remaining is not None:
+                    rule = rules["flat_type_utilisation"]
+                    rows.add(day, str(portfolio_type), None, M_TYPE_UTIL, rule.label(U_AMOUNT),
+                             _to_unit(limit - remaining, rule))
 
     _type_volumes(data.fact_type_daily, rows, lambda d: first <= d <= day)
     return rows.frame(rules.values())

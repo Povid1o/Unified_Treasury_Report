@@ -401,6 +401,12 @@ def _print_limits(downloads: Path, data_dir: Path) -> None:
     ui.console.print("  [grey50]выделено вложенным: %s[/grey50]"
                      % (allocated or "не задано (объём вложенного типа "
                                      "складывается с объемлющим)"))
+    if allocations:
+        remaining = ", ".join("{} = {:,.0f}".format(name, value)
+                              for name, value in etl.parse_nested_remaining().items())
+        ui.console.print("  [grey50]остаток лимита у вложенных: %s[/grey50]"
+                         % (remaining or "не задан (остаток поделённого лимита "
+                                         "не пишется)"))
 
 
 def _print_loose_files(source: file_discovery.SourceConfig, data_dir: Path) -> None:

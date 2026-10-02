@@ -135,6 +135,8 @@ CATALOG: Dict[str, List[Category]] = {
         _c("flat_type_volume", "CSV: Объём типа (и разовая история)", "9 знаков (до рубля)",
            **_DYNAMICS_CSV_MONEY),
         _c("flat_type_limit", "CSV: Лимит типа", "9 знаков (до рубля)", **_DYNAMICS_CSV_MONEY),
+        _c("flat_type_utilisation", "CSV: Утилизация лимита типа", "9 знаков (до рубля)",
+           **_DYNAMICS_CSV_MONEY),
         _c("xlsx_amounts", "xlsx: все суммы", "2 знака в отображении", MONEY, base=9,
            unit="млрд RUB", currency="RUB",
            note="единица одна на всю книгу (формулы сравнивают лимиты с объёмами); "

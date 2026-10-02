@@ -251,8 +251,8 @@ class RawMonitorTests(WorkbookFormulaTestCase):
         self.assertEqual([c.value for c in self.raw[1]], [
             "Код", "Портфель", "Тип", "Объём T0", "Объём T-7", "Изменение объёма",
             "Изменение объёма, %", "Дюрация тек.", "Дюрация-КУАП", "Изменение дюрации",
-            "Лимит типа", "Комментарий"])
-        self.assertEqual(self.raw.max_column, 12)
+            "Лимит типа", "Утилизация лимита типа", "Комментарий"])
+        self.assertEqual(self.raw.max_column, 13)
         self.assertEqual(self.raw.max_row, 1 + len(self.data.dim_portfolio))
 
     def test_header_has_no_delta_symbol(self):
@@ -283,7 +283,7 @@ class RawMonitorTests(WorkbookFormulaTestCase):
         self.assertEqual(ordered, ["HTM_1", "KUAP", "AFS_1", "AFS_2", "TSS_1", "X_OTHER", "NO_TYPE"])
 
     def test_values(self):
-        rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:12]] for r in range(2, 6)}
+        rows = {self.raw[f"A{r}"].value: [c.value for c in self.raw[r][:13]] for r in range(2, 6)}
         ofz = rows["AFS_OFZ"]
         self.assertEqual(ofz[:3], ["AFS_OFZ", "ОФЗ, AFS", "AFS"])
         for got, expected in zip(ofz[3:7], [30, 29.4, 0.6, 30_000 / 29_400 - 1]):  # млрд
@@ -292,11 +292,14 @@ class RawMonitorTests(WorkbookFormulaTestCase):
         self.assertEqual(ofz[5], 0.6)
         self.assertEqual(ofz[7:10], [3.0, 2.5, 0.5])
         self.assertAlmostEqual(ofz[10], 100, places=9)
-        self.assertEqual(ofz[11], "Заметка AFS_OFZ")
+        self.assertAlmostEqual(ofz[11], 55, places=9)  # утилизация: 100 - остаток 45
+        self.assertEqual(ofz[12], "Заметка AFS_OFZ")
         # Без дюрации по КУАП — пустые ячейки, а не 0 и не "".
         alco = rows["HTM_ALCO"]
         self.assertEqual(alco[7:10], [3.0, None, None])
         self.assertAlmostEqual(alco[10], 300, places=9)
+        # У HTM остатка нет — утилизация пустая, а не весь лимит.
+        self.assertIsNone(alco[11])
 
 
 @unittest.skipUnless(HAS_FORMULAS, "нужен пакет formulas: pip install formulas")
@@ -369,7 +372,8 @@ class EvaluationTests(WorkbookFormulaTestCase):
         self.assertAlmostEqual(self.value("view_monitor", "G8"), 30_000 / 29_400 - 1, places=6)
         self.assertAlmostEqual(self.value("view_monitor", "J8"), 0.5, places=6)  # гэп дюрации
         self.assertAlmostEqual(self.value("view_monitor", "K8"), 100, places=9)  # лимит типа
-        self.assertEqual(self.value("view_monitor", "L8"), "Заметка AFS_OFZ")    # комментарий
+        self.assertAlmostEqual(self.value("view_monitor", "L8"), 55, places=9)   # утилизация лимита
+        self.assertEqual(self.value("view_monitor", "M8"), "Заметка AFS_OFZ")    # комментарий
 
     def test_view_monitor_follows_type_order(self):
         codes = [self.value("view_monitor", f"A{r}") for r in range(6, 10)]
@@ -388,7 +392,7 @@ class EvaluationTests(WorkbookFormulaTestCase):
         raw = load_workbook(self.path)["view_monitor_raw"]
         mismatches = []
         for r in range(6, 10):
-            for col in "ABCDEFGHIJKL":
+            for col in "ABCDEFGHIJKLM":
                 expected = self.value("view_monitor", f"{col}{r}")
                 expected = None if expected == "" else expected
                 actual = raw[f"{col}{r - 4}"].value  # на raw нет шапки над таблицей

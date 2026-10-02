@@ -135,7 +135,7 @@ SCHEMA = {
         ("red_max_util", "Красная зона, до", "num", "да", "> yellow_max_util, обычно = limit_amount", "Верхняя граница красной зоны, АБСОЛЮТНАЯ сумма в %s. Выше — превышение лимита." % UNIT),
         ("valid_from", "Действует с", "date", "да", "ISO дата", "Дата вступления лимита в силу — аудиторский след."),
         ("updated_by", "Кем изменено", "text", "да", "", "ФИО/логин сотрудника, изменившего строку."),
-        ("limit_remaining", "Остаток лимита сверху", "num", "нет", ">= 0, пусто — не пришло", "Свободный остаток лимита по данным САМОЙ системы лимитов, %s: колонка «Остаток лимита сверху» из выгрузки «Состояние лимитов». Не расчёт отчёта, а вторая, независимая величина — разница limit_amount минус эта колонка должна сходиться с объёмом типа в fact_type_daily. Пусто, если тип не пришёл в файле или лимит был разделён на подлимиты." % UNIT),
+        ("limit_remaining", "Остаток лимита сверху", "num", "нет", ">= 0, пусто — не пришло", "Свободный остаток лимита по данным САМОЙ системы лимитов, %s: колонка «Остаток лимита сверху» из выгрузки «Состояние лимитов». Не расчёт отчёта, а вторая, независимая величина — разница limit_amount минус эта колонка должна сходиться с объёмом типа в fact_type_daily. У поделённого лимита (HTM / HTM_KUAP) остаток делится так же: часть вложенного типа — из настройки «Остаток лимита у вложенных типов», объемлющему — остальное. Пусто, если тип не пришёл в файле или лимит поделён, а остаток вложенного типа не задан." % UNIT),
     ],
     "fact_type_daily": [
         ("business_date", "Дата", "date", "PK", "ISO дата, рабочий день", "Отчётная дата. Вместе с portfolio_type образует составной ключ."),
@@ -294,7 +294,7 @@ def _portfolio_notes(data: PortfolioDynamicsData) -> Dict[str, str]:
 def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
                         lim_rows: List[List[Any]],
                         notes: Optional[Dict[str, str]] = None) -> List[List[Any]]:
-    """Строки view_monitor (колонки A..L) значениями — то, что покажут формулы.
+    """Строки view_monitor (колонки A..M) значениями — то, что покажут формулы.
 
     Повторяет формулы витрины один в один, включая поведение Excel: INDEX по
     пустой ячейке объёма или лимита даёт 0, а "" формулы — пустую ячейку.
@@ -308,8 +308,11 @@ def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
     for row in sn_rows:
         snap.setdefault(_key(row[SNAPSHOT_COLUMNS.index("portfolio_code")]), row)
     limit: Dict[str, Any] = {}
+    remaining: Dict[str, Any] = {}
     for row in lim_rows:
-        limit.setdefault(_key(row[LIMIT_COLUMNS.index("portfolio_type")]), row[LIMIT_COLUMNS.index("limit_amount")])
+        key = _key(row[LIMIT_COLUMNS.index("portfolio_type")])
+        limit.setdefault(key, row[LIMIT_COLUMNS.index("limit_amount")])
+        remaining.setdefault(key, row[LIMIT_COLUMNS.index("limit_remaining")])
 
     def _num(value: Any) -> Any:
         return 0 if value is None else value
@@ -330,8 +333,11 @@ def view_monitor_values(dim_rows: List[List[Any]], sn_rows: List[List[Any]],
         dur_gap = None if dur_cur is None or dur_target is None else dur_cur - dur_target
         key = _key(ptype)
         type_limit = _num(limit[key]) if ptype is not None and key in limit else None
+        # Без остатка утилизация не определена: пусто, а не весь лимит.
+        rest = remaining.get(key) if type_limit is not None else None
+        used = None if rest is None else type_limit - rest
         out.append([code, name, ptype, t0, t7, delta, delta_pct,
-                    dur_cur, dur_target, dur_gap, type_limit,
+                    dur_cur, dur_target, dur_gap, type_limit, used,
                     (notes or {}).get(str(code)) if code is not None else None])
     return out
 
@@ -359,7 +365,7 @@ README_LINES = [
     ("fact_limit — лимиты и границы зон ПО ТИПАМ. Одна строка на тип; этот же лист служит реестром допустимых типов.", None),
     ("fact_type_daily — история объёмов по типам.", None),
     ("fact_portfolio_snapshot — срез по портфелям на отчётную дату.", None),
-    ("view_monitor — витрина по портфелям: объём T0/T-7, дельты, дюрация, лимит типа.", None),
+    ("view_monitor — витрина по портфелям: объём T0/T-7, дельты, дюрация, лимит типа и его утилизация (лимит минус остаток по системе лимитов).", None),
     ("view_monitor_raw — то же, что view_monitor, но значениями без формул: для загрузок, которые не пересчитывают книгу. Строка 1 — названия колонок, со 2-й — данные. Не реагирует на правки B3/D3 в view_monitor.", None),
     ("view_by_type — свод по типам: динамика, утилизация, светофор, сверка с детальным срезом.", None),
     ("checks — автоматические проверки качества. Все строки должны быть OK перед отправкой в BI.", None),
@@ -391,7 +397,7 @@ README_LINES = [
     ("Границы зон в fact_limit заданы АБСОЛЮТНЫМИ суммами: green_max_util < yellow_max_util < red_max_util.", None),
     ("Сравнивается с ними объём ТИПА из fact_type_daily: <= green — зелёная; <= yellow — жёлтая; <= red — красная; выше — ПРЕВЫШЕНИЕ.", None),
     ("Светофор находится на листе view_by_type, потому что лимит и объём типа лежат на одном грейне. В view_monitor колонка «Лимит» показывает лимит типа, к которому относится портфель.", None),
-    ("Колонка limit_remaining в fact_limit — СПРАВОЧНАЯ: это остаток лимита по данным самой системы лимитов. Ни одна формула её не использует; она нужна, чтобы сверить занятое по двум независимым источникам (limit_amount минус остаток должно сходиться с объёмом типа).", None),
+    ("Колонка limit_remaining в fact_limit — остаток лимита по данным самой системы лимитов. Светофор её не использует; из неё считается «Утилизация лимита типа» на view_monitor (limit_amount минус остаток), и эта величина должна сходиться с объёмом типа.", None),
     ("", None),
     ("Правила, которые нельзя нарушать", "h"),
     ("1. Строка 1 каждого листа с данными — технические заголовки snake_case. Их читает код. Не переименовывать, не переставлять, не добавлять строку над ними.", None),
@@ -563,6 +569,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     L_G = "fact_limit!$C$2:$C$%d" % LIMROW
     L_Y = "fact_limit!$D$2:$D$%d" % LIMROW
     L_R = "fact_limit!$E$2:$E$%d" % LIMROW
+    L_REM = "fact_limit!$H$2:$H$%d" % LIMROW  # limit_remaining
     D_CODE = "dim_portfolio!$A$2:$A$%d" % SNAPROW
     D_TYPE = "dim_portfolio!$C$2:$C$%d" % SNAPROW
     D_INC = "dim_portfolio!$D$2:$D$%d" % SNAPROW
@@ -600,7 +607,8 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
                         "убедитесь, что выгрузка использует тот же сдвиг.", "schema v3.0")
 
     VH = ["Код", "Портфель", "Тип", "Объём T0", "Объём T-7", "Δ объёма", "Δ, %",
-          "Дюрация тек.", "Дюрация-КУАП", "Δ дюрации", "Лимит типа", VIEW_COMMENT_HEADER]
+          "Дюрация тек.", "Дюрация-КУАП", "Δ дюрации", "Лимит типа", "Утилизация лимита типа",
+          VIEW_COMMENT_HEADER]
     HR = 5
     for j, h in enumerate(VH, start=1):
         c = ws.cell(row=HR, column=j, value=h)
@@ -613,6 +621,9 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         "Лимит типа, к которому относится портфель. Лимит установлен на суммарный объём типа, "
         "поэтому по отдельному портфелю утилизация не считается — смотрите view_by_type.", "schema v3.0")
     ws.cell(row=HR, column=12).comment = Comment(
+        "Сколько лимита типа уже занято по данным системы лимитов: лимит минус «Остаток "
+        "лимита сверху» (fact_limit). Пусто, если остаток не пришёл.", "schema v3.0")
+    ws.cell(row=HR, column=13).comment = Comment(
         "Пишите комментарий прямо здесь. Следующий запуск отчёта перенесёт его в новый "
         "выпуск, заново вводить не нужно.", "schema v3.0")
 
@@ -637,6 +648,11 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             "I": "=IFERROR(IF(INDEX({v},{m})=\"\",\"\",INDEX({v},{m})),\"\")".format(v=S_DT, m=LK.format(r=r)),
             "J": "=IF(OR($H{r}=\"\",$I{r}=\"\"),\"\",$H{r}-$I{r})".format(r=r),
             "K": "=IFERROR(INDEX({a},MATCH($C{r},{t},0)),\"\")".format(a=L_AMT, t=L_TYPE, r=r),
+            # Остаток не пришёл — пусто: иначе INDEX дал бы 0 и утилизацию,
+            # равную всему лимиту.
+            "L": ("=IFERROR(IF(INDEX({rem},MATCH($C{r},{t},0))=\"\",\"\","
+                  "INDEX({a},MATCH($C{r},{t},0))-INDEX({rem},MATCH($C{r},{t},0))),\"\")"
+                  ).format(a=L_AMT, rem=L_REM, t=L_TYPE, r=r),
         }
         for col, formula in f.items():
             cc = ws["%s%d" % (col, r)]
@@ -644,11 +660,12 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             cc.font = F_LINK if col in ("A", "B", "C") else F_CALC
             cc.border = BORDER
         for col, fmt in (("D", fmt_amt), ("E", fmt_amt), ("F", fmt_amt), ("G", fmt_pct),
-                         ("H", fmt_dur), ("I", fmt_dur), ("J", fmt_dur), ("K", fmt_amt)):
+                         ("H", fmt_dur), ("I", fmt_dur), ("J", fmt_dur), ("K", fmt_amt),
+                         ("L", fmt_amt)):
             ws["%s%d" % (col, r)].number_format = fmt
         # Комментарий — не формула, а ручной ввод: значение из прошлого выпуска,
         # ячейка открыта для правки на защищённом листе.
-        cc = ws["L%d" % r]
+        cc = ws["M%d" % r]
         cc.value = notes.get(str(dim_rows[i][0])) if i < len(dim_rows) else None
         cc.font = F_INPUT
         cc.fill = FILL_INPUTCELL
@@ -657,7 +674,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         cc.protection = Protection(locked=False)
 
     for col, w in {"A": 18, "B": 36, "C": 12, "D": 14, "E": 14, "F": 13, "G": 10,
-                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 60}.items():
+                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 14, "M": 60}.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "C%d" % FIRST
     delta_rng = "G%d:G%d" % (FIRST, LAST)
@@ -687,7 +704,7 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     ws.row_dimensions[1].height = 32
     raw_formats = {4: fmt_amt, 5: fmt_amt, 6: fmt_amt, 7: fmt_pct,
-                   8: fmt_dur, 9: fmt_dur, 10: fmt_dur, 11: fmt_amt}
+                   8: fmt_dur, 9: fmt_dur, 10: fmt_dur, 11: fmt_amt, 12: fmt_amt}
     # Разность сумм в млрд даёт хвосты вида 0.5999999999999979. В Excel их прячет
     # формат, а в базу они уехали бы как есть. 9 знаков в млрд — точность до
     # рубля, 12 знаков у доли — заведомо точнее любого отображения.
@@ -699,7 +716,8 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
     pct_digits = rounding.rule("portfolio_dynamics", "xlsx_percent").decimals
     dur_digits = rounding.rule("portfolio_dynamics", "xlsx_duration").decimals
     raw_round = {4: amount_digits, 5: amount_digits, 6: amount_digits,
-                 7: 12 if pct_digits is None else pct_digits + 2, 11: amount_digits}
+                 7: 12 if pct_digits is None else pct_digits + 2, 11: amount_digits,
+                 12: amount_digits}
     if dur_digits is not None:
         raw_round.update({8: dur_digits, 9: dur_digits, 10: dur_digits})
     for i, values in enumerate(view_monitor_values(dim_rows, sn_rows, lim_rows, notes)):
@@ -711,10 +729,10 @@ def build_workbook(data: PortfolioDynamicsData) -> Workbook:
             cc.border = BORDER
             if j in raw_formats:
                 cc.number_format = raw_formats[j]
-            if j == 12:
+            if j == 13:
                 cc.alignment = Alignment(wrap_text=True, vertical="top")
     for col, w in {"A": 18, "B": 36, "C": 12, "D": 14, "E": 14, "F": 13, "G": 10,
-                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 60}.items():
+                   "H": 13, "I": 13, "J": 12, "K": 14, "L": 14, "M": 60}.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "C2"
 

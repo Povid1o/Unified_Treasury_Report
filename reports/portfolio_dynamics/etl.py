@@ -909,6 +909,30 @@ def parse_nested_limits(raw: Optional[str] = None) -> Dict[str, float]:
     return allocations
 
 
+def parse_nested_remaining(raw: Optional[str] = None) -> Dict[str, float]:
+    """«HTM_KUAP=30» -> {вложенный тип: его часть остатка лимита, млн RUB}.
+
+    Пара к parse_nested_limits: остаток в выгрузке тоже совокупный, и сколько
+    из него приходится на вложенный тип, выгрузка не знает. Ноль допустим —
+    подлимит может быть выбран полностью.
+    """
+    raw = config.PORTFOLIO_DYNAMICS_NESTED_REMAINING if raw is None else raw
+    remaining: Dict[str, float] = {}
+    for item in str(raw or "").split(","):
+        name, _, amount = item.partition("=")
+        if not name.strip() or not amount.strip():
+            continue
+        try:
+            value = float(amount.strip().replace(" ", "").replace(",", "."))
+        except ValueError as exc:
+            raise PortfolioDynamicsError(
+                f"Не удалось разобрать остаток {item.strip()!r}: ожидается «тип=сумма», "
+                "сумма в млн RUB. Поправьте настройку «Остаток лимита у вложенных типов»."
+            ) from exc
+        remaining[name.strip().upper()] = value
+    return remaining
+
+
 def aggregated_parents() -> Dict[str, str]:
     """Вложенности, объёмы которых СКЛАДЫВАЮТСЯ с объемлющим типом.
 
@@ -1622,8 +1646,15 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
     if parsed_limits is not None:
         from reports.portfolio_dynamics import limits as limits_module
         today_rows = history[history["business_date"] == business_date]
+        # Сверяется уже fact_limit, а не сырой файл: у поделённого лимита HTM
+        # и лимит, и остаток, и объём — без HTM_KUAP, а в файле они совокупные.
+        # Только типы, пришедшие в файле (или поделённые настройкой): у прочих
+        # остаток перенесён из прошлого выпуска и к сегодняшнему объёму не относится.
+        fresh = {canonical_type(t) for t in parsed_limits["portfolio_type"]}
+        fresh |= set(parse_nested_limits())
         limits_module.check_utilisation(
-            parsed_limits,
+            limits[limits["portfolio_type"].astype(str).str.upper().isin(fresh)]
+                .rename(columns={"limit_remaining": "remaining_amount"}),
             dict(zip(today_rows["portfolio_type"].astype(str), today_rows["volume_amount"])),
         )
 

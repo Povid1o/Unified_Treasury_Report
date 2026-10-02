@@ -71,6 +71,7 @@ PORTFOLIO_DYNAMICS_TOLERANCE: float
 PORTFOLIO_DYNAMICS_DEFAULT_LOOKBACK: int
 PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
 PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
+PORTFOLIO_DYNAMICS_NESTED_REMAINING: str
 PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS: list
 PORTFOLIO_DYNAMICS_READ_DURATION_END: bool
 PORTFOLIO_DYNAMICS_KUAP_DURATIONS: str
@@ -189,6 +190,8 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_TYPE_PARENTS"] = v["portfolio_dynamics_type_parents"]
     # Сколько из совокупного лимита выделено вложенному типу (млн RUB).
     g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
+    # Какая часть совокупного «Остатка лимита сверху» приходится на вложенный тип.
+    g["PORTFOLIO_DYNAMICS_NESTED_REMAINING"] = v["portfolio_dynamics_nested_remaining"]
     # Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
     g["PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS"] = v["portfolio_dynamics_manual_portfolios"]
     # Конечная дюрация из выгрузки временно не читается: «Дюрация-КУАП» —

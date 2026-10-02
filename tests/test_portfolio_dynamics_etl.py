@@ -585,7 +585,7 @@ def _write_view_comments(path: Path, notes: dict) -> None:
     rows = _view_rows(ws, _dim_codes(wb))
     for code, text in notes.items():
         # .value = ..., а не cell(value=...): value=None там не очищает ячейку.
-        ws.cell(row=rows[code], column=12).value = text
+        ws.cell(row=rows[code], column=13).value = text
     wb.save(path)
 
 
@@ -597,7 +597,7 @@ def _read_view_comments(path: Path, sheet: str) -> dict:
         rows = _view_rows(ws, _dim_codes(wb))
     else:  # на raw код лежит значением
         rows = {ws.cell(row=r, column=1).value: r for r in range(2, ws.max_row + 1)}
-    return {code: ws.cell(row=r, column=12).value for code, r in rows.items()}
+    return {code: ws.cell(row=r, column=13).value for code, r in rows.items()}
 
 
 def _drop_view_comment_column(path: Path) -> None:
@@ -605,7 +605,7 @@ def _drop_view_comment_column(path: Path) -> None:
     from openpyxl import load_workbook
     wb = load_workbook(path)
     ws = wb["view_monitor"]
-    ws.delete_cols(12)
+    ws.delete_cols(13)
     wb.save(path)
 
 

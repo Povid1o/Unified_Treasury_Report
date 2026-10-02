@@ -313,6 +313,47 @@ class RemainingInFactLimitTests(LimitsTestCase):
         self.assertEqual(frame.loc["AFS", "limit_remaining"], 100_000,
                          "у неделёного типа остаток остаётся на месте")
 
+    def test_a_split_limit_splits_the_remaining_too(self):
+        """Остаток в файле совокупный: КУАП получает свою часть из настроек,
+        остальной HTM — разность, ровно как с самим лимитом."""
+        settings.set_value("portfolio_dynamics_nested_limits", "HTM_KUAP=100000")
+        settings.set_value("portfolio_dynamics_nested_remaining", "HTM_KUAP=30000")
+        config.reload()
+
+        frame = self.by_type(self.build(["AFS", "HTM", "HTM_KUAP", "TSS"]))
+
+        self.assertEqual(frame.loc["HTM", "limit_amount"], 800_000)
+        self.assertEqual(frame.loc["HTM", "limit_remaining"], 170_000)
+        self.assertEqual(frame.loc["HTM_KUAP", "limit_amount"], 100_000)
+        self.assertEqual(frame.loc["HTM_KUAP", "limit_remaining"], 30_000)
+        self.assertEqual(frame.loc["AFS", "limit_remaining"], 100_000)
+
+    def test_a_fully_used_sub_limit_has_zero_remaining(self):
+        settings.set_value("portfolio_dynamics_nested_limits", "HTM_KUAP=100000")
+        settings.set_value("portfolio_dynamics_nested_remaining", "HTM_KUAP=0")
+        config.reload()
+
+        frame = self.by_type(self.build(["HTM", "HTM_KUAP"]))
+
+        self.assertEqual(frame.loc["HTM_KUAP", "limit_remaining"], 0)
+        self.assertEqual(frame.loc["HTM", "limit_remaining"], 200_000)
+
+    def test_nested_remaining_without_a_sub_limit_is_ignored(self):
+        settings.set_value("portfolio_dynamics_nested_remaining", "HTM_KUAP=30000")
+        config.reload()
+
+        with self.assertLogs("portfolio_dynamics", level="WARNING") as captured:
+            frame = self.by_type(self.build(["HTM"]))
+
+        self.assertEqual(frame.loc["HTM", "limit_remaining"], 200_000)
+        self.assertTrue(any("не используется" in line for line in captured.output))
+
+    def test_bad_nested_remaining_is_an_error(self):
+        settings.set_value("portfolio_dynamics_nested_remaining", "HTM_KUAP=тридцать")
+        config.reload()
+        with self.assertRaises(etl.PortfolioDynamicsError):
+            etl.parse_nested_remaining()
+
     def test_the_skip_is_explained_in_the_log(self):
         settings.set_value("portfolio_dynamics_nested_limits", "HTM_KUAP=100000")
         config.reload()
