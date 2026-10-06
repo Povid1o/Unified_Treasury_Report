@@ -52,7 +52,9 @@ KEYS = [key for key, _title, _unit in etl.MARKET_METRICS]
 TITLES = {key: title for key, title, _unit in etl.MARKET_METRICS}
 _BY_TITLE = {title.casefold(): key for key, title in TITLES.items()}
 _DATE_HEADERS = {"date", "date_", "дата"}
-FILE_COLUMNS = ["date"] + [TITLES[key] for key in KEYS]
+# Порядок колонок в файле — как в документации, удобный для ручного ввода.
+FILE_KEYS = ["ruonia", "rgbi", "rwa"]
+FILE_COLUMNS = ["date"] + [TITLES[key] for key in FILE_KEYS]
 
 SEED_DIR = BASE_DIR / "seed"
 SEED_NAMES = ("market_history_seed.csv", "market_history_seed.xlsx")
@@ -157,7 +159,7 @@ def write_history(path: Path, history: History) -> Path:
     должна оставить бэкап полупустым."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [[day.isoformat()] + [history[day].get(key) for key in KEYS]
+    rows = [[day.isoformat()] + [history[day].get(key) for key in FILE_KEYS]
             for day in sorted(history)]
     frame = pd.DataFrame(rows, columns=FILE_COLUMNS)
     tmp = path.with_name(path.name + ".tmp")
