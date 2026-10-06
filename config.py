@@ -90,6 +90,8 @@ PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
 
 PORTFOLIO_REPORT_OUTPUT_DIR: Path
+PORTFOLIO_REPORT_OWN_PORTFOLIOS: frozenset
+PORTFOLIO_REPORT_MARKET_HISTORY: Path
 
 # Раздел настроек -> {показатель: {"scale", "decimals"}}; пусто — как сейчас.
 ROUNDING: dict
@@ -237,6 +239,11 @@ def _apply_settings() -> None:
     # Источник общий с «Динамикой портфелей» (та же выгрузка «Позиция за
     # период»), своя только папка результатов.
     g["PORTFOLIO_REPORT_OUTPUT_DIR"] = v["portfolio_report_output_dir"]
+    # Портфели Казны (indicators=1 в BI): коды в верхнем регистре.
+    g["PORTFOLIO_REPORT_OWN_PORTFOLIOS"] = frozenset(
+        _settings.parse_codes(v["portfolio_report_own_portfolios"]))
+    # Бэкап введённых RUONIA/RGBI/RWA (reports/portfolio_report/market.py).
+    g["PORTFOLIO_REPORT_MARKET_HISTORY"] = v["portfolio_report_market_history"]
 
     # ── Округление ───────────────────────────────────────────────────────────
     # Читается через common/rounding.rule(отчёт, показатель).

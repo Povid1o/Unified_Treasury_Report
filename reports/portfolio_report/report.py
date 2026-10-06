@@ -5,9 +5,10 @@
 или загрузки — и настройки источника у отчётов общие. Файл из загрузок
 кладётся в папку своей даты, как это сделала бы «Динамика портфелей».
 
-Плюс два неявных входа: предыдущий выпуск самого отчёта (из него берётся
-вчерашний Open QTY — самый свежий выпуск раньше даты позиций) и RGBI, RUONIA
-и RWA на сегодня — их вводят руками.
+Плюс неявные входы: предыдущий выпуск самого отчёта (из него берётся
+вчерашний Open QTY — самый свежий выпуск раньше даты позиций), комментарии из
+xlsx-витрины последнего выпуска и RGBI, RUONIA и RWA на сегодня — их вводят
+руками, и каждый запуск дописывает их в файл истории (market.py).
 """
 import argparse
 import datetime as dt
@@ -20,14 +21,15 @@ from rich.table import Table
 import config
 from common import ui
 from reports.base import Report
-from reports.portfolio_report import etl
+from reports.portfolio_report import etl, market, workbook
 
 
 class PortfolioReport(Report):
     slug = "portfolio-report"
     title = "Отчёт по портфелям"
     description = ("Выгрузка позиций на T-1 -> плоский CSV для BI: Open QTY и его изменение, "
-                   "PL, стоимость, DV01, Yield по портфелям + RGBI, RUONIA, RWA")
+                   "PL, стоимость, DV01, Yield, комментарии по портфелям + история "
+                   "RGBI, RUONIA, RWA")
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -57,17 +59,42 @@ class PortfolioReport(Report):
             previous = etl.find_previous_release(config.PORTFOLIO_REPORT_OUTPUT_DIR,
                                                  before=snapshot_date)
 
-        market = etl.MarketInputs(
+        entered = etl.MarketInputs(
             rgbi=_number(args.rgbi, "RGBI"),
             ruonia=_number(args.ruonia, "RUONIA"),
             rwa=_number(args.rwa, "RWA"),
         )
-        data = etl.build_data(source_path, previous_path=previous, market=market)
+        output_dir = (Path(args.output).parent if args.output
+                      else Path(config.PORTFOLIO_REPORT_OUTPUT_DIR))
+
+        # Своя дата не считается уже выгруженной: файл за неё перезаписывается.
+        history, already = market.load(output_dir, skip=snapshot_date)
+        inputs, pending = entered, {}
+        comments = {}
+        if snapshot_date is not None:
+            inputs = market.apply_inputs(history, snapshot_date, entered)
+            pending = market.pending(history, already, snapshot_date)
+            comments_path = workbook.find_comments_release(output_dir, snapshot_date)
+            if comments_path is not None:
+                comments = workbook.read_comments(comments_path)
+                ui.console.print(f"[grey70]Комментарии ({len(comments)}) — из "
+                                 f"[bold]{comments_path.name}[/bold][/grey70]")
+
+        data = etl.build_data(source_path, previous_path=previous, market=inputs,
+                              comments=comments, market_history=pending)
+        history_file = market.write_history(market.history_path(), history)
         output = Path(args.output) if args.output else etl.default_output_path(data.business_date)
         etl.save_report(data, output)
+        book = workbook.write_workbook(data, workbook.workbook_path(output))
 
         ui.success(f"Готово: {len(data.frame)} портфелей на {data.business_date.isoformat()} "
                    f"-> {output}")
+        ui.console.print(f"[grey70]Комментарии пишутся в жёлтой колонке {book.name}[/grey70]")
+        ui.console.print(f"[grey70]История рынка: {history_file} — "
+                         f"{market.dates_span(history)}[/grey70]")
+        if data.market_history:
+            ui.console.print(f"[grey70]В CSV добавлены показатели рынка из истории: "
+                             f"{market.dates_span(data.market_history)}[/grey70]")
         if data.previous_path is None:
             ui.warning("Предыдущего выпуска нет — изменение Open QTY появится со следующего запуска.")
         missing = data.market.missing()
@@ -99,26 +126,34 @@ class PortfolioReport(Report):
         if snapshot_date is not None:
             previous = etl.find_previous_release(config.PORTFOLIO_REPORT_OUTPUT_DIR,
                                                  before=snapshot_date)
-        yesterday = etl.MarketInputs()
         if previous is not None:
             ui.console.print(f"[grey70]Open QTY сравнивается с выпуском "
                              f"[bold]{previous.name}[/bold][/grey70]")
-            try:
-                yesterday = etl.load_previous_release(previous).market
-            except etl.PortfolioReportError as exc:
-                ui.warning(str(exc))
         else:
             ui.warning("Предыдущего выпуска нет — изменение Open QTY появится со следующего запуска.")
 
+        # Подсказки при вводе — из истории: последнее значение до даты позиций и
+        # уже записанное на неё (при повторном прогоне его не нужно вводить снова).
+        yesterday, recorded = etl.MarketInputs(), etl.MarketInputs()
+        if snapshot_date is not None:
+            try:
+                history, _ = market.load(skip=snapshot_date)
+                yesterday = market.latest_before(history, snapshot_date)
+                recorded = etl.MarketInputs(**history.get(snapshot_date, {}))
+            except etl.PortfolioReportError as exc:
+                ui.warning(str(exc))
+
         today = dt.date.today()
-        ui.console.print(f"[bold]Показатели на {today:%d.%m.%Y}[/bold] "
-                         "[grey50](Enter — оставить пустым)[/grey50]")
+        target = (f" — запишутся на дату позиций {snapshot_date:%d.%m.%Y}"
+                  if snapshot_date is not None else "")
+        ui.console.print(f"[bold]Показатели на {today:%d.%m.%Y}[/bold]{target} "
+                         "[grey50](Enter — оставить записанное или пустым)[/grey50]")
         return argparse.Namespace(
             date=None, input=str(source_path), no_import=no_import, output=None,
             previous=str(previous) if previous is not None else None,
-            rgbi=_ask_number("RGBI", yesterday.rgbi),
-            ruonia=_ask_number("RUONIA, %", yesterday.ruonia),
-            rwa=_ask_number("RWA", yesterday.rwa),
+            rgbi=_ask_number("RGBI", yesterday.rgbi, recorded.rgbi),
+            ruonia=_ask_number("RUONIA, %", yesterday.ruonia, recorded.ruonia),
+            rwa=_ask_number("RWA", yesterday.rwa, recorded.rwa),
         )
 
 
@@ -131,9 +166,19 @@ def _number(raw: Optional[str], name: str) -> Optional[float]:
     return value
 
 
-def _ask_number(label: str, previous: Optional[float]) -> Optional[str]:
-    """Спрашивает число, пока не введут разбираемое или не оставят пустым."""
-    hint = f" [grey50](вчера: {previous:,.2f})[/grey50]" if previous is not None else ""
+def _ask_number(label: str, previous: Optional[float],
+                recorded: Optional[float] = None) -> Optional[str]:
+    """Спрашивает число, пока не введут разбираемое или не оставят пустым.
+
+    Пусто — None: тогда в выпуск идёт значение, уже записанное в историю на
+    эту дату (recorded), если оно есть.
+    """
+    hints = []
+    if previous is not None:
+        hints.append(f"прошлое: {previous:,.2f}")
+    if recorded is not None:
+        hints.append(f"уже записано: {recorded:,.2f}, Enter — оставить")
+    hint = f" [grey50]({'; '.join(hints)})[/grey50]" if hints else ""
     while True:
         answer = ui.ask(f"{label}{hint}").strip()
         if not answer:

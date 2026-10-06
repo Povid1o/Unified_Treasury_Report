@@ -61,6 +61,7 @@ KIND_HINTS = {
     "bool": "да / нет",
     "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
     "durations": "пары «код портфеля=дюрация, лет» через запятую; пусто — ничего не задано",
+    "codes": "коды портфелей через запятую; пусто — ничего не задано",
     "portfolios": "список портфелей (код, название, тип, объём); правится своим экраном",
     "rounding": "единица и знаки после запятой по каждому показателю; правится своим экраном",
 }
@@ -500,6 +501,25 @@ SETTINGS: List[Setting] = [
              "сравнивается Open QTY. Выгрузки «Позиция за период» ищутся там же, где "
              "у «Динамики портфелей» (её папка исходных файлов и загрузки).",
     ),
+    Setting(
+        key="portfolio_report_own_portfolios", label="Портфели Казны",
+        kind="codes", group="portfolio_report", default="",
+        help="Через запятую, коды портфелей из выгрузки, например «AFS_OFZ, HTM_KUAP_CORE». "
+             "Эти портфели помечаются indicators=1 и попадают в виджет «Портфели Казны» "
+             "и его строку «Итого»; в основной таблице дашборда видны все портфели. "
+             "Регистр не важен. Пусто — не помечен ни один.",
+    ),
+    Setting(
+        key="portfolio_report_market_history", label="Файл истории RUONIA / RGBI / RWA",
+        kind="file", group="portfolio_report",
+        default=lambda get: settings_path().parent / "market_history.csv",
+        help="Бэкап всех введённых значений: каждый запуск дописывает в него RUONIA, RGBI "
+             "и RWA на дату позиций. Колонки date, RUONIA, RGBI, RWA. Файла нет — создаётся "
+             "сам. Пропуски дополняются из уже выпущенных CSV и из начального файла "
+             "seed/market_history_seed.csv (или .xlsx) в папке проекта; записанное в этом "
+             "файле они не перебивают. В git и в архив проекта не попадает — у каждой "
+             "установки свой.",
+    ),
 ]
 
 # ── Округление: по пункту в каждом разделе отчёта ────────────────────────────
@@ -592,6 +612,9 @@ def parse_value(setting: Setting, raw: Any) -> Any:
             parse_durations(text, setting.key)
         return text
 
+    if setting.kind == "codes":
+        return ", ".join(parse_codes(text, setting.key))
+
     if setting.kind == "bool":
         if isinstance(raw, bool):
             return raw
@@ -633,6 +656,29 @@ def parse_value(setting: Setting, raw: Any) -> Any:
         return value
 
     raise SettingsError(f"[{setting.key}] Неизвестный вид значения {setting.kind!r}.")
+
+
+def parse_codes(raw: Any, key: str = "codes") -> List[str]:
+    """«afs_ofz, HTM_KUAP_CORE» -> ["AFS_OFZ", "HTM_KUAP_CORE"].
+
+    Коды приводятся к верхнему регистру — так их сравнивает разбор выгрузки.
+    Повтор — ошибка, а не молчаливое схлопывание: обычно это опечатка в
+    другом коде, который хотели вписать.
+    """
+    result: List[str] = []
+    for item in str(raw or "").split(","):
+        code = item.strip().upper()
+        if not code:
+            continue
+        if any(ch.isspace() or ch == "=" for ch in code):
+            raise SettingsError(
+                f"[{key}] Ожидаются коды портфелей через запятую, не разобрано: "
+                f"{item.strip()!r}. Пример: AFS_OFZ, HTM_KUAP_CORE"
+            )
+        if code in result:
+            raise SettingsError(f"[{key}] Портфель {code} указан дважды.")
+        result.append(code)
+    return result
 
 
 def parse_durations(raw: Any, key: str = "durations") -> Dict[str, float]:
@@ -918,7 +964,7 @@ _CREATED_ON_WRITE = {
     "logs_dir", "ofz_output_path", "ovp_output_dir", "balance_struct_output_dir",
     "chpd_output_dir", "nim_output_dir", "transfert_output_dir",
     "portfolio_dynamics_output_dir", "portfolio_dynamics_types_file",
-    "portfolio_report_output_dir",
+    "portfolio_report_output_dir", "portfolio_report_market_history",
 }
 
 

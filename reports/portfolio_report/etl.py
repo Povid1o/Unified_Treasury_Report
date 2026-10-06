@@ -8,17 +8,24 @@ NIM: одна строка — одно значение, смысл значе�
 строка «Позиция: <CODE>» открывает портфель, строки под ней — его бумаги.
 
 Что берётся по портфелю:
-- Open QTY, Total Full PL with Funding, чистая стоимость — из строки
+- Open QTY, Total Full PL with Funding, чистая стоимость, DV01 — из строки
   «Позиция: …»: выгрузка считает их по портфелю сама. Если в строке пусто —
-  сумма по бумагам;
-- DV01 — сумма по бумагам: DV01 бумаги в выгрузке посчитан на всю позицию,
-  поэтому у портфеля он складывается, а не усредняется;
+  сумма по бумагам. DV01 бумаги в выгрузке посчитан на всю позицию, поэтому
+  у портфеля он складывается, а не усредняется;
 - Yield — средневзвешенная по чистой стоимости бумаг: по портфелю выгрузка
-  её не считает.
+  её не считает. Только если ни у одной бумаги нет пары «Yield + стоимость» —
+  то, что написано в строке портфеля.
 
 Почему предыдущий выпуск — это ВХОД. Open QTY сравнивается со значением на
 предыдущую дату, а в выгрузке на T-1 его нет. Каждый выпуск содержит Open QTY
 по всем портфелям, и следующий запуск берёт вчерашние значения оттуда.
+
+Ещё два входа, которых нет в выгрузке, — как в «Динамике портфелей»:
+- комментарии к портфелям пишутся в xlsx-витрине рядом с CSV и переносятся
+  из выпуска в выпуск (reports/portfolio_report/workbook.py);
+- RUONIA, RGBI и RWA вводятся руками и копятся в файле истории; в CSV
+  попадают и даты из истории, которых в папке результатов ещё нет
+  (reports/portfolio_report/market.py).
 """
 import datetime as dt
 import re
@@ -71,13 +78,16 @@ DATA_COLUMNS = [
 #   axis_1 — тип портфеля (AFS, HTM, TSS…) или «Рынок» для RGBI/RUONIA/RWA;
 #   axis_2 — код портфеля (у рыночных показателей пусто);
 #   axis_3 — показатель (METRICS ниже, либо RGBI/RUONIA/RWA);
-#   axis_4 — единица измерения.
+#   axis_4 — единица измерения;
+#   text_value — текст (комментарий к портфелю), у числовых строк пусто.
+# date_ у рыночных показателей — своя у каждой строки: кроме даты выпуска, в
+# файл попадают даты из истории, которых в CSV папки ещё нет.
 # Пустые значения не пишутся: строка без значения в BI — только шум.
 # Единицу и знаки каждого показателя можно поменять настройкой «Округление»
 # (common/rounding.py, ключ показателя = колонка свода или ключ MarketInputs);
 # axis_4 тогда меняется вместе со значением.
 OUT_COLUMNS = ["id", "date_", "axis_0", "axis_1", "axis_2", "axis_3", "axis_4",
-               "value", "nversionid"]
+               "value", "text_value", "nversionid"]
 AXIS_0 = "Портфели"
 MARKET_GROUP = "Рынок"
 # (колонка свода, название показателя в axis_3, единица в axis_4)
@@ -91,6 +101,7 @@ METRICS = [
 ]
 MARKET_METRICS = [("rgbi", "RGBI", "пункты"), ("ruonia", "RUONIA", "%"), ("rwa", "RWA", "руб")]
 OPEN_QTY_METRIC = "Open QTY"
+COMMENT_METRIC = "Комментарий"
 
 OUTPUT_FILENAME_PREFIX = "otchet_po_portfelyam_"
 _OUTPUT_DATE = re.compile(re.escape(OUTPUT_FILENAME_PREFIX) + r"(\d{4}-\d{2}-\d{2})")
@@ -137,6 +148,10 @@ class PortfolioReportData:
     market: MarketInputs
     previous_date: Optional[dt.date] = None
     previous_path: Optional[Path] = None
+    comments: Dict[str, str] = field(default_factory=dict)  # код (верхний регистр) -> текст
+    # Рыночные показатели за ДРУГИЕ даты, которых ещё нет в CSV папки результатов
+    # (см. market.pending): {дата: {rgbi/ruonia/rwa: значение}}.
+    market_history: Dict[dt.date, Dict[str, float]] = field(default_factory=dict)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -246,7 +261,6 @@ def parse_positions(path: Path) -> PositionsSnapshot:
                 path.name, code, f"{own[COL_VALUE]:,.2f}", f"{computed_value:,.2f}",
             )
 
-        dv01 = _sum(r[COL_DV01] for r in rows)
         yield_ = positions._weighted_duration(
             [(r[COL_YIELD], r[COL_VALUE]) for r in rows
              if r[COL_YIELD] is not None and r[COL_VALUE] is not None]
@@ -256,8 +270,8 @@ def parse_positions(path: Path) -> PositionsSnapshot:
             "open_qty": stated_or_sum(COL_QTY),
             "net_value": stated_or_sum(COL_VALUE),
             "total_pl": stated_or_sum(COL_PL),
-            # Бумаг с DV01/Yield нет — тогда то, что выгрузка написала по портфелю.
-            "dv01": dv01 if dv01 is not None else own[COL_DV01],
+            "dv01": stated_or_sum(COL_DV01),
+            # Бумаг с Yield нет — тогда то, что выгрузка написала по портфелю.
             "yield": yield_ if yield_ is not None else own[COL_YIELD],
         })
 
@@ -503,7 +517,10 @@ def _type_of(code: str) -> str:
 
 def build_data(source_path: Path, previous_path: Optional[Path] = None,
                market: Optional[MarketInputs] = None,
-               report_date: Optional[dt.date] = None) -> PortfolioReportData:
+               report_date: Optional[dt.date] = None,
+               comments: Optional[Dict[str, str]] = None,
+               market_history: Optional[Dict[dt.date, Dict[str, float]]] = None
+               ) -> PortfolioReportData:
     snapshot = parse_positions(source_path)
     if snapshot.business_date is None:
         raise PortfolioReportError(
@@ -553,6 +570,15 @@ def build_data(source_path: Path, previous_path: Optional[Path] = None,
     for name in market.missing():
         logger.warning("%s не введён — в отчёте ячейка останется пустой.", name)
 
+    comments = {str(code).strip().upper(): text for code, text in (comments or {}).items()
+                if str(text or "").strip()}
+    dropped = sorted(set(comments) - set(frame["portfolio_code"].str.upper()))
+    if dropped:
+        logger.warning("Комментарии к портфелям, которых нет в выпуске, не перенесены: %s.",
+                       ", ".join(dropped))
+    history = {day: values for day, values in (market_history or {}).items()
+               if day != snapshot.business_date and values}
+
     return PortfolioReportData(
         business_date=snapshot.business_date,
         report_date=report_date or dt.date.today(),
@@ -561,6 +587,8 @@ def build_data(source_path: Path, previous_path: Optional[Path] = None,
         market=market,
         previous_date=previous.business_date if previous else None,
         previous_path=previous.path if previous else None,
+        comments={code: text for code, text in comments.items() if code not in dropped},
+        market_history=history,
     )
 
 
@@ -572,19 +600,29 @@ def to_flat(data: PortfolioReportData) -> pd.DataFrame:
     rules = {key: rounding.rule("portfolio_report", key)
              for key, _metric, _unit in METRICS + MARKET_METRICS}
 
-    def add(group, code, key, metric, unit, value):
+    def add(group, code, key, metric, unit, value, day=date_):
         if value is None or pd.isna(value):
             return
         rule = rules[key]
-        rows.append({"id": len(rows), "date_": date_, "axis_0": AXIS_0, "axis_1": group,
+        rows.append({"id": len(rows), "date_": day, "axis_0": AXIS_0, "axis_1": group,
                      "axis_2": code, "axis_3": metric, "axis_4": rule.label(unit),
                      "value": float(value) if rule.is_default else rule.apply(float(value)),
-                     "nversionid": ""})
+                     "text_value": "", "nversionid": ""})
 
     for record in data.frame.to_dict("records"):
         for column, metric, unit in METRICS:
             add(record["portfolio_type"], record["portfolio_code"], column, metric, unit,
                 record[column])
+        note = data.comments.get(str(record["portfolio_code"]).upper())
+        if note:
+            rows.append({"id": len(rows), "date_": date_, "axis_0": AXIS_0,
+                         "axis_1": record["portfolio_type"], "axis_2": record["portfolio_code"],
+                         "axis_3": COMMENT_METRIC, "axis_4": "", "value": None,
+                         "text_value": note, "nversionid": ""})
+    for day in sorted(data.market_history):
+        for key, metric, unit in MARKET_METRICS:
+            add(MARKET_GROUP, "", key, metric, unit, data.market_history[day].get(key),
+                day=day.isoformat())
     for key, metric, unit in MARKET_METRICS:
         add(MARKET_GROUP, "", key, metric, unit, getattr(data.market, key))
     if all(rule.is_default for rule in rules.values()):
@@ -603,8 +641,8 @@ def save_report(data: PortfolioReportData, output_path: Path) -> Path:
             f"Нет доступа для записи в {output_path} (файл открыт в Excel?): {exc}. "
             "Закройте файл и повторите запуск."
         ) from exc
-    logger.info("Отчёт сохранён: %s (портфелей %d, строк %d)",
-                output_path, len(data.frame), len(flat))
+    logger.info("Отчёт сохранён: %s (портфелей %d, строк %d, рынок из истории за %d дат)",
+                output_path, len(data.frame), len(flat), len(data.market_history))
     return output_path
 
 

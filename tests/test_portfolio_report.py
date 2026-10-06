@@ -1,6 +1,7 @@
 """Тесты «Отчёта по портфелям».
 
-Проверяется то, что ломается молча: DV01 складывается, а не усредняется;
+Проверяется то, что ломается молча: DV01 берётся из строки портфеля, а без
+неё складывается по бумагам, а не усредняется;
 Yield — средневзвешенная по стоимости, а не простая средняя; значения из
 строки «Позиция: …» важнее сумм по бумагам; Open QTY сравнивается со
 ВЧЕРАШНИМ выпуском, а не с самим собой при повторном прогоне.
@@ -13,15 +14,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import argparse
+
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
 from common import settings  # noqa: E402
-from reports.portfolio_report import etl  # noqa: E402
+from reports.portfolio_report import etl, market, workbook  # noqa: E402
+from reports.portfolio_report.report import PortfolioReport  # noqa: E402
 
 # Колонки выгрузки: нужные пять вперемешку с лишними, как в реальном файле.
 EXPORT_HEADER = [
@@ -86,7 +90,10 @@ class PortfolioReportTest(unittest.TestCase):
             "portfolio_report_output_dir": str(self.tmp / "out"),
             "downloads_dir": str(self.tmp / "downloads"),
             "portfolio_dynamics_types_file": str(self.tmp / "portfolio_types.json"),
+            "portfolio_report_market_history": str(self.tmp / "market_history.csv"),
         }), encoding="utf-8")
+        self._saved_seed_dir = market.SEED_DIR
+        market.SEED_DIR = self.tmp / "seed"
         os.environ[settings.SETTINGS_FILE_ENV] = str(settings_file)
         config.reload()
         self.day1 = write_export(self.tmp / "data" / "2026-09-28" / export_name("28.09.2026"),
@@ -95,6 +102,7 @@ class PortfolioReportTest(unittest.TestCase):
                                  DAY2, "29.09.2026")
 
     def tearDown(self):
+        market.SEED_DIR = self._saved_seed_dir
         if self._saved_env is None:
             os.environ.pop(settings.SETTINGS_FILE_ENV, None)
         else:
@@ -113,6 +121,16 @@ class PortfolioReportTest(unittest.TestCase):
         self.assertEqual(afs["net_value"], 400_000_000)
         # DV01 — сумма, Yield — средневзвешенная по стоимости: (10*300 + 14*100) / 400.
         self.assertEqual(afs["dv01"], 25_000)
+        self.assertAlmostEqual(afs["yield"], 11.0)
+        # DV01 в строке портфеля важнее суммы по бумагам; Yield там же игнорируется —
+        # средневзвешенная по бумагам точнее.
+        stated = write_export(self.tmp / "stated.xlsx", [
+            ("Позиция: AFS_TR_RUR", 150, 5_000_000, 31_000, 99.0, 400_000_000),
+            ("Bond", 100, 3_000_000, 20_000, 10.0, 300_000_000),
+            ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000),
+        ], "28.09.2026")
+        afs = self.row(etl.parse_positions(stated).frame, "AFS_TR_RUR")
+        self.assertEqual(afs["dv01"], 31_000)
         self.assertAlmostEqual(afs["yield"], 11.0)
         htm = self.row(frame, "HTM_ALCO")
         self.assertEqual(htm["open_qty"], 200)
@@ -185,6 +203,103 @@ class PortfolioReportTest(unittest.TestCase):
                          ["Open QTY", "Изменение Open QTY"])
         units = dict(zip(flat["axis_3"], flat["axis_4"]))
         self.assertEqual((units["Open QTY"], units["Yield"], units["RGBI"]), ("шт", "%", "пункты"))
+
+    # ── Запуск целиком: история рынка и комментарии ─────────────────────────
+    def run_report(self, path: Path, **inputs) -> pd.DataFrame:
+        args = argparse.Namespace(date=None, input=str(path), previous=None, no_import=True,
+                                  output=None, rgbi=inputs.get("rgbi"),
+                                  ruonia=inputs.get("ruonia"), rwa=inputs.get("rwa"))
+        PortfolioReport().run(args)
+        day = etl.positions.read_business_date(path)
+        return pd.read_csv(etl.default_output_path(day), dtype=str, keep_default_na=False,
+                           encoding="utf-8-sig")
+
+    @staticmethod
+    def market_rows(flat: pd.DataFrame) -> dict:
+        rows = flat[flat["axis_1"] == etl.MARKET_GROUP]
+        return {(r.date_, r.axis_3): float(r.value) for r in rows.itertuples()}
+
+    def write_seed(self, lines):
+        """Начальный файл как из русского Excel: «;», запятая, cp1251, дд.мм.гггг."""
+        seed = self.tmp / "seed" / "market_history_seed.csv"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_bytes(("Дата;RUONIA;RGBI;RWA\n" + "\n".join(lines) + "\n").encode("cp1251"))
+
+    def test_market_history_backup_and_csv_without_duplicates(self):
+        self.write_seed(["25.09.2026;16,1;115,0;", "26.09.2026;16,2;;",
+                         "28.09.2026;16,3;115,2;"])
+        flat = self.run_report(self.day1, rgbi="115,5")
+        # Первый выпуск: вся история по свою дату. Введённое важнее начального файла,
+        # не введённое (RUONIA) берётся из него.
+        self.assertEqual(self.market_rows(flat), {
+            ("2026-09-25", "RUONIA"): 16.1, ("2026-09-25", "RGBI"): 115.0,
+            ("2026-09-26", "RUONIA"): 16.2,
+            ("2026-09-28", "RUONIA"): 16.3, ("2026-09-28", "RGBI"): 115.5,
+        })
+        backup = market.read_history(market.history_path())
+        self.assertEqual(backup[dt.date(2026, 9, 28)], {"ruonia": 16.3, "rgbi": 115.5})
+
+        # Начальный файл поправили задним числом и дописали пропущенный день:
+        # записанное в бэкапе не перебивается, пропуск дополняется.
+        self.write_seed(["25.09.2026;99;115,0;", "26.09.2026;16,2;;",
+                         "27.09.2026;16,25;;", "28.09.2026;16,3;115,2;"])
+        for _ in range(2):  # повторный прогон за ту же дату собирает то же самое
+            flat = self.run_report(self.day2, ruonia="16.5", rwa="1 500 000 000 000")
+            self.assertEqual(self.market_rows(flat), {
+                ("2026-09-27", "RUONIA"): 16.25,
+                ("2026-09-29", "RUONIA"): 16.5, ("2026-09-29", "RWA"): 1.5e12,
+            })
+        backup = market.read_history(market.history_path())
+        self.assertEqual(backup[dt.date(2026, 9, 25)]["ruonia"], 16.1)
+        self.assertEqual(backup[dt.date(2026, 9, 29)], {"ruonia": 16.5, "rwa": 1.5e12})
+
+        # Повторный прогон без ввода не теряет записанное: берёт его из истории.
+        flat = self.run_report(self.day2)
+        self.assertEqual(self.market_rows(flat)[("2026-09-29", "RUONIA")], 16.5)
+
+    def test_backup_picks_up_values_from_older_releases(self):
+        # Выпуск, сделанный до появления файла истории, — его значения тоже в бэкап.
+        old = etl.build_data(self.day1, market=etl.MarketInputs(ruonia=16.0, rwa=2e12))
+        etl.save_report(old, etl.default_output_path(old.business_date))
+        flat = self.run_report(self.day2, ruonia="16.5")
+        self.assertEqual(self.market_rows(flat), {("2026-09-29", "RUONIA"): 16.5})
+        backup = market.read_history(market.history_path())
+        self.assertEqual(backup[dt.date(2026, 9, 28)], {"ruonia": 16.0, "rwa": 2e12})
+
+    def set_comment(self, day: dt.date, code: str, text: str) -> None:
+        path = workbook.workbook_path(etl.default_output_path(day))
+        wb = load_workbook(path)
+        ws = wb[workbook.SHEET]
+        header = [c.value for c in ws[workbook.HEADER_ROW]]
+        col = header.index(workbook.COMMENT_HEADER) + 1
+        for row in range(workbook.HEADER_ROW + 1, ws.max_row + 1):
+            if ws.cell(row=row, column=1).value == code:
+                ws.cell(row=row, column=col, value=text)
+        wb.save(path)
+
+    def test_comments_carry_over_like_in_dynamics(self):
+        day1, day2 = dt.date(2026, 9, 28), dt.date(2026, 9, 29)
+        self.run_report(self.day1)
+        self.set_comment(day1, "AFS_TR_RUR", "Докупаем ОФЗ")
+        self.set_comment(day1, "HTM_ALCO", "Закрыт")
+
+        def comments(flat):
+            rows = flat[flat["axis_3"] == etl.COMMENT_METRIC]
+            self.assertTrue((rows["value"] == "").all())
+            return dict(zip(rows["axis_2"], rows["text_value"]))
+
+        # Перезапуск за ту же дату — правка попадает в CSV этого выпуска.
+        self.assertEqual(comments(self.run_report(self.day1)),
+                         {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
+        # Следующий день: комментарии переносятся, в т.ч. портфелю, пропавшему из выгрузки.
+        flat = self.run_report(self.day2)
+        self.assertEqual(comments(flat), {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
+        self.assertEqual(workbook.read_comments(
+            workbook.workbook_path(etl.default_output_path(day2))),
+            {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
+        # Комментарий не мешает сравнению Open QTY со вчерашним выпуском.
+        change = flat[(flat["axis_2"] == "AFS_TR_RUR") & (flat["axis_3"] == "Изменение Open QTY")]
+        self.assertEqual(float(change["value"].iloc[0]), 20)
 
 if __name__ == "__main__":
     unittest.main()

@@ -180,6 +180,24 @@ class ValidationTests(SettingsTestCase):
                 with self.assertRaisesRegex(settings.SettingsError, "ключ=значение"):
                     settings.set_value("portfolio_dynamics_type_parents", bad)
 
+    def test_codes_setting_is_normalized_and_reaches_config(self):
+        self.assertEqual(config.PORTFOLIO_REPORT_OWN_PORTFOLIOS, frozenset())
+        self.assertEqual(
+            settings.set_value("portfolio_report_own_portfolios", " afs_ofz,HTM_KUAP_CORE , "),
+            "AFS_OFZ, HTM_KUAP_CORE")
+        config.reload()
+        self.assertEqual(config.PORTFOLIO_REPORT_OWN_PORTFOLIOS,
+                         frozenset({"AFS_OFZ", "HTM_KUAP_CORE"}))
+        self.assertEqual(settings.set_value("portfolio_report_own_portfolios", ""), "")
+
+    def test_codes_setting_rejects_duplicates_and_pairs(self):
+        with self.assertRaisesRegex(settings.SettingsError, "дважды"):
+            settings.set_value("portfolio_report_own_portfolios", "AFS_OFZ, afs_ofz")
+        for bad in ("AFS_OFZ=1", "AFS OFZ"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(settings.SettingsError, "через запятую"):
+                    settings.set_value("portfolio_report_own_portfolios", bad)
+
     def test_unknown_key_is_rejected(self):
         with self.assertRaisesRegex(settings.SettingsError, "Неизвестная настройка"):
             settings.set_value("no_such_setting", "x")
