@@ -1,10 +1,11 @@
 """Тесты «Отчёта по портфелям».
 
-Проверяется то, что ломается молча: DV01 берётся из строки портфеля, а без
-неё складывается по бумагам, а не усредняется;
-Yield — средневзвешенная по стоимости, а не простая средняя; значения из
-строки «Позиция: …» важнее сумм по бумагам; Open QTY сравнивается со
-ВЧЕРАШНИМ выпуском, а не с самим собой при повторном прогоне.
+Проверяется то, что ломается молча: DV01 — сумма по бумагам, а не среднее и
+не значение из строки портфеля; Yield — средневзвешенная по стоимости бумаг, а
+не простая средняя и не строка портфеля; Open QTY, PL и стоимость из строки
+«Позиция: …» важнее сумм по бумагам; изменение Open QTY — с начала
+года, из самого файла, а выгрузка за один день (где оно всегда ноль) не
+принимается.
 """
 import datetime as dt
 import json
@@ -34,16 +35,16 @@ EXPORT_HEADER = [
     "Чистая стоимость позиции (кон.)", "Duration (нач.)",
 ]
 FIELDS = ["Open QTY (кон.)", "Total Full PL with Funding", "DV01 (кон.)",
-          "Yield (кон.)", "Чистая стоимость позиции (кон.)"]
+          "Yield (кон.)", "Чистая стоимость позиции (кон.)", "Open QTY (нач.)"]
 
 
-def write_export(path: Path, rows, period_end: str) -> Path:
-    """rows — (Тип актива, qty, pl, dv01, yield, value); None — пустая ячейка."""
+def write_export(path: Path, rows, period_end: str, period_start: str = "01.01.2026") -> Path:
+    """rows — (Тип актива, qty, pl, dv01, yield, value[, qty на начало]); None — пусто."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Financial Position"
     ws.cell(row=1, column=1,
-            value=f"Позиция за период [{period_end}] - [{period_end}] - SECURITIES")
+            value=f"Позиция за период [{period_start}] - [{period_end}] - SECURITIES")
     for j, title in enumerate(EXPORT_HEADER, start=1):
         ws.cell(row=5, column=j, value=title)
     for i, (asset_type, *values) in enumerate(rows, start=6):
@@ -56,26 +57,27 @@ def write_export(path: Path, rows, period_end: str) -> Path:
     return path
 
 
-def export_name(period_end: str) -> str:
-    return f"Позиция за период  {period_end}  -  {period_end}   - SECURITIES.xlsx"
+def export_name(period_end: str, period_start: str = "01.01.2026") -> str:
+    return f"Позиция за период  {period_start}  -  {period_end}   - SECURITIES.xlsx"
 
 
-# Портфель AFS: QTY/PL/стоимость написаны в строке портфеля, DV01 и Yield — нет.
-# HTM: в строке портфеля пусто — всё считается по бумагам.
+# Портфель AFS: QTY (на конец и на начало года)/PL/стоимость написаны в строке
+# портфеля, DV01 и Yield — нет. HTM: в строке портфеля пусто — всё по бумагам.
 DAY1 = [
-    ("Позиция: AFS_TR_RUR", 150, 5_000_000, None, None, 400_000_000),
-    ("Bond", 100, 3_000_000, 20_000, 10.0, 300_000_000),
-    ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000),
-    ("Позиция: HTM_ALCO", None, None, None, None, None),
-    ("Bond", 200, 1_000_000, 30_000, 12.0, 200_000_000),
-    ("Итого", 350, 6_000_000, 55_000, None, 600_000_000),
+    ("Позиция: AFS_TR_RUR", 150, 5_000_000, None, None, 400_000_000, 100),
+    ("Bond", 100, 3_000_000, 20_000, 10.0, 300_000_000, 60),
+    ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000, 30),
+    ("Позиция: HTM_ALCO", None, None, None, None, None, None),
+    ("Bond", 200, 1_000_000, 30_000, 12.0, 200_000_000, 250),
+    ("Итого", 350, 6_000_000, 55_000, None, 600_000_000, 350),
 ]
+# OFZ_PD куплен в этом году: на начало года — ноль.
 DAY2 = [
-    ("Позиция: AFS_TR_RUR", 170, 6_000_000, None, None, 450_000_000),
-    ("Bond", 120, 4_000_000, 22_000, 10.0, 350_000_000),
-    ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000),
-    ("Позиция: OFZ_PD", 10, 100_000, None, None, 10_000_000),
-    ("Bond", 10, 100_000, 1_000, 15.0, 10_000_000),
+    ("Позиция: AFS_TR_RUR", 170, 6_000_000, None, None, 450_000_000, 100),
+    ("Bond", 120, 4_000_000, 22_000, 10.0, 350_000_000, 70),
+    ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000, 30),
+    ("Позиция: OFZ_PD", 10, 100_000, None, None, 10_000_000, None),
+    ("Bond", 10, 100_000, 1_000, 15.0, 10_000_000, 0),
 ]
 
 
@@ -116,32 +118,44 @@ class PortfolioReportTest(unittest.TestCase):
     def test_portfolio_values(self):
         frame = etl.parse_positions(self.day1).frame
         afs = self.row(frame, "AFS_TR_RUR")
-        # Из строки портфеля, а не суммой по бумагам.
+        # Из строки портфеля, а не суммой по бумагам (60 + 30 = 90).
         self.assertEqual(afs["open_qty"], 150)
+        self.assertEqual(afs["open_qty_start"], 100)
         self.assertEqual(afs["net_value"], 400_000_000)
         # DV01 — сумма, Yield — средневзвешенная по стоимости: (10*300 + 14*100) / 400.
         self.assertEqual(afs["dv01"], 25_000)
         self.assertAlmostEqual(afs["yield"], 11.0)
-        # DV01 в строке портфеля важнее суммы по бумагам; Yield там же игнорируется —
-        # средневзвешенная по бумагам точнее.
+        # Строка портфеля заполнена и DV01, и Yield — оба всё равно считаются по
+        # бумагам: DV01 = 20 000 + 5 000, Yield = (10*300 + 14*100) / 400.
         stated = write_export(self.tmp / "stated.xlsx", [
             ("Позиция: AFS_TR_RUR", 150, 5_000_000, 31_000, 99.0, 400_000_000),
             ("Bond", 100, 3_000_000, 20_000, 10.0, 300_000_000),
             ("Bond", 50, 2_000_000, 5_000, 14.0, 100_000_000),
         ], "28.09.2026")
         afs = self.row(etl.parse_positions(stated).frame, "AFS_TR_RUR")
-        self.assertEqual(afs["dv01"], 31_000)
+        self.assertEqual(afs["dv01"], 25_000)
         self.assertAlmostEqual(afs["yield"], 11.0)
         htm = self.row(frame, "HTM_ALCO")
-        self.assertEqual(htm["open_qty"], 200)
+        self.assertEqual((htm["open_qty"], htm["open_qty_start"]), (200, 250))
         self.assertEqual(htm["total_pl"], 1_000_000)
         self.assertEqual(len(frame), 2)  # строка «Итого» не портфель
 
     def test_sources_and_import(self):
+        # Выгрузки за один день («Динамика» по-старому): на 29.09 рядом с выгрузкой
+        # с начала года, на 30.09 — единственная.
+        for day in ("29.09.2026", "30.09.2026"):
+            write_export(self.tmp / "data" / f"2026-09-{day[:2]}" / export_name(day, day),
+                         DAY2, day, period_start=day)
         sources = etl.find_sources(Path(config.DOWNLOADS_DIR))
         self.assertEqual([s.business_date for s in sources],
-                         [dt.date(2026, 9, 29), dt.date(2026, 9, 28)])
-        self.assertEqual(sources[0].origin, etl.ORIGIN_DOWNLOADS)
+                         [dt.date(2026, 9, 30), dt.date(2026, 9, 29), dt.date(2026, 9, 28)])
+        # Выгрузка с начала года из загрузок важнее выгрузки за день в своей папке.
+        self.assertEqual(sources[1].origin, etl.ORIGIN_DOWNLOADS)
+        self.assertEqual(sources[1].period_start, dt.date(2026, 1, 1))
+        self.assertFalse(sources[0].from_year_start)
+        with self.assertRaisesRegex(etl.PortfolioReportError, "за один день"):
+            etl.pick_source(sources, dt.date(2026, 9, 30))
+        sources = sources[1:]
         path = etl.take(sources[0], move=False)
         self.assertEqual(path.parent.name, "2026-09-29")
         self.assertTrue(path.exists() and self.day2.exists())
@@ -157,31 +171,17 @@ class PortfolioReportTest(unittest.TestCase):
         self.assertEqual(etl.previous_business_day(dt.date(2026, 9, 30)),
                          dt.date(2026, 9, 29))
 
-    def test_two_runs_compare_open_qty(self):
-        out = Path(config.PORTFOLIO_REPORT_OUTPUT_DIR)
-        first = etl.build_data(self.day1, market=etl.MarketInputs(rgbi=115.2))
-        self.assertTrue(first.frame["open_qty_change"].isna().all())
-        etl.save_report(first, etl.default_output_path(first.business_date))
-
+    def test_change_is_since_start_of_year(self):
         market = etl.MarketInputs(rgbi=116.0, ruonia=16.5, rwa=1.5e12)
-        for _ in range(2):  # повторный прогон за ту же дату сравнивает со вчерашним
-            previous = etl.find_previous_release(out, before=dt.date(2026, 9, 29))
-            self.assertEqual(etl.release_date(previous), dt.date(2026, 9, 28))
-            second = etl.build_data(self.day2, previous_path=previous, market=market,
-                                    report_date=dt.date(2026, 9, 30))
-            path = etl.save_report(second, etl.default_output_path(second.business_date))
+        for _ in range(2):  # повторный прогон даёт то же самое: прошлые выпуски не нужны
+            data = etl.build_data(self.day2, market=market, report_date=dt.date(2026, 9, 30))
+            path = etl.save_report(data, etl.default_output_path(data.business_date))
+        self.assertEqual(data.period_start, dt.date(2026, 1, 1))
 
-        frame = second.frame
-        self.assertEqual(self.row(frame, "AFS_TR_RUR")["open_qty_change"], 20)
-        self.assertEqual(self.row(frame, "OFZ_PD")["open_qty_change"], 10)  # новый
-        gone = self.row(frame, "HTM_ALCO")  # был вчера, сегодня нет
-        self.assertEqual((gone["open_qty"], gone["open_qty_change"]), (0, -200))
-
-        reloaded = etl.load_previous_release(path)
-        self.assertEqual(reloaded.business_date, dt.date(2026, 9, 29))
-        self.assertEqual(reloaded.open_qty, {"AFS_TR_RUR": 170, "OFZ_PD": 10, "HTM_ALCO": 0})
-        self.assertEqual((reloaded.market.rgbi, reloaded.market.ruonia, reloaded.market.rwa),
-                         (116.0, 16.5, 1.5e12))
+        frame = data.frame
+        self.assertEqual(self.row(frame, "AFS_TR_RUR")["open_qty_change"], 70)  # 170 - 100
+        self.assertEqual(self.row(frame, "OFZ_PD")["open_qty_change"], 10)      # куплен в году
+        self.assertNotIn("HTM_ALCO", set(frame["portfolio_code"]))  # нет в выгрузке — нет в отчёте
 
         flat = pd.read_csv(path, encoding="utf-8-sig", keep_default_na=False)
         self.assertEqual(list(flat.columns), etl.OUT_COLUMNS)
@@ -194,15 +194,65 @@ class PortfolioReportTest(unittest.TestCase):
             self.assertEqual(len(hit), 1, (group, code, metric))
             return float(hit["value"].iloc[0])
 
-        self.assertEqual(value("AFS", "AFS_TR_RUR", "Изменение Open QTY"), 20)
+        self.assertEqual(value("AFS", "AFS_TR_RUR", "Open QTY на начало года"), 100)
+        self.assertEqual(value("AFS", "AFS_TR_RUR", "Изменение Open QTY"), 70)
         self.assertEqual(value("AFS", "AFS_TR_RUR", "Чистая стоимость"), 450_000_000)
         self.assertEqual(value("AFS", "AFS_TR_RUR", "DV01"), 27_000)
         self.assertEqual(value("Рынок", "", "RUONIA"), 16.5)
-        # У пропавшего портфеля только Open QTY и изменение — пустые значения не пишутся.
-        self.assertEqual(sorted(flat.loc[flat["axis_2"] == "HTM_ALCO", "axis_3"]),
-                         ["Open QTY", "Изменение Open QTY"])
         units = dict(zip(flat["axis_3"], flat["axis_4"]))
         self.assertEqual((units["Open QTY"], units["Yield"], units["RGBI"]), ("шт", "%", "пункты"))
+
+    def test_single_day_export_is_rejected(self):
+        single = write_export(self.tmp / export_name("29.09.2026", "29.09.2026"), DAY2,
+                              "29.09.2026", period_start="29.09.2026")
+        with self.assertRaisesRegex(etl.PortfolioReportError, "за один день"):
+            etl.build_data(single)
+
+    def test_period_not_from_january_is_used_with_a_warning(self):
+        path = write_export(self.tmp / export_name("29.09.2026", "01.07.2026"), DAY2,
+                            "29.09.2026", period_start="01.07.2026")
+        with self.assertLogs("portfolio_report", level="WARNING") as captured:
+            data = etl.build_data(path)
+        self.assertEqual(data.period_start, dt.date(2026, 7, 1))
+        self.assertTrue(any("01.07.2026" in line for line in captured.output))
+
+    def test_diagnose_shows_why_dv01_and_yield_are_empty(self):
+        """Колонки называются иначе, чем ждёт отчёт, — DV01/Yield пустые, и видно почему."""
+        global EXPORT_HEADER
+        saved = list(EXPORT_HEADER)
+        try:
+            EXPORT_HEADER[EXPORT_HEADER.index("DV01 (кон.)")] = "DV01"
+            EXPORT_HEADER[EXPORT_HEADER.index("Yield (кон.)")] = "Yield"
+            renamed = list(EXPORT_HEADER)
+            FIELDS[FIELDS.index("DV01 (кон.)")] = "DV01"
+            FIELDS[FIELDS.index("Yield (кон.)")] = "Yield"
+            path = write_export(self.tmp / export_name("29.09.2026"), DAY2, "29.09.2026")
+        finally:
+            EXPORT_HEADER[:] = saved
+            FIELDS[FIELDS.index("DV01")] = "DV01 (кон.)"
+            FIELDS[FIELDS.index("Yield")] = "Yield (кон.)"
+        self.assertIn("DV01", renamed)
+
+        with self.assertLogs("portfolio_report", level="WARNING") as captured:
+            lines = etl.diagnose(path)
+        text = "\n".join(lines)
+        self.assertIn("[НЕ НАЙДЕНА] DV01 (кон.) — похожие заголовки в файле: 'DV01'", text)
+        self.assertIn("[НЕ НАЙДЕНА] Yield (кон.) — похожие заголовки в файле: 'Yield'", text)
+        self.assertIn("AFS_TR_RUR      2  пусто / пусто", text)
+        logged = "\n".join(captured.output)
+        self.assertIn("Похожие заголовки в файле: 'DV01'", logged)
+        self.assertIn("DV01 не посчитан ни по одному портфелю", logged)
+
+    def test_diagnose_reports_values_that_are_not_numbers(self):
+        path = write_export(self.tmp / export_name("29.09.2026"), [
+            ("Позиция: AFS_TR_RUR", 170, 6_000_000, None, None, 450_000_000, 100),
+            ("Bond", 120, 4_000_000, "(22 000)", 10.0, 350_000_000, 70),
+            (None, 50, 2_000_000, 5_000, 14.0, 100_000_000, 30),
+        ], "29.09.2026")
+        text = "\n".join(etl.diagnose(path))
+        self.assertIn("[не числа]   DV01 (кон.): '(22 000)'", text)
+        self.assertIn("из них с пустым «Тип актива»: 1", text)
+        self.assertIn("сумма по 1 бумагам / средневзвешенная по 2 бумагам", text)
 
     # ── Запуск целиком: история рынка и комментарии ─────────────────────────
     def run_report(self, path: Path, **inputs) -> pd.DataFrame:
@@ -291,15 +341,16 @@ class PortfolioReportTest(unittest.TestCase):
         # Перезапуск за ту же дату — правка попадает в CSV этого выпуска.
         self.assertEqual(comments(self.run_report(self.day1)),
                          {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
-        # Следующий день: комментарии переносятся, в т.ч. портфелю, пропавшему из выгрузки.
+        # Следующий день: комментарии переносятся. HTM_ALCO в выгрузке нет — в CSV его
+        # комментария нет, но витрина его хранит и вернёт, когда портфель появится.
         flat = self.run_report(self.day2)
-        self.assertEqual(comments(flat), {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
+        self.assertEqual(comments(flat), {"AFS_TR_RUR": "Докупаем ОФЗ"})
         self.assertEqual(workbook.read_comments(
             workbook.workbook_path(etl.default_output_path(day2))),
             {"AFS_TR_RUR": "Докупаем ОФЗ", "HTM_ALCO": "Закрыт"})
-        # Комментарий не мешает сравнению Open QTY со вчерашним выпуском.
+        # Комментарий не мешает числам портфеля.
         change = flat[(flat["axis_2"] == "AFS_TR_RUR") & (flat["axis_3"] == "Изменение Open QTY")]
-        self.assertEqual(float(change["value"].iloc[0]), 20)
+        self.assertEqual(float(change["value"].iloc[0]), 70)
 
 if __name__ == "__main__":
     unittest.main()

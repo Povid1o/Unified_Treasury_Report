@@ -307,24 +307,25 @@ class CsvReportsTests(SettingsSandbox):
 
 
 class PortfolioReportTests(SettingsSandbox):
-    def test_units_change_and_open_qty_survives_the_previous_release(self):
-        from reports.portfolio_report import etl as pr
+    def test_units_change_and_backup_reads_them_back(self):
+        from reports.portfolio_report import etl as pr, market
         import test_portfolio_report as tpr
         d1 = tpr.write_export(self.tmp / tpr.export_name("01.09.2026"), tpr.DAY1, "01.09.2026")
-        d2 = tpr.write_export(self.tmp / tpr.export_name("02.09.2026"), tpr.DAY2, "02.09.2026")
         self.set_rounding("portfolio_report", {"open_qty": {"scale": 3},
-                                               "net_value": {"scale": 6, "decimals": 1}})
-        r1 = pr.save_report(pr.build_data(d1), self.tmp / "otchet_po_portfelyam_2026-09-01.csv")
+                                               "net_value": {"scale": 6, "decimals": 1},
+                                               "rwa": {"scale": 9}})
+        data = pr.build_data(d1, market=pr.MarketInputs(rwa=1.5e12))
+        r1 = pr.save_report(data, self.tmp / "otchet_po_portfelyam_2026-09-01.csv")
         flat = pd.read_csv(r1, encoding="utf-8-sig", keep_default_na=False)
         row = flat[(flat["axis_2"] == "AFS_TR_RUR") & (flat["axis_3"] == "Open QTY")].iloc[0]
         self.assertEqual((float(row["value"]), row["axis_4"]), (0.15, "тыс. шт"))
         row = flat[(flat["axis_2"] == "AFS_TR_RUR") & (flat["axis_3"] == "Чистая стоимость")].iloc[0]
         self.assertEqual((float(row["value"]), row["axis_4"]), (400.0, "млн руб"))
+        row = flat[flat["axis_3"] == "RWA"].iloc[0]
+        self.assertEqual((float(row["value"]), row["axis_4"]), (1500.0, "млрд руб"))
 
-        # Вчерашний Open QTY записан в тыс. шт — изменение всё равно в штуках: 170 - 150.
-        data = pr.build_data(d2, previous_path=r1)
-        change = data.frame.set_index("portfolio_code").loc["AFS_TR_RUR", "open_qty_change"]
-        self.assertEqual(change, 20)
+        # RWA записан в млрд — в бэкап истории он возвращается в рублях.
+        self.assertEqual(market.released(self.tmp), {dt.date(2026, 9, 1): {"rwa": 1.5e12}})
 
 
 class PortfolioDynamicsTests(SettingsSandbox):

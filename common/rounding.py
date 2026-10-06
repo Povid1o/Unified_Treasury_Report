@@ -149,6 +149,7 @@ CATALOG: Dict[str, List[Category]] = {
     ],
     "portfolio_report": [
         _c("open_qty", "Open QTY", "без округления", RELATIVE, unit="шт"),
+        _c("open_qty_start", "Open QTY на начало года", "без округления", RELATIVE, unit="шт"),
         _c("open_qty_change", "Изменение Open QTY", "без округления", RELATIVE, unit="шт"),
         _c("net_value", "Чистая стоимость", "без округления", MONEY, base=0, unit="руб"),
         _c("total_pl", "Total Full PL with Funding", "без округления", MONEY, base=0, unit="руб"),
@@ -269,9 +270,9 @@ def rule(report: str, key: str) -> Rule:
 def scale_of_label(report: str, key: str, label: Optional[str]) -> Optional[int]:
     """Степень десяти, в которой записано значение с подписью label.
 
-    Нужна там, где отчёт читает свой предыдущий выпуск (Open QTY в «Отчёте по
-    портфелям»): вчерашнее значение могло быть записано в другой единице, и
-    сравнивать его нужно, вернув в базовую. None — подпись не узнана.
+    Нужна там, где отчёт читает свои прошлые выпуски (RUONIA/RGBI/RWA в
+    «Отчёте по портфелям»): значение могло быть записано в другой единице, и
+    в бэкап истории его нужно вернуть в базовую. None — подпись не узнана.
     Возвращает сдвиг к базовой единице: value * 10**shift.
     """
     category = CATEGORIES[report][key]

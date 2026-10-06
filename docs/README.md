@@ -12,8 +12,8 @@
 | [NIM](nim.md) | `nim` | `NIM_гггг_мм.xlsx` | `<имя>_converted.csv` | оси `axis_*` |
 | [Трансфертные ставки](transfert_stavka.md) | `transfert-stavka` | два Excel: до 3М и свыше 3М | `result_transert_<дата>.csv` | ставки `name_group/name_st` |
 | [Ставки ОФЗ](ofz_rates.md) | `ofz-rates` | CBonds API | `ofz_report.csv` | ставки `name_group/name_st` |
-| [Динамика портфелей](portfolio_dynamics.md) | `portfolio-dynamics` | «Позиция за период» ×2 + «Состояние лимитов» | `dinamika_portfeley_<дата>.csv` (+ `.xlsx`) | оси `axis_*` + `text_value` |
-| [Отчёт по портфелям](portfolio_report.md) | `portfolio-report` | «Позиция за период» на T-1 | `otchet_po_portfelyam_<дата>.csv` (+ `.xlsx`) | оси `axis_*` + `text_value` |
+| [Динамика портфелей](portfolio_dynamics.md) | `portfolio-dynamics` | «Позиция за период» с начала года на T0 и T-7 + «Состояние лимитов» | `dinamika_portfeley_<дата>.csv` (+ `.xlsx`) | оси `axis_*` + `text_value` |
+| [Отчёт по портфелям](portfolio_report.md) | `portfolio-report` | «Позиция за период» с начала года по T-1 | `otchet_po_portfelyam_<дата>.csv` (+ `.xlsx`) | оси `axis_*` + `text_value` |
 
 ## Три семейства выходных таблиц
 

@@ -107,14 +107,15 @@ COL_VALUE = "Чистая стоимость позиции (кон.)"
 COL_DURATION_START = "Duration (нач.)"
 COL_DURATION_END = "Дюрация"
 
-# Маппинг дюраций на схему намеренно «перекрёстный»: «Duration (нач.)» ->
-# duration_current_yrs, «Дюрация» (конечная) -> duration_target_yrs. Имена не
-# совпадают по смыслу с «нач.»/«кон.» — это осознанное решение при согласовании
-# схемы v3.0, колонки не переименовывать и маппинг соблюдать буквально.
+# Выгрузка берётся за период с начала года по дату среза («Позиция за период
+# 01.01.2026 - 18.09.2026»): колонки «(нач.)» в ней — на 01.01, «(кон.)» — на
+# дату среза. Поэтому текущая дюрация (duration_current_yrs) — это «Дюрация»,
+# дюрация на КОНЕЦ периода. «Duration (нач.)» — дюрация на начало периода и
+# идёт в дело только у выгрузки за один день (обе даты периода совпадают):
+# там начало и есть конец, а «Дюрация» бывает не заполнена.
 #
-# Конечная «Дюрация» временно не читается (настройка «Читать конечную дюрацию
-# из выгрузки», по умолчанию выключена): колонка duration_target_yrs теперь
-# заполняется дюрацией, установленной КУАП, — см. apply_kuap_durations.
+# Целевая дюрация (duration_target_yrs) из выгрузки не берётся вовсе — это
+# дюрация, установленная КУАП (настройка, см. apply_kuap_durations).
 
 POSITION_MARKER = excel_io.normalize_label("Позиция:")
 TOTAL_MARKERS = tuple(excel_io.normalize_label(x) for x in ("Итого", "Всего", "Grand Total", "Total"))
@@ -246,17 +247,26 @@ def _find_sheet_and_header(path: Path) -> Tuple[str, pd.DataFrame, int, Dict[str
     raise PortfolioDynamicsError(message)
 
 
-def _business_date_from_name(path: Path) -> Optional[dt.date]:
-    match = PERIOD_DATES_PATTERN.search(path.name)
-    if not match:
+Period = Tuple[dt.date, dt.date]  # (начало, конец) периода выгрузки
+
+
+def _period_from_match(match) -> Optional[Period]:
+    try:
+        return tuple(dt.datetime.strptime(match.group(i), config.PORTFOLIO_DYNAMICS_DATE_FORMAT
+                                          ).date() for i in (1, 2))
+    except ValueError:
         return None
-    return dt.datetime.strptime(match.group(2), config.PORTFOLIO_DYNAMICS_DATE_FORMAT).date()
 
 
-def _business_date_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optional[dt.date]:
+def _period_from_name(path: Path) -> Optional[Period]:
+    match = PERIOD_DATES_PATTERN.search(Path(path).name)
+    return _period_from_match(match) if match else None
+
+
+def _period_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optional[Period]:
     """Та же строка «Позиция за период [..] - [..] - SECURITIES», но из шапки листа.
 
-    Резерв на случай, если файл переименовали руками и дата из имени пропала.
+    Резерв на случай, если файл переименовали руками и даты из имени пропали.
     """
     for row_idx in range(min(header_row + 1, len(matrix))):
         for value in matrix.iloc[row_idx]:
@@ -264,10 +274,31 @@ def _business_date_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optiona
                 continue
             match = PERIOD_DATES_PATTERN.search(str(value))
             if match:
-                return dt.datetime.strptime(
-                    match.group(2), config.PORTFOLIO_DYNAMICS_DATE_FORMAT
-                ).date()
+                return _period_from_match(match)
     return None
+
+
+def _business_date_from_name(path: Path) -> Optional[dt.date]:
+    period = _period_from_name(path)
+    return period[1] if period else None
+
+
+def _business_date_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optional[dt.date]:
+    period = _period_from_matrix(matrix, header_row)
+    return period[1] if period else None
+
+
+def read_period(path: Path) -> Optional[Period]:
+    """(начало, конец) периода выгрузки: из имени файла, иначе из шапки листа."""
+    path = Path(path)
+    from_name = _period_from_name(path)
+    if from_name is not None:
+        return from_name
+    try:
+        _sheet, matrix, header_row, _cols = _find_sheet_and_header(path)
+    except (PortfolioDynamicsError, excel_io.ExcelSourceError):
+        return None
+    return _period_from_matrix(matrix, header_row)
 
 
 def read_business_date(path: Path) -> Optional[dt.date]:
@@ -475,15 +506,15 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
     scale = config.PORTFOLIO_DYNAMICS_VALUE_SCALE if value_scale is None else value_scale
     sheet_name, matrix, header_row, columns = _find_sheet_and_header(path)
 
-    if not config.PORTFOLIO_DYNAMICS_READ_DURATION_END:
-        # Колонка есть в выгрузке, но её значения намеренно не используются:
-        # убираем её из найденных, и дальше она ведёт себя как отсутствующая.
-        columns.pop(COL_DURATION_END, None)
+    period = _period_from_name(path) or _period_from_matrix(matrix, header_row)
+    # Выгрузка за один день: начало периода и есть конец, «Duration (нач.)» —
+    # запасная колонка текущей дюрации. В выгрузке с начала года она на 01.01.
+    single_day = period is not None and period[0] == period[1]
+    if not single_day:
+        columns.pop(COL_DURATION_START, None)
 
     stats = SliceStats(sheet_name=sheet_name, header_row=header_row + 1, columns=dict(columns))
-    expected = [COL_VALUE, COL_DURATION_START]
-    if config.PORTFOLIO_DYNAMICS_READ_DURATION_END:
-        expected.append(COL_DURATION_END)
+    expected = [COL_VALUE, COL_DURATION_END]
     for missing in expected:
         if missing not in columns:
             logger.warning(
@@ -499,8 +530,17 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
     type_col = columns[COL_ASSET_TYPE]
     value_col = columns[COL_VALUE]
 
+    def current_duration(row) -> Optional[float]:
+        """Дюрация на дату среза: «Дюрация», у выгрузки за день — запасная «Duration (нач.)»."""
+        for column in (COL_DURATION_END, COL_DURATION_START):
+            if column in columns:
+                value = parse_number(row.iloc[columns[column]])
+                if value is not None:
+                    return value
+        return None
+
     order: List[str] = []
-    securities: Dict[str, List[Tuple[Optional[float], Optional[float], Optional[float]]]] = {}
+    securities: Dict[str, List[Tuple[Optional[float], Optional[float]]]] = {}
     stated: Dict[str, Dict[str, Optional[float]]] = {}
     current: Optional[str] = None
 
@@ -527,14 +567,7 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
             # авторитетнее посчитанных по бумагам (см. сверку ниже).
             stated[code] = {
                 "volume": parse_number(row.iloc[value_col]),
-                "duration_current_yrs": (
-                    parse_number(row.iloc[columns[COL_DURATION_START]])
-                    if COL_DURATION_START in columns else None
-                ),
-                "duration_target_yrs": (
-                    parse_number(row.iloc[columns[COL_DURATION_END]])
-                    if COL_DURATION_END in columns else None
-                ),
+                "duration_current_yrs": current_duration(row),
             }
             continue
 
@@ -547,11 +580,7 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
             stats.rows_without_portfolio += 1
             continue
 
-        securities[current].append((
-            parse_number(row.iloc[value_col]),
-            parse_number(row.iloc[columns[COL_DURATION_START]]) if COL_DURATION_START in columns else None,
-            parse_number(row.iloc[columns[COL_DURATION_END]]) if COL_DURATION_END in columns else None,
-        ))
+        securities[current].append((parse_number(row.iloc[value_col]), current_duration(row)))
         stats.securities += 1
 
     stats.portfolios = len(order)
@@ -564,14 +593,11 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
     records = []
     for code in order:
         rows = securities[code]
-        computed_volume = sum(value for value, _dc, _dt in rows if value is not None)
+        computed_volume = sum(value for value, _dc in rows if value is not None)
         computed = {
             "volume": computed_volume,
             "duration_current_yrs": _weighted_duration(
-                [(dc, value) for value, dc, _dt in rows if dc is not None and value is not None]
-            ),
-            "duration_target_yrs": _weighted_duration(
-                [(dtg, value) for value, _dc, dtg in rows if dtg is not None and value is not None]
+                [(dc, value) for value, dc in rows if dc is not None and value is not None]
             ),
         }
         chosen = {
@@ -592,7 +618,8 @@ def parse_slice(path: Path, label: str, value_scale: Optional[float] = None) -> 
             "portfolio_code": code,
             "volume": None if chosen["volume"] is None else chosen["volume"] / scale,
             "duration_current_yrs": chosen["duration_current_yrs"],
-            "duration_target_yrs": chosen["duration_target_yrs"],
+            # Целевая дюрация — только КУАП (apply_kuap_durations), не из выгрузки.
+            "duration_target_yrs": None,
         })
 
     business_date = _business_date_from_name(path) or _business_date_from_matrix(matrix, header_row)
@@ -1462,11 +1489,9 @@ def _add_manual_portfolios(snapshot: pd.DataFrame, previous: PreviousRelease) ->
             "volume_t0": record["volume"],
             "volume_t7": previous_t0.get(record["code"], record["volume"]),
             "duration_current_yrs": record["duration"],
-            # Пока конечная дюрация не читается, «Дюрация-КУАП» — только КУАП;
-            # копировать в неё текущую дюрацию значило бы выдать её за целевую.
-            "duration_target_yrs": (
-                record["duration"] if config.PORTFOLIO_DYNAMICS_READ_DURATION_END else None
-            ),
+            # «Дюрация-КУАП» — только КУАП; копировать в неё текущую дюрацию
+            # значило бы выдать её за целевую.
+            "duration_target_yrs": None,
         })
 
     if not additions:

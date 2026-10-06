@@ -39,7 +39,8 @@ HEADER_ROW = 4
 # «Округление»), xlsx на них не влияет.
 COLUMNS = [
     ("Open QTY, шт", "open_qty", 1, "#,##0"),
-    ("Изменение Open QTY, шт", "open_qty_change", 1, "+#,##0;-#,##0;0"),
+    ("Open QTY на начало года, шт", "open_qty_start", 1, "#,##0"),
+    ("Изменение Open QTY с начала года, шт", "open_qty_change", 1, "+#,##0;-#,##0;0"),
     ("Чистая стоимость, млрд руб", "net_value", 1e9, "#,##0.000"),
     ("Total Full PL with Funding, млн руб", "total_pl", 1e6, "#,##0.0"),
     ("DV01, руб", "dv01", 1, "#,##0"),
@@ -148,12 +149,21 @@ def write_workbook(data: "etl.PortfolioReportData", path: Path) -> Path:
         note.fill = _COMMENT_FILL
         note.alignment = Alignment(wrap_text=True, vertical="top")
 
+    # Портфели, которых нет в выгрузке, но есть комментарий: строка без чисел.
+    for k, code in enumerate(sorted(data.absent_comments)):
+        r = HEADER_ROW + 1 + len(frame) + k
+        ws.cell(row=r, column=1, value=code).font = Font(color="808080")
+        ws.cell(row=r, column=2, value="нет в выгрузке").font = Font(italic=True, color="808080")
+        note = ws.cell(row=r, column=comment_col, value=data.absent_comments[code])
+        note.fill = _COMMENT_FILL
+        note.alignment = Alignment(wrap_text=True, vertical="top")
+
     widths = [22, 10] + [16] * len(COLUMNS) + [60]
     for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     ws.row_dimensions[HEADER_ROW].height = 32
     ws.freeze_panes = ws.cell(row=HEADER_ROW + 1, column=3)
-    last = HEADER_ROW + max(len(frame), 1)
+    last = HEADER_ROW + max(len(frame) + len(data.absent_comments), 1)
     ws.auto_filter.ref = f"A{HEADER_ROW}:{get_column_letter(comment_col)}{last}"
 
     path.parent.mkdir(parents=True, exist_ok=True)

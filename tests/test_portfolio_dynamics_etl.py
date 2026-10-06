@@ -167,32 +167,52 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
         self.assertEqual(result.stats.total_rows_skipped, 2)      # «Итого» и «Всего»
 
     def test_duration_is_weighted_by_value_not_averaged(self):
-        """Две бумаги 30 и 10 млн с дюрациями 3.0 и 1.0 -> 2.5, а не 2.0."""
+        """Две бумаги 30 и 10 млн с дюрациями 2.5 и 1.5 -> 2.25, а не 2.0."""
         result = etl.parse_slice(self.t0_path, "T0")
         row = result.frame.set_index("portfolio_code").loc["AFS_TR_RUR"]
 
-        self.assertAlmostEqual(row["duration_current_yrs"], (3.0 * 30 + 1.0 * 10) / 40)
-        self.assertNotAlmostEqual(row["duration_current_yrs"], (3.0 + 1.0) / 2)
+        self.assertAlmostEqual(row["duration_current_yrs"], (2.5 * 30 + 1.5 * 10) / 40)
+        self.assertNotAlmostEqual(row["duration_current_yrs"], (2.5 + 1.5) / 2)
 
-    def test_end_duration_is_weighted_when_reading_is_enabled(self):
-        settings.set_value("portfolio_dynamics_read_duration_end", True)
-        config.reload()
-        row = etl.parse_slice(self.t0_path, "T0").frame.set_index("portfolio_code").loc["AFS_TR_RUR"]
-        self.assertAlmostEqual(row["duration_target_yrs"], (2.5 * 30 + 1.5 * 10) / 40)
-
-    def test_end_duration_is_not_read_by_default(self):
-        """Колонка «Дюрация» есть в выгрузке, но по умолчанию не читается."""
-        self.assertFalse(config.PORTFOLIO_DYNAMICS_READ_DURATION_END)
-        frame = etl.parse_slice(self.t0_path, "T0").frame
+    def test_ytd_export_takes_current_duration_from_the_end_of_period(self):
+        """Выгрузка с 01.01: «Duration (нач.)» — дюрация на 01.01, текущая — «Дюрация»."""
+        frame = etl.parse_slice(self.t0_path, "T0").frame.set_index("portfolio_code")
+        self.assertAlmostEqual(frame.loc["AFS_TR_RUR", "duration_current_yrs"], 2.25)
+        self.assertNotAlmostEqual(frame.loc["AFS_TR_RUR", "duration_current_yrs"],
+                                  (3.0 * 30 + 1.0 * 10) / 40)
+        # Целевая дюрация из выгрузки не берётся — только КУАП.
         self.assertTrue(frame["duration_target_yrs"].isna().all())
-        self.assertTrue(frame["duration_current_yrs"].notna().all())
 
-    def test_security_without_duration_keeps_its_volume_but_not_its_weight(self):
-        settings.set_value("portfolio_dynamics_read_duration_end", True)
-        config.reload()
+    def test_ytd_export_without_end_duration_does_not_fall_back_to_start(self):
         path = write_export(self.tmp / export_name("03.09.2026"), [
             ("Позиция: AFS_TR_RUR", None, None, None),
             ("Bond", 30 * MLN, 3.0, None),
+        ], period_end="03.09.2026")
+        row = etl.parse_slice(path, "T0").frame.iloc[0]
+        self.assertTrue(pd.isna(row["duration_current_yrs"]))
+
+    def test_single_day_export_falls_back_to_start_duration(self):
+        """Выгрузка за один день: начало периода и есть конец."""
+        path = write_export(self.tmp / "Позиция за период [03.09.2026] - [03.09.2026].xlsx", [
+            ("Позиция: AFS_TR_RUR", None, None, None),
+            ("Bond", 30 * MLN, 3.0, None),
+            ("Bond", 10 * MLN, 1.0, 2.0),
+        ], period_start="03.09.2026", period_end="03.09.2026")
+        row = etl.parse_slice(path, "T0").frame.iloc[0]
+        # Первая бумага — «Duration (нач.)», вторая — «Дюрация»: (3*30 + 2*10) / 40.
+        self.assertAlmostEqual(row["duration_current_yrs"], 2.75)
+
+    def test_read_period(self):
+        self.assertEqual(etl.read_period(self.t0_path),
+                         (dt.date(2026, 1, 1), dt.date(2026, 9, 1)))
+        renamed = self.tmp / "renamed.xlsx"
+        renamed.write_bytes(self.t0_path.read_bytes())
+        self.assertEqual(etl.read_period(renamed), (dt.date(2026, 1, 1), dt.date(2026, 9, 1)))
+
+    def test_security_without_duration_keeps_its_volume_but_not_its_weight(self):
+        path = write_export(self.tmp / export_name("03.09.2026"), [
+            ("Позиция: AFS_TR_RUR", None, None, None),
+            ("Bond", 30 * MLN, None, 3.0),
             ("Bond", 10 * MLN, None, None),
         ], period_end="03.09.2026")
 
@@ -219,13 +239,6 @@ class KuapDurationTests(PortfolioDynamicsTestCase):
         self.assertEqual(target["AFS_TR_RUR"], 3.5)
         others = target.drop("AFS_TR_RUR")
         self.assertTrue(others.isna().all(), "без КУАП и без чтения выгрузки цель пустая")
-
-    def test_kuap_duration_overrides_the_export(self):
-        settings.set_value("portfolio_dynamics_read_duration_end", True)
-        self.set_kuap("AFS_TR_RUR=7")
-        target = self.target(self.build(bootstrap=True))
-        self.assertEqual(target["AFS_TR_RUR"], 7.0)
-        self.assertTrue(target.drop("AFS_TR_RUR").notna().all(), "остальные — из выгрузки")
 
     def test_unknown_code_is_reported_not_fatal(self):
         self.set_kuap("NO_SUCH_PORTFOLIO=2")

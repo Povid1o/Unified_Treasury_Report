@@ -1,14 +1,13 @@
 """Обёртка «Отчёта по портфелям» для единой консоли (см. console.py).
 
-Вход — одна выгрузка «Позиция за период» на T-1 (предыдущий рабочий день).
-Лежит там же, где выгрузки «Динамики портфелей»: папки-даты, плоская папка
-или загрузки — и настройки источника у отчётов общие. Файл из загрузок
-кладётся в папку своей даты, как это сделала бы «Динамика портфелей».
+Вход — одна выгрузка «Позиция за период» с начала года по T-1 (предыдущий
+рабочий день). Лежит там же, где выгрузки «Динамики портфелей»: папки-даты,
+плоская папка или загрузки — и настройки источника у отчётов общие. Файл из
+загрузок кладётся в папку своей даты: «Динамике портфелей» он тоже годится.
 
-Плюс неявные входы: предыдущий выпуск самого отчёта (из него берётся
-вчерашний Open QTY — самый свежий выпуск раньше даты позиций), комментарии из
-xlsx-витрины последнего выпуска и RGBI, RUONIA и RWA на сегодня — их вводят
-руками, и каждый запуск дописывает их в файл истории (market.py).
+Плюс неявные входы: комментарии из xlsx-витрины последнего выпуска и RGBI,
+RUONIA и RWA на сегодня — их вводят руками, и каждый запуск дописывает их в
+файл истории (market.py).
 """
 import argparse
 import datetime as dt
@@ -27,7 +26,8 @@ from reports.portfolio_report import etl, market, workbook
 class PortfolioReport(Report):
     slug = "portfolio-report"
     title = "Отчёт по портфелям"
-    description = ("Выгрузка позиций на T-1 -> плоский CSV для BI: Open QTY и его изменение, "
+    description = ("Выгрузка позиций с начала года по T-1 -> плоский CSV для BI: Open QTY и "
+                   "его изменение с начала года, "
                    "PL, стоимость, DV01, Yield, комментарии по портфелям + история "
                    "RGBI, RUONIA, RWA")
 
@@ -38,26 +38,25 @@ class PortfolioReport(Report):
                  "если на него выгрузки нет, берётся самая свежая более ранняя.",
         )
         parser.add_argument("--input", type=str, default=None,
-                            help="Явный путь к выгрузке «Позиция за период»")
-        parser.add_argument(
-            "--previous", type=str, default=None,
-            help="Предыдущий выпуск (.csv), с которым сравнивается Open QTY. По умолчанию — "
-                 "самый свежий выпуск в папке результатов с датой раньше даты позиций.",
-        )
+                            help="Явный путь к выгрузке «Позиция за период» с начала года")
         parser.add_argument("--rgbi", type=str, default=None, help="RGBI на сегодня")
         parser.add_argument("--ruonia", type=str, default=None, help="RUONIA на сегодня, %%")
         parser.add_argument("--rwa", type=str, default=None, help="RWA на сегодня")
         parser.add_argument("--no-import", action="store_true",
                             help="Не заглядывать в папку загрузок")
         parser.add_argument("--output", type=str, default=None, help="Путь для сохранения .csv")
+        parser.add_argument(
+            "--diagnose", action="store_true",
+            help="Ничего не считать и не записывать: показать, какие колонки нашлись в "
+                 "выгрузке, сколько бумаг увидено и откуда берутся DV01 и Yield.",
+        )
 
     def run(self, args: argparse.Namespace) -> None:
+        if getattr(args, "diagnose", False):
+            _diagnose(args)
+            return
         source_path = _resolve_input(args)
         snapshot_date = etl.positions.read_business_date(source_path)
-        previous = Path(args.previous) if args.previous else None
-        if previous is None and snapshot_date is not None:
-            previous = etl.find_previous_release(config.PORTFOLIO_REPORT_OUTPUT_DIR,
-                                                 before=snapshot_date)
 
         entered = etl.MarketInputs(
             rgbi=_number(args.rgbi, "RGBI"),
@@ -80,7 +79,7 @@ class PortfolioReport(Report):
                 ui.console.print(f"[grey70]Комментарии ({len(comments)}) — из "
                                  f"[bold]{comments_path.name}[/bold][/grey70]")
 
-        data = etl.build_data(source_path, previous_path=previous, market=inputs,
+        data = etl.build_data(source_path, market=inputs,
                               comments=comments, market_history=pending)
         history_file = market.write_history(market.history_path(), history)
         output = Path(args.output) if args.output else etl.default_output_path(data.business_date)
@@ -88,15 +87,13 @@ class PortfolioReport(Report):
         book = workbook.write_workbook(data, workbook.workbook_path(output))
 
         ui.success(f"Готово: {len(data.frame)} портфелей на {data.business_date.isoformat()} "
-                   f"-> {output}")
+                   f"(изменение Open QTY — с {data.period_start:%d.%m.%Y}) -> {output}")
         ui.console.print(f"[grey70]Комментарии пишутся в жёлтой колонке {book.name}[/grey70]")
         ui.console.print(f"[grey70]История рынка: {history_file} — "
                          f"{market.dates_span(history)}[/grey70]")
         if data.market_history:
             ui.console.print(f"[grey70]В CSV добавлены показатели рынка из истории: "
                              f"{market.dates_span(data.market_history)}[/grey70]")
-        if data.previous_path is None:
-            ui.warning("Предыдущего выпуска нет — изменение Open QTY появится со следующего запуска.")
         missing = data.market.missing()
         if missing:
             ui.warning(f"Не введены: {', '.join(missing)} — ячейки в отчёте пустые.")
@@ -122,15 +119,6 @@ class PortfolioReport(Report):
             source_path = etl.take(item)
 
         snapshot_date = etl.positions.read_business_date(source_path)
-        previous = None
-        if snapshot_date is not None:
-            previous = etl.find_previous_release(config.PORTFOLIO_REPORT_OUTPUT_DIR,
-                                                 before=snapshot_date)
-        if previous is not None:
-            ui.console.print(f"[grey70]Open QTY сравнивается с выпуском "
-                             f"[bold]{previous.name}[/bold][/grey70]")
-        else:
-            ui.warning("Предыдущего выпуска нет — изменение Open QTY появится со следующего запуска.")
 
         # Подсказки при вводе — из истории: последнее значение до даты позиций и
         # уже записанное на неё (при повторном прогоне его не нужно вводить снова).
@@ -150,7 +138,6 @@ class PortfolioReport(Report):
                          "[grey50](Enter — оставить записанное или пустым)[/grey50]")
         return argparse.Namespace(
             date=None, input=str(source_path), no_import=no_import, output=None,
-            previous=str(previous) if previous is not None else None,
             rgbi=_ask_number("RGBI", yesterday.rgbi, recorded.rgbi),
             ruonia=_ask_number("RUONIA, %", yesterday.ruonia, recorded.ruonia),
             rwa=_ask_number("RWA", yesterday.rwa, recorded.rwa),
@@ -193,21 +180,35 @@ def _sources_table(sources: List[etl.SourceFile], default: dt.date) -> Table:
                   title_style="bold cyan", box=box.SIMPLE_HEAVY, header_style="bold cyan")
     table.add_column("#", justify="right", style="bold yellow", no_wrap=True, width=3)
     table.add_column("Дата", style="bold white", no_wrap=True)
+    table.add_column("Период с", no_wrap=True)
     table.add_column("Откуда", no_wrap=True)
     table.add_column("Файл", style="grey70", overflow="fold")
     for number, item in enumerate(sources, start=1):
         mark = "  ← T-1" if item.business_date == default else ""
         origin = (f"[bold yellow]{item.origin}[/bold yellow]"
                   if item.origin == etl.ORIGIN_DOWNLOADS else item.origin)
-        table.add_row(str(number), item.business_date.isoformat() + mark, origin, item.path.name)
+        table.add_row(str(number), item.business_date.isoformat() + mark,
+                      item.period_start.strftime("%d.%m.%Y") if item.period_start else "?",
+                      origin, item.path.name)
     return table
 
 
 def _ask_for_source(sources: List[etl.SourceFile]) -> etl.SourceFile:
     t_minus_1 = etl.previous_business_day(dt.date.today())
-    shown = sources[:10]
+    # Выгрузки за один день отчёту не годятся (изменение Open QTY в них ноль) —
+    # их не показываем, чтобы не выбрать по ошибке.
+    usable = [item for item in sources if item.from_year_start]
+    if not usable:
+        raise etl.PortfolioReportError(
+            "Нашлись только выгрузки «Позиция за период» за один день — отчёту нужна "
+            f"выгрузка с начала года («01.01.{t_minus_1.year} - {t_minus_1:%d.%m.%Y}»).")
+    skipped = len(sources) - len(usable)
+    if skipped:
+        ui.console.print(f"[grey50]Выгрузок за один день (без начала года) не показано: "
+                         f"{skipped}[/grey50]")
+    shown = usable[:10]
     ui.console.print(_sources_table(shown, t_minus_1))
-    default = next((item for item in sources if item.business_date == t_minus_1), None)
+    default = next((item for item in usable if item.business_date == t_minus_1), None)
     if default is None:
         default = shown[0]
         ui.warning(f"Выгрузки на T-1 ({t_minus_1.isoformat()}) нет — по умолчанию самая "
@@ -238,3 +239,19 @@ def _resolve_input(args: argparse.Namespace) -> Path:
         return etl.take(etl.pick_source(sources, target))
     return etl.take(etl.pick_source(sources, etl.previous_business_day(dt.date.today()),
                                     strict=False))
+
+
+def _diagnose(args: argparse.Namespace) -> None:
+    """--diagnose: файл берётся тем же выбором, что и при запуске, но не перекладывается."""
+    if args.input:
+        path = Path(args.input)
+    else:
+        sources = etl.find_sources(etl.downloads_dir(getattr(args, "no_import", False)))
+        if args.date:
+            target = dt.datetime.strptime(args.date.strip(), "%Y-%m-%d").date()
+            path = etl.pick_source(sources, target).path
+        else:
+            path = etl.pick_source(sources, etl.previous_business_day(dt.date.today()),
+                                   strict=False).path
+    for line in etl.diagnose(path):
+        ui.console.print(line, markup=False, highlight=False)

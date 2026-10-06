@@ -1,4 +1,4 @@
-"""ETL «Отчёта по портфелям»: выгрузка «Позиция за период» на T-1 -> свод по портфелям.
+"""ETL «Отчёта по портфелям»: выгрузка «Позиция за период» с начала года по T-1 -> свод по портфелям.
 
 На выходе — плоский CSV для загрузки в BI, в той же раскладке, что у ЧПД и
 NIM: одна строка — одно значение, смысл значения задают оси (см. OUT_COLUMNS).
@@ -7,20 +7,24 @@ NIM: одна строка — одно значение, смысл значе�
 (см. reports/portfolio_dynamics/etl.py): лист ищется по колонке «Тип актива»,
 строка «Позиция: <CODE>» открывает портфель, строки под ней — его бумаги.
 
+Период выгрузки — С НАЧАЛА ГОДА по T-1 («Позиция за период 01.01.2026 -
+29.09.2026»): колонки «(нач.)» в ней — на начало периода, «(кон.)» — на T-1.
+Изменение Open QTY — это «(кон.)» минус «(нач.)», то есть изменение с начала
+года, из самого файла. Выгрузка за один день (обе даты совпадают) для отчёта
+не годится: изменение в ней всегда ноль, поэтому такие файлы не берутся.
+
 Что берётся по портфелю:
-- Open QTY, Total Full PL with Funding, чистая стоимость, DV01 — из строки
-  «Позиция: …»: выгрузка считает их по портфелю сама. Если в строке пусто —
-  сумма по бумагам. DV01 бумаги в выгрузке посчитан на всю позицию, поэтому
-  у портфеля он складывается, а не усредняется;
-- Yield — средневзвешенная по чистой стоимости бумаг: по портфелю выгрузка
-  её не считает. Только если ни у одной бумаги нет пары «Yield + стоимость» —
-  то, что написано в строке портфеля.
+- Open QTY на конец и на начало периода, Total Full PL with Funding, чистая
+  стоимость — из строки «Позиция: …»: выгрузка считает их по портфелю сама.
+  Если в строке пусто — сумма по бумагам;
+- DV01 — ВСЕГДА сумма «DV01 (кон.)» по бумагам портфеля (строки под
+  «Позиция: …» до следующей такой строки). DV01 бумаги в выгрузке посчитан на
+  всю позицию, поэтому у портфеля он складывается, а не усредняется. Что
+  написано в строке портфеля, не используется;
+- Yield — ВСЕГДА средневзвешенная «Yield (кон.)» по бумагам портфеля, вес —
+  «Чистая стоимость позиции (кон.)» бумаги. Строка портфеля не используется.
 
-Почему предыдущий выпуск — это ВХОД. Open QTY сравнивается со значением на
-предыдущую дату, а в выгрузке на T-1 его нет. Каждый выпуск содержит Open QTY
-по всем портфелям, и следующий запуск берёт вчерашние значения оттуда.
-
-Ещё два входа, которых нет в выгрузке, — как в «Динамике портфелей»:
+Два входа, которых нет в выгрузке, — как в «Динамике портфелей»:
 - комментарии к портфелям пишутся в xlsx-витрине рядом с CSV и переносятся
   из выпуска в выпуск (reports/portfolio_report/workbook.py);
 - RUONIA, RGBI и RWA вводятся руками и копятся в файле истории; в CSV
@@ -57,16 +61,17 @@ class PortfolioReportError(RuntimeError):
 # ── Колонки входной выгрузки ─────────────────────────────────────────────────
 # Сравнение по excel_io.normalize_label, как и в «Динамике портфелей».
 COL_QTY = "Open QTY (кон.)"
+COL_QTY_START = "Open QTY (нач.)"
 COL_PL = "Total Full PL with Funding"
 COL_DV01 = "DV01 (кон.)"
 COL_YIELD = "Yield (кон.)"
 COL_VALUE = positions.COL_VALUE  # «Чистая стоимость позиции (кон.)»
 
-INPUT_COLUMNS = (COL_QTY, COL_PL, COL_DV01, COL_YIELD, COL_VALUE)
+INPUT_COLUMNS = (COL_QTY, COL_QTY_START, COL_PL, COL_DV01, COL_YIELD, COL_VALUE)
 
 # Свод по портфелям внутри расчёта (суммы в рублях, как в выгрузке).
 DATA_COLUMNS = [
-    "portfolio_code", "portfolio_type", "open_qty", "open_qty_prev", "open_qty_change",
+    "portfolio_code", "portfolio_type", "open_qty", "open_qty_start", "open_qty_change",
     "net_value", "total_pl", "dv01", "yield",
 ]
 
@@ -93,6 +98,7 @@ MARKET_GROUP = "Рынок"
 # (колонка свода, название показателя в axis_3, единица в axis_4)
 METRICS = [
     ("open_qty", "Open QTY", "шт"),
+    ("open_qty_start", "Open QTY на начало года", "шт"),
     ("open_qty_change", "Изменение Open QTY", "шт"),
     ("net_value", "Чистая стоимость", "руб"),
     ("total_pl", "Total Full PL with Funding", "руб"),
@@ -100,7 +106,6 @@ METRICS = [
     ("yield", "Yield", "%"),
 ]
 MARKET_METRICS = [("rgbi", "RGBI", "пункты"), ("ruonia", "RUONIA", "%"), ("rwa", "RWA", "руб")]
-OPEN_QTY_METRIC = "Open QTY"
 COMMENT_METRIC = "Комментарий"
 
 OUTPUT_FILENAME_PREFIX = "otchet_po_portfelyam_"
@@ -125,30 +130,49 @@ class PositionsSnapshot:
     """Выгрузка на одну дату, свёрнутая до портфелей (суммы в рублях)."""
 
     path: Path
-    business_date: Optional[dt.date]
-    frame: pd.DataFrame  # portfolio_code, open_qty, net_value, total_pl, dv01, yield
+    business_date: Optional[dt.date]  # конец периода выгрузки (T-1)
+    period_start: Optional[dt.date]   # начало периода (начало года)
+    frame: pd.DataFrame  # portfolio_code, open_qty, open_qty_start, net_value, total_pl, dv01, yield
     securities: int = 0
     missing_columns: List[str] = field(default_factory=list)
+    diagnostics: Optional["ParseDiagnostics"] = None
 
 
 @dataclass
-class PreviousRelease:
-    path: Path
-    business_date: Optional[dt.date]
-    open_qty: Dict[str, float]  # портфель -> Open QTY
-    market: MarketInputs
+class ParseDiagnostics:
+    """Что разбор увидел в файле — для --diagnose и предупреждений в логе.
+
+    DV01 и Yield (в отличие от Open QTY, PL и стоимости) обычно считаются по
+    строкам БУМАГ, поэтому пустые DV01/Yield почти всегда значат одно из двух:
+    колонка не найдена по названию или строки бумаг не распознаны.
+    """
+
+    sheet_name: str
+    header_row: int                                  # номер строки в Excel, с 1
+    headers: List[str]                               # заголовки как в файле
+    columns: Dict[str, int]                          # колонка выгрузки -> индекс
+    # Строки бумаг с пустым «Тип актива» (номер строки Excel). Бумагами они
+    # считаются: пустая ячейка приходит из Excel как NaN, а не как пустая строка.
+    untyped_rows: List[int] = field(default_factory=list)
+    # Непустые ячейки, которые не разобрались как число: колонка -> примеры.
+    unparsed: Dict[str, List[str]] = field(default_factory=dict)
+    # Портфель -> {"securities": N, "dv01": откуда, "yield": откуда}.
+    portfolios: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 @dataclass
 class PortfolioReportData:
     business_date: dt.date          # дата позиций (T-1)
+    period_start: dt.date           # с какой даты считается изменение Open QTY
     report_date: dt.date            # дата отчёта и введённых руками показателей
     source_path: Path
     frame: pd.DataFrame             # DATA_COLUMNS, суммы в рублях
     market: MarketInputs
-    previous_date: Optional[dt.date] = None
-    previous_path: Optional[Path] = None
     comments: Dict[str, str] = field(default_factory=dict)  # код (верхний регистр) -> текст
+    # Комментарии портфелей, которых в этой выгрузке нет: в CSV их не пишут
+    # (у портфеля нет чисел на дату), но витрина хранит их, чтобы портфель,
+    # выпавший на день, не потерял комментарий — как в «Динамике портфелей».
+    absent_comments: Dict[str, str] = field(default_factory=dict)
     # Рыночные показатели за ДРУГИЕ даты, которых ещё нет в CSV папки результатов
     # (см. market.pending): {дата: {rgbi/ruonia/rwa: значение}}.
     market_history: Dict[dt.date, Dict[str, float]] = field(default_factory=dict)
@@ -191,18 +215,35 @@ def parse_positions(path: Path) -> PositionsSnapshot:
 
     missing = [label for label in INPUT_COLUMNS if label not in columns]
     for label in missing:
-        logger.warning("%s: колонка «%s» не найдена на листе %r — значения останутся пустыми.",
-                       path.name, label, sheet_name)
+        similar = _similar_headers(label, matrix.iloc[header_row])
+        logger.warning("%s: колонка «%s» не найдена на листе %r — значения останутся пустыми.%s",
+                       path.name, label, sheet_name,
+                       f" Похожие заголовки в файле: {', '.join(repr(h) for h in similar)}."
+                       if similar else "")
     if COL_VALUE not in columns:
         raise PortfolioReportError(
             f"В файле {path.name} (лист {sheet_name!r}) нет колонки «{COL_VALUE}» — "
             "без неё не посчитать ни стоимость, ни средневзвешенную доходность."
         )
 
+    diag = ParseDiagnostics(
+        sheet_name=sheet_name, header_row=header_row + 1,
+        headers=["" if v is None or (not isinstance(v, str) and pd.isna(v)) else str(v).strip()
+                 for v in matrix.iloc[header_row]],
+        columns=dict(columns),
+    )
+
     def cell(row, label) -> Optional[float]:
         if label not in columns:
             return None
-        return positions.parse_number(row.iloc[columns[label]])
+        raw = row.iloc[columns[label]]
+        value = positions.parse_number(raw)
+        if value is None and raw is not None and not (not isinstance(raw, str) and pd.isna(raw)) \
+                and str(raw).strip() and str(raw).strip().casefold() not in positions._MISSING_TOKENS:
+            examples = diag.unparsed.setdefault(label, [])
+            if len(examples) < 5:
+                examples.append(str(raw))
+        return value
 
     order: List[str] = []
     stated: Dict[str, Dict[str, Optional[float]]] = {}
@@ -235,12 +276,19 @@ def parse_positions(path: Path) -> PositionsSnapshot:
             continue  # «Итого» и шапка выгрузки до первого портфеля
         rows_by_code[current].append(values)
         securities += 1
+        if raw_type is None or (not isinstance(raw_type, str) and pd.isna(raw_type)):
+            diag.untyped_rows.append(row_idx + 1)
 
     if not order:
         raise PortfolioReportError(
             f"В файле {path.name} (лист {sheet_name!r}) нет ни одной строки "
             f"«{positions.COL_ASSET_TYPE}» вида «Позиция: <КОД>» — портфели определить не по чему."
         )
+
+    for label, examples in diag.unparsed.items():
+        logger.warning("%s: в колонке «%s» есть значения, которые не разобрались как число "
+                       "(например: %s) — они считаются пустыми.", path.name, label,
+                       "; ".join(repr(e) for e in examples))
 
     records = []
     for code in order:
@@ -261,31 +309,98 @@ def parse_positions(path: Path) -> PositionsSnapshot:
                 path.name, code, f"{own[COL_VALUE]:,.2f}", f"{computed_value:,.2f}",
             )
 
-        yield_ = positions._weighted_duration(
-            [(r[COL_YIELD], r[COL_VALUE]) for r in rows
-             if r[COL_YIELD] is not None and r[COL_VALUE] is not None]
-        )
+        yield_pairs = [(r[COL_YIELD], r[COL_VALUE]) for r in rows
+                       if r[COL_YIELD] is not None and r[COL_VALUE] is not None]
+        yield_ = positions._weighted_duration(yield_pairs)
+        dv01 = _sum(r[COL_DV01] for r in rows)
+        dv01_rows = sum(1 for r in rows if r[COL_DV01] is not None)
+        diag.portfolios[code] = {
+            "securities": len(rows),
+            "dv01": f"сумма по {dv01_rows} бумагам" if dv01 is not None else "пусто",
+            "yield": (f"средневзвешенная по {len(yield_pairs)} бумагам" if yield_ is not None
+                      else "пусто"),
+        }
         records.append({
             "portfolio_code": code,
             "open_qty": stated_or_sum(COL_QTY),
+            "open_qty_start": stated_or_sum(COL_QTY_START),
             "net_value": stated_or_sum(COL_VALUE),
             "total_pl": stated_or_sum(COL_PL),
-            "dv01": stated_or_sum(COL_DV01),
-            # Бумаг с Yield нет — тогда то, что выгрузка написала по портфелю.
-            "yield": yield_ if yield_ is not None else own[COL_YIELD],
+            "dv01": dv01,
+            "yield": yield_,
         })
 
-    business_date = (positions._business_date_from_name(path)
-                     or positions._business_date_from_matrix(matrix, header_row))
-    logger.info("%s: лист %r, портфелей %d, бумаг %d, дата позиций %s",
+    for column, title in (("dv01", "DV01"), ("yield", "Yield")):
+        if records and all(r[column] is None for r in records):
+            logger.warning("%s: %s не посчитан ни по одному портфелю. Что отчёт увидел в файле, "
+                           "покажет: python console.py portfolio-report --diagnose --input "
+                           "\"<путь к файлу>\"", path.name, title)
+
+    period = (positions._period_from_name(path)
+              or positions._period_from_matrix(matrix, header_row))
+    period_start, business_date = period if period else (None, None)
+    logger.info("%s: лист %r, портфелей %d, бумаг %d, период %s",
                 path.name, sheet_name, len(order), securities,
-                business_date.isoformat() if business_date else "не определена")
+                f"{period_start.isoformat()} - {business_date.isoformat()}" if period
+                else "не определён")
     return PositionsSnapshot(
-        path=path, business_date=business_date,
-        frame=pd.DataFrame(records, columns=["portfolio_code", "open_qty", "net_value",
-                                             "total_pl", "dv01", "yield"]),
-        securities=securities, missing_columns=missing,
+        path=path, business_date=business_date, period_start=period_start,
+        frame=pd.DataFrame(records, columns=["portfolio_code", "open_qty", "open_qty_start",
+                                             "net_value", "total_pl", "dv01", "yield"]),
+        securities=securities, missing_columns=missing, diagnostics=diag,
     )
+
+
+_HINTS = {COL_DV01: ("dv01",), COL_YIELD: ("yield", "доход"), COL_QTY: ("qty", "колич"),
+          COL_QTY_START: ("qty", "колич"), COL_PL: ("pl",), COL_VALUE: ("стоимост",)}
+
+
+def _similar_headers(label: str, header_row) -> List[str]:
+    """Заголовки файла, похожие на искомую колонку (для подсказки, что не нашлось)."""
+    hints = _HINTS.get(label, ())
+    result = []
+    for value in header_row:
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            continue
+        if any(k in excel_io.normalize_label(value) for k in hints):
+            result.append(str(value).strip())
+    return result
+
+
+def diagnose(path: Path) -> List[str]:
+    """Отчёт для --diagnose: какие колонки нашлись, сколько бумаг увидено, откуда DV01/Yield."""
+    snapshot = parse_positions(path)
+    diag = snapshot.diagnostics
+    from openpyxl.utils import get_column_letter
+
+    lines = [f"Файл: {Path(path).name}",
+             f"Лист: {diag.sheet_name!r}, строка заголовков: {diag.header_row}",
+             "Период: " + (f"{snapshot.period_start:%d.%m.%Y} - {snapshot.business_date:%d.%m.%Y}"
+                           if snapshot.business_date else "не определён"),
+             "", "Колонки:"]
+    for label in INPUT_COLUMNS:
+        if label in diag.columns:
+            index = diag.columns[label]
+            lines.append(f"  [найдена]    {label} — колонка {get_column_letter(index + 1)}")
+            continue
+        similar = _similar_headers(label, diag.headers)
+        lines.append(f"  [НЕ НАЙДЕНА] {label}"
+                     + (f" — похожие заголовки в файле: {', '.join(repr(h) for h in similar)}"
+                        if similar else " — похожих заголовков нет"))
+    for label, examples in diag.unparsed.items():
+        lines.append(f"  [не числа]   {label}: {'; '.join(repr(e) for e in examples)}")
+
+    lines += ["", f"Портфелей: {len(diag.portfolios)}, строк бумаг: {snapshot.securities}"]
+    if diag.untyped_rows:
+        lines.append(f"  из них с пустым «{positions.COL_ASSET_TYPE}»: {len(diag.untyped_rows)} "
+                     "(считаются бумагами)")
+    lines.append("")
+    width = max((len(code) for code in diag.portfolios), default=10)
+    lines.append(f"  {'Портфель'.ljust(width)}  бумаг  DV01 — откуда / Yield — откуда")
+    for code, info in diag.portfolios.items():
+        lines.append(f"  {code.ljust(width)}  {info['securities']:>5}  "
+                     f"{info['dv01']} / {info['yield']}")
+    return lines
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -303,8 +418,14 @@ _ORIGIN_PRIORITY = [ORIGIN_OWN_FOLDER, ORIGIN_OTHER_FOLDER, ORIGIN_FLAT, ORIGIN_
 @dataclass(frozen=True)
 class SourceFile:
     path: Path
-    business_date: dt.date
+    business_date: dt.date             # конец периода выгрузки
     origin: str
+    period_start: Optional[dt.date] = None
+
+    @property
+    def from_year_start(self) -> bool:
+        """Выгрузка за период (а не за один день) — только такая годится отчёту."""
+        return self.period_start is not None and self.period_start < self.business_date
 
 
 def _source():
@@ -321,9 +442,11 @@ def downloads_dir(no_import: bool = False) -> Optional[Path]:
 def find_sources(downloads: Optional[Path]) -> List[SourceFile]:
     """По одной выгрузке на каждую дату, свежие сначала.
 
-    Если на дату есть несколько файлов, берётся лежащий в папке своей даты,
-    затем в другой папке-дате, затем в плоской папке, и только потом — в
-    загрузках: разложенное по местам важнее того, что ещё не принято.
+    Если на дату есть несколько файлов, выгрузка с начала года важнее
+    выгрузки за один день (та для отчёта не годится, см. pick_source). При
+    равенстве берётся лежащий в папке своей даты, затем в другой папке-дате,
+    затем в плоской папке, и только потом — в загрузках: разложенное по местам
+    важнее того, что ещё не принято.
     """
     source = _source()
     found: List[SourceFile] = []
@@ -348,11 +471,16 @@ def find_sources(downloads: Optional[Path]) -> List[SourceFile]:
         found += [SourceFile(c.path, c.business_date, ORIGIN_DOWNLOADS)
                   for c in inbox.scan_slices(source, downloads)]
 
+    def rank(item: SourceFile):
+        return (not item.from_year_start, _ORIGIN_PRIORITY.index(item.origin))
+
     best: Dict[dt.date, SourceFile] = {}
     for item in found:
+        period = positions.read_period(item.path)
+        item = SourceFile(item.path, item.business_date, item.origin,
+                          period[0] if period else None)
         current = best.get(item.business_date)
-        if current is None or (_ORIGIN_PRIORITY.index(item.origin)
-                               < _ORIGIN_PRIORITY.index(current.origin)):
+        if current is None or rank(item) < rank(current):
             best[item.business_date] = item
     return [best[d] for d in sorted(best, reverse=True)]
 
@@ -389,30 +517,41 @@ def take(item: SourceFile, move: Optional[bool] = None) -> Path:
 
 def pick_source(sources: List[SourceFile], target: dt.date,
                 strict: bool = True) -> SourceFile:
-    """Выгрузка на дату target.
+    """Выгрузка с начала года на дату target.
 
     strict=False — дата не задана явно (T-1 по умолчанию): если на неё файла
     нет (праздник, выгрузку не сделали), берётся самая свежая более ранняя, с
-    предупреждением.
+    предупреждением. Выгрузка за один день не берётся никогда: изменение Open
+    QTY в ней всегда ноль, и отчёт молча показал бы, что ничего не менялось.
     """
     for item in sources:
-        if item.business_date == target:
+        if item.business_date == target and item.from_year_start:
             return item
-    earlier = [item for item in sources if item.business_date < target]
+    single_day = [item for item in sources
+                  if item.business_date == target and not item.from_year_start]
+    earlier = [item for item in sources if item.business_date < target and item.from_year_start]
     if not strict and earlier:
-        logger.warning("Выгрузки на %s нет — взята самая свежая более ранняя, на %s.",
-                       target.isoformat(), earlier[0].business_date.isoformat())
+        logger.warning("Выгрузки с начала года на %s нет — взята самая свежая более ранняя, "
+                       "на %s.", target.isoformat(), earlier[0].business_date.isoformat())
         return earlier[0]
-    available = ", ".join(item.business_date.isoformat() for item in sources[:10]) or "ни одной"
+    if single_day:
+        raise PortfolioReportError(
+            f"На {target.isoformat()} есть только выгрузка за один день "
+            f"({single_day[0].path.name}). Отчёту нужна выгрузка с начала года: "
+            f"«Позиция за период 01.01.{target.year} - {target:%d.%m.%Y}» — из неё "
+            "считается изменение Open QTY."
+        )
+    available = ", ".join(item.business_date.isoformat() for item in sources[:10]
+                          if item.from_year_start) or "ни одной"
     raise PortfolioReportError(
-        f"Не найдена выгрузка «Позиция за период» на {target.isoformat()}. "
+        f"Не найдена выгрузка «Позиция за период» с начала года на {target.isoformat()}. "
         f"Есть на даты: {available}. Искали в {Path(_source().directory)} (с папками-датами)"
         + (" и в загрузках." if downloads_dir() is not None else "; приёмка из загрузок выключена.")
     )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Предыдущий выпуск
+# Прошлые выпуски (их читает market.released)
 # ════════════════════════════════════════════════════════════════════════════
 def release_date(path: Path) -> Optional[dt.date]:
     match = _OUTPUT_DATE.search(Path(path).name)
@@ -424,37 +563,11 @@ def release_date(path: Path) -> Optional[dt.date]:
         return None
 
 
-def find_previous_release(output_dir: Path, before: dt.date) -> Optional[Path]:
-    """Самый свежий выпуск с датой позиций СТРОГО раньше before.
-
-    Строго: повторный прогон за ту же дату должен сравниваться со вчерашним
-    выпуском, а не с самим собой (иначе изменение Open QTY всегда было бы 0).
-    """
-    output_dir = Path(output_dir)
-    if not output_dir.is_dir():
-        return None
-    dated = []
-    for path in output_dir.glob(f"{OUTPUT_FILENAME_PREFIX}*.csv"):
-        if not path.is_file():
-            continue
-        when = release_date(path)
-        if when is not None and when < before:
-            dated.append((when, path))
-    if not dated:
-        return None
-    return max(dated, key=lambda item: item[0])[1]
-
-
-def _optional_float(value) -> Optional[float]:
-    return positions.parse_number(value)
-
-
 def _to_base_unit(value: float, key: str, unit: Optional[str], path: Path) -> float:
-    """Значение прошлого выпуска -> исходная единица показателя (шт, руб…).
+    """Значение прошлого выпуска -> исходная единица показателя (руб, %…).
 
-    Выпуск мог быть записан с другой настройкой «Округление» (Open QTY в тыс.
-    шт): без пересчёта вчерашнее значение сравнивалось бы с сегодняшним в
-    другой единице, и изменение Open QTY вышло бы на порядки неверным.
+    Выпуск мог быть записан с другой настройкой «Округление» (RWA в млрд):
+    без пересчёта в бэкап истории ушло бы значение в чужой единице.
     """
     if unit is None:
         return value
@@ -466,48 +579,6 @@ def _to_base_unit(value: float, key: str, unit: Optional[str], path: Path) -> fl
     return rounding.Rule(shift=shift).scale(value) if shift else value
 
 
-def load_previous_release(path: Path) -> PreviousRelease:
-    """Вчерашний Open QTY по портфелям и введённые тогда RGBI/RUONIA/RWA."""
-    path = Path(path)
-    try:
-        flat = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
-    except (OSError, ValueError, UnicodeDecodeError) as exc:
-        raise PortfolioReportError(
-            f"Не удалось прочитать предыдущий выпуск {path.name}: {exc}. Укажите другой "
-            "файл через --previous или удалите битый выпуск из папки результатов."
-        ) from exc
-    missing = [c for c in ("date_", "axis_1", "axis_2", "axis_3", "value") if c not in flat.columns]
-    if missing:
-        raise PortfolioReportError(
-            f"Предыдущий выпуск {path.name} не в формате отчёта — нет колонок {missing}."
-        )
-
-    open_qty: Dict[str, float] = {}
-    market: Dict[str, Optional[float]] = {}
-    market_names = {title: key for key, title, _unit in MARKET_METRICS}
-    has_unit = "axis_4" in flat.columns
-    for row in flat.itertuples(index=False):
-        value = _optional_float(row.value)
-        if value is None:
-            continue
-        if row.axis_3 == OPEN_QTY_METRIC and row.axis_2:
-            value = _to_base_unit(value, "open_qty", row.axis_4 if has_unit else None, path)
-            open_qty[row.axis_2.strip().upper()] = value
-        elif row.axis_1 == MARKET_GROUP and row.axis_3 in market_names:
-            key = market_names[row.axis_3]
-            market[key] = _to_base_unit(value, key, row.axis_4 if has_unit else None, path)
-
-    business_date = release_date(path)
-    dates = {d for d in flat["date_"] if d}
-    if len(dates) == 1:
-        try:
-            business_date = dt.date.fromisoformat(dates.pop())
-        except ValueError:
-            pass
-    return PreviousRelease(path=path, business_date=business_date, open_qty=open_qty,
-                           market=MarketInputs(**market))
-
-
 # ════════════════════════════════════════════════════════════════════════════
 # Сборка
 # ════════════════════════════════════════════════════════════════════════════
@@ -515,56 +586,36 @@ def _type_of(code: str) -> str:
     return positions.guess_type(code, positions.KNOWN_PORTFOLIO_TYPES)
 
 
-def build_data(source_path: Path, previous_path: Optional[Path] = None,
+def build_data(source_path: Path,
                market: Optional[MarketInputs] = None,
                report_date: Optional[dt.date] = None,
                comments: Optional[Dict[str, str]] = None,
                market_history: Optional[Dict[dt.date, Dict[str, float]]] = None
                ) -> PortfolioReportData:
     snapshot = parse_positions(source_path)
+    name = Path(source_path).name
     if snapshot.business_date is None:
         raise PortfolioReportError(
-            f"Не удалось определить дату позиций в {Path(source_path).name}: в имени файла "
-            "или в шапке листа должна быть строка «Позиция за период [дд.мм.гггг] - [дд.мм.гггг]»."
+            f"Не удалось определить дату позиций в {name}: в имени файла или в шапке "
+            "листа должна быть строка «Позиция за период [дд.мм.гггг] - [дд.мм.гггг]»."
         )
+    start, end = snapshot.period_start, snapshot.business_date
+    if start >= end:
+        raise PortfolioReportError(
+            f"{name} — выгрузка за один день ({end:%d.%m.%Y}). Отчёту нужна выгрузка с "
+            f"начала года: «Позиция за период 01.01.{end.year} - {end:%d.%m.%Y}» — "
+            "изменение Open QTY считается от первой даты периода."
+        )
+    if start != dt.date(end.year, 1, 1):
+        logger.warning("%s: период начинается %s, а не 01.01.%d — изменение Open QTY "
+                       "будет посчитано от %s.", name, start.strftime("%d.%m.%Y"), end.year,
+                       start.strftime("%d.%m.%Y"))
     frame = snapshot.frame.copy()
     frame["portfolio_type"] = frame["portfolio_code"].map(_type_of)
-
-    previous = load_previous_release(previous_path) if previous_path else None
-    if previous is not None and previous.business_date is not None \
-            and previous.business_date >= snapshot.business_date:
-        logger.warning("Предыдущий выпуск %s — на %s, не раньше позиций (%s): сравнение "
-                       "Open QTY покажет не то, что нужно.", previous.path.name,
-                       previous.business_date.isoformat(), snapshot.business_date.isoformat())
-
-    if previous is None:
-        logger.warning("Предыдущего выпуска нет — Open QTY сравнивать не с чем, колонки "
-                       "«пред.» и «изменение» останутся пустыми.")
-        frame["open_qty_prev"] = None
-        frame["open_qty_change"] = None
-    else:
-        prev_qty = pd.Series(previous.open_qty, dtype=float)
-        frame["open_qty_prev"] = frame["portfolio_code"].map(prev_qty.to_dict())
-        # Портфеля не было вчера — количество выросло с нуля; нет сегодня — упало до нуля.
-        gone = [code for code in prev_qty.index if code not in set(frame["portfolio_code"])]
-        if gone:
-            logger.warning("Портфели из предыдущего выпуска, которых нет в выгрузке: %s — "
-                           "показаны с нулевым Open QTY.", ", ".join(gone))
-            extra = pd.DataFrame({
-                "portfolio_code": gone,
-                "portfolio_type": [_type_of(code) for code in gone],
-                "open_qty": [0.0] * len(gone),
-                "open_qty_prev": [prev_qty[code] for code in gone],
-            })
-            frame = pd.concat([frame, extra], ignore_index=True)
-        new = frame.loc[frame["open_qty_prev"].isna(), "portfolio_code"].tolist()
-        if new:
-            logger.info("Новые портфели (в предыдущем выпуске их не было): %s", ", ".join(new))
-        frame["open_qty_change"] = [
-            None if qty is None or pd.isna(qty) else
-            qty - (0.0 if prev is None or pd.isna(prev) else prev)
-            for qty, prev in zip(frame["open_qty"], frame["open_qty_prev"])
-        ]
+    frame["open_qty_change"] = [
+        None if qty is None or pd.isna(qty) or first is None or pd.isna(first) else qty - first
+        for qty, first in zip(frame["open_qty"], frame["open_qty_start"])
+    ]
 
     market = market or MarketInputs()
     for name in market.missing():
@@ -574,8 +625,8 @@ def build_data(source_path: Path, previous_path: Optional[Path] = None,
                 if str(text or "").strip()}
     dropped = sorted(set(comments) - set(frame["portfolio_code"].str.upper()))
     if dropped:
-        logger.warning("Комментарии к портфелям, которых нет в выпуске, не перенесены: %s.",
-                       ", ".join(dropped))
+        logger.warning("Портфелей %s нет в выгрузке — их комментарии сохранены в xlsx-витрине, "
+                       "но в CSV не попадут.", ", ".join(dropped))
     history = {day: values for day, values in (market_history or {}).items()
                if day != snapshot.business_date and values}
 
@@ -585,9 +636,9 @@ def build_data(source_path: Path, previous_path: Optional[Path] = None,
         source_path=Path(source_path),
         frame=frame[DATA_COLUMNS].reset_index(drop=True),
         market=market,
-        previous_date=previous.business_date if previous else None,
-        previous_path=previous.path if previous else None,
+        period_start=start,
         comments={code: text for code, text in comments.items() if code not in dropped},
+        absent_comments={code: comments[code] for code in dropped},
         market_history=history,
     )
 
