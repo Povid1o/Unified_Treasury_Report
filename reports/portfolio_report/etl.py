@@ -424,8 +424,23 @@ class SourceFile:
 
     @property
     def from_year_start(self) -> bool:
-        """Выгрузка за период (а не за один день) — только такая годится отчёту."""
-        return self.period_start is not None and self.period_start < self.business_date
+        """Выгрузка «01.01 - дата» того же года — только такая годится отчёту."""
+        return is_year_start_period(self.period_start, self.business_date)
+
+
+def is_year_start_period(start: Optional[dt.date], end: Optional[dt.date]) -> bool:
+    """Период выгрузки — с 01.01 года её конечной даты по конечную дату.
+
+    Выгрузка за один день не годится (изменение Open QTY в ней всегда ноль),
+    выгрузка с другой начальной даты — тоже: изменение посчиталось бы не с
+    начала года, и на дашборде это было бы не видно.
+    """
+    return (start is not None and end is not None
+            and start == dt.date(end.year, 1, 1) and start < end)
+
+
+def _period_text(start: Optional[dt.date], end: dt.date) -> str:
+    return f"{start:%d.%m.%Y} - {end:%d.%m.%Y}" if start else f"? - {end:%d.%m.%Y}"
 
 
 def _source():
@@ -522,24 +537,26 @@ def pick_source(sources: List[SourceFile], target: dt.date,
     strict=False — дата не задана явно (T-1 по умолчанию): если на неё файла
     нет (праздник, выгрузку не сделали), берётся самая свежая более ранняя, с
     предупреждением. Выгрузка за один день не берётся никогда: изменение Open
-    QTY в ней всегда ноль, и отчёт молча показал бы, что ничего не менялось.
+    QTY в ней всегда ноль, и отчёт молча показал бы, что ничего не менялось. Не
+    берётся и выгрузка с другой начальной даты (не 01.01).
     """
     for item in sources:
         if item.business_date == target and item.from_year_start:
             return item
-    single_day = [item for item in sources
-                  if item.business_date == target and not item.from_year_start]
+    unusable = [item for item in sources
+                if item.business_date == target and not item.from_year_start]
     earlier = [item for item in sources if item.business_date < target and item.from_year_start]
     if not strict and earlier:
         logger.warning("Выгрузки с начала года на %s нет — взята самая свежая более ранняя, "
                        "на %s.", target.isoformat(), earlier[0].business_date.isoformat())
         return earlier[0]
-    if single_day:
+    if unusable:
+        item = unusable[0]
         raise PortfolioReportError(
-            f"На {target.isoformat()} есть только выгрузка за один день "
-            f"({single_day[0].path.name}). Отчёту нужна выгрузка с начала года: "
-            f"«Позиция за период 01.01.{target.year} - {target:%d.%m.%Y}» — из неё "
-            "считается изменение Open QTY."
+            f"На {target.isoformat()} есть только выгрузка за период "
+            f"{_period_text(item.period_start, item.business_date)} ({item.path.name}). "
+            f"Отчёту нужна выгрузка с начала года: «Позиция за период 01.01.{target.year} - "
+            f"{target:%d.%m.%Y}» — из неё считается изменение Open QTY."
         )
     available = ", ".join(item.business_date.isoformat() for item in sources[:10]
                           if item.from_year_start) or "ни одной"
@@ -600,16 +617,13 @@ def build_data(source_path: Path,
             "листа должна быть строка «Позиция за период [дд.мм.гггг] - [дд.мм.гггг]»."
         )
     start, end = snapshot.period_start, snapshot.business_date
-    if start >= end:
+    if not is_year_start_period(start, end):
+        kind = "выгрузка за один день" if start == end else "выгрузка не с начала года"
         raise PortfolioReportError(
-            f"{name} — выгрузка за один день ({end:%d.%m.%Y}). Отчёту нужна выгрузка с "
-            f"начала года: «Позиция за период 01.01.{end.year} - {end:%d.%m.%Y}» — "
-            "изменение Open QTY считается от первой даты периода."
+            f"{name} — {kind} (период {_period_text(start, end)}). Отчёту нужна выгрузка "
+            f"с начала года: «Позиция за период 01.01.{end.year} - {end:%d.%m.%Y}» — "
+            "изменение Open QTY считается от 01.01."
         )
-    if start != dt.date(end.year, 1, 1):
-        logger.warning("%s: период начинается %s, а не 01.01.%d — изменение Open QTY "
-                       "будет посчитано от %s.", name, start.strftime("%d.%m.%Y"), end.year,
-                       start.strftime("%d.%m.%Y"))
     frame = snapshot.frame.copy()
     frame["portfolio_type"] = frame["portfolio_code"].map(_type_of)
     frame["open_qty_change"] = [

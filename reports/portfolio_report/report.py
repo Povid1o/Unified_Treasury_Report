@@ -195,16 +195,17 @@ def _sources_table(sources: List[etl.SourceFile], default: dt.date) -> Table:
 
 def _ask_for_source(sources: List[etl.SourceFile]) -> etl.SourceFile:
     t_minus_1 = etl.previous_business_day(dt.date.today())
-    # Выгрузки за один день отчёту не годятся (изменение Open QTY в них ноль) —
-    # их не показываем, чтобы не выбрать по ошибке.
+    # Годятся только выгрузки «01.01 - дата»: за один день изменение Open QTY
+    # всегда ноль, с другой начальной даты — не с начала года. Остальные не
+    # показываем, чтобы не выбрать по ошибке.
     usable = [item for item in sources if item.from_year_start]
     if not usable:
         raise etl.PortfolioReportError(
-            "Нашлись только выгрузки «Позиция за период» за один день — отчёту нужна "
+            "Нашлись только выгрузки «Позиция за период» не с начала года — отчёту нужна "
             f"выгрузка с начала года («01.01.{t_minus_1.year} - {t_minus_1:%d.%m.%Y}»).")
     skipped = len(sources) - len(usable)
     if skipped:
-        ui.console.print(f"[grey50]Выгрузок за один день (без начала года) не показано: "
+        ui.console.print(f"[grey50]Выгрузок не с начала года (за день и т.п.) не показано: "
                          f"{skipped}[/grey50]")
     shown = usable[:10]
     ui.console.print(_sources_table(shown, t_minus_1))

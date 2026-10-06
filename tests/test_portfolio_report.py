@@ -153,7 +153,8 @@ class PortfolioReportTest(unittest.TestCase):
         self.assertEqual(sources[1].origin, etl.ORIGIN_DOWNLOADS)
         self.assertEqual(sources[1].period_start, dt.date(2026, 1, 1))
         self.assertFalse(sources[0].from_year_start)
-        with self.assertRaisesRegex(etl.PortfolioReportError, "за один день"):
+        with self.assertRaisesRegex(etl.PortfolioReportError,
+                                    "только выгрузка за период 30.09.2026 - 30.09.2026"):
             etl.pick_source(sources, dt.date(2026, 9, 30))
         sources = sources[1:]
         path = etl.take(sources[0], move=False)
@@ -208,13 +209,26 @@ class PortfolioReportTest(unittest.TestCase):
         with self.assertRaisesRegex(etl.PortfolioReportError, "за один день"):
             etl.build_data(single)
 
-    def test_period_not_from_january_is_used_with_a_warning(self):
-        path = write_export(self.tmp / export_name("29.09.2026", "01.07.2026"), DAY2,
-                            "29.09.2026", period_start="01.07.2026")
-        with self.assertLogs("portfolio_report", level="WARNING") as captured:
-            data = etl.build_data(path)
-        self.assertEqual(data.period_start, dt.date(2026, 7, 1))
-        self.assertTrue(any("01.07.2026" in line for line in captured.output))
+    def test_only_exports_from_january_first_are_accepted(self):
+        """«01.07 - 29.09» — не с начала года: изменение было бы с июля, такой файл не берётся."""
+        mid_year = write_export(self.tmp / "data" / "2026-09-30" / export_name("30.09.2026", "01.07.2026"),
+                                DAY2, "30.09.2026", period_start="01.07.2026")
+        with self.assertRaisesRegex(etl.PortfolioReportError, "не с начала года"):
+            etl.build_data(mid_year)
+        last_year = write_export(self.tmp / export_name("29.09.2026", "01.01.2025"), DAY2,
+                                 "29.09.2026", period_start="01.01.2025")
+        with self.assertRaisesRegex(etl.PortfolioReportError, "не с начала года"):
+            etl.build_data(last_year)
+
+        sources = etl.find_sources(None)
+        by_date = {s.business_date: s for s in sources}
+        self.assertFalse(by_date[dt.date(2026, 9, 30)].from_year_start)
+        self.assertTrue(by_date[dt.date(2026, 9, 28)].from_year_start)
+        with self.assertRaisesRegex(etl.PortfolioReportError, "01.07.2026 - 30.09.2026"):
+            etl.pick_source(sources, dt.date(2026, 9, 30))
+        # По умолчанию (T-1 без явной даты) берётся ближайшая подходящая — 28.09.
+        self.assertEqual(etl.pick_source(sources, dt.date(2026, 9, 30), strict=False).business_date,
+                         dt.date(2026, 9, 28))
 
     def test_diagnose_shows_why_dv01_and_yield_are_empty(self):
         """Колонки называются иначе, чем ждёт отчёт, — DV01/Yield пустые, и видно почему."""

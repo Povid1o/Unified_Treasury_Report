@@ -463,7 +463,16 @@ def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, 
             "«Позиция за период [дд.мм.гггг] - [дд.мм.гггг]»."
         )
 
-    dated.sort(key=lambda item: item[0], reverse=True)
+    # На одну дату может лежать и выгрузка с начала года, и выгрузка за день:
+    # «Динамика» читает из обеих одно и то же (колонки на конец периода), но
+    # выбор должен быть предсказуемым — берётся выгрузка с начала года, та же,
+    # что у «Отчёта по портфелям».
+    def from_year_start(path: Path) -> bool:
+        period = read_period(path)
+        return bool(period) and period[0] == dt.date(period[1].year, 1, 1) \
+            and period[0] < period[1]
+
+    dated.sort(key=lambda item: (item[0], from_year_start(item[1])), reverse=True)
     t0_date, t0_path = dated[0]
     # Срез на ту же дату, что T0, — не кандидат в T-7, но и не повод молча
     # взять что-то третье: такую пару ниже отвергает отдельная проверка.

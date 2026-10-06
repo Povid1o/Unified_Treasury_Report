@@ -222,6 +222,67 @@ class ParseSliceTests(PortfolioDynamicsTestCase):
         self.assertIsNone(row["duration_target_yrs"])
 
 
+class ExportKindTests(PortfolioDynamicsTestCase):
+    """«Динамика» берёт и выгрузку с начала года, и выгрузку за день — и в обеих
+    читает значения на КОНЕЦ периода. Колонки «(нач.)» заполнены подставными
+    числами: если отчёт возьмёт не ту колонку, тест это увидит."""
+
+    DECOY_VALUE = 999 * MLN
+    DECOY_DURATION = 99.0
+
+    def fill_start_columns(self, path: Path, duration: bool = True) -> Path:
+        from openpyxl import load_workbook
+        wb = load_workbook(path)
+        ws = wb.active
+        start_value_col = EXPORT_HEADER.index("Чистая стоимость позиции (нач.)") + 1
+        for row in range(6, ws.max_row + 1):
+            ws.cell(row=row, column=start_value_col, value=self.DECOY_VALUE)
+            if duration:
+                ws.cell(row=row, column=COL_DUR_START + 1, value=self.DECOY_DURATION)
+        wb.save(path)
+        return path
+
+    def test_year_start_export_reads_end_of_period_columns(self):
+        path = self.fill_start_columns(self.t0_path)  # «01.01.2026 - 01.09.2026»
+        frame = etl.parse_slice(path, "T0").frame.set_index("portfolio_code")
+        self.assertAlmostEqual(frame.loc["AFS_TR_RUR", "volume"], 40.0)   # (кон.), не 999
+        self.assertAlmostEqual(frame.loc["HTM_ALCO", "volume"], 80.0)
+        self.assertAlmostEqual(frame.loc["AFS_TR_RUR", "duration_current_yrs"], 2.25)  # «Дюрация»
+
+    def test_single_day_export_reads_the_same_columns(self):
+        """За день: «Дюрация» главная; «Duration (нач.)» — только где «Дюрация» пустая."""
+        path = write_export(self.tmp / "Позиция за период [25.08.2026] - [25.08.2026].xlsx", [
+            ("Позиция: AFS_TR_RUR", None, None, None),
+            ("Bond", 28 * MLN, 9.0, 2.5),    # «Дюрация» есть — «Duration (нач.)» не нужна
+            ("Bond", 10 * MLN, 1.5, None),   # «Дюрация» пустая — запасная «Duration (нач.)»
+        ], period_start="25.08.2026", period_end="25.08.2026")
+        self.fill_start_columns(path, duration=False)
+        row = etl.parse_slice(path, "T-7").frame.iloc[0]
+        self.assertAlmostEqual(row["volume"], 38.0)
+        self.assertAlmostEqual(row["duration_current_yrs"], (2.5 * 28 + 1.5 * 10) / 38)
+
+    def test_mixed_pair_and_duplicate_date_pick_year_start_export(self):
+        """T0 — с начала года, T-7 — за день; рядом ещё выгрузка за день на дату T0."""
+        folder = self.tmp / "2026-09-01"
+        folder.mkdir()
+        t0 = folder / self.t0_path.name
+        t0.write_bytes(self.t0_path.read_bytes())
+        # Имя сортируется раньше выгрузки с начала года — порядок файлов не должен решать.
+        single_t0 = write_export(folder / "Позиция за период [01.09.2026] - [01.09.2026] - A.xlsx",
+                                 T0_ROWS, period_start="01.09.2026", period_end="01.09.2026")
+        t7 = write_export(folder / "Позиция за период [25.08.2026] - [25.08.2026].xlsx", T7_ROWS,
+                          period_start="25.08.2026", period_end="25.08.2026")
+        for order in ([single_t0, t0, t7], [t7, t0, single_t0]):
+            picked = etl.split_slice_files(order, folder.name)
+            self.assertEqual(picked, (t0, t7))
+
+        # Суммы среза — в млн RUB: T0 = 30 + 10, T-7 = 28 + 10.
+        snap = etl.build_data(t0, t7, bootstrap=True).fact_portfolio_snapshot
+        snap = snap.set_index("portfolio_code")
+        self.assertAlmostEqual(snap.loc["AFS_TR_RUR", "volume_t0"], 40.0)
+        self.assertAlmostEqual(snap.loc["AFS_TR_RUR", "volume_t7"], 38.0)
+
+
 class KuapDurationTests(PortfolioDynamicsTestCase):
     """«Дюрация-КУАП» — дюрация, установленная КУАП, из настройки."""
 
