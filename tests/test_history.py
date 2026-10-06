@@ -68,6 +68,7 @@ class HistoryTestCase(unittest.TestCase):
         settings_file = self.tmp / "settings.json"
         settings_file.write_text(json.dumps({
             "portfolio_dynamics_dir": str(self.tmp / "data"),
+            "portfolio_report_dir": str(self.tmp / "report_data"),
             "portfolio_dynamics_output_dir": str(self.tmp / "out"),
             "downloads_dir": str(self.tmp / "downloads"),
         }), encoding="utf-8")

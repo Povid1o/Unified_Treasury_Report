@@ -288,6 +288,21 @@ def _business_date_from_matrix(matrix: pd.DataFrame, header_row: int) -> Optiona
     return period[1] if period else None
 
 
+def is_year_start_period(start: Optional[dt.date], end: Optional[dt.date]) -> bool:
+    """Период выгрузки — с 01.01 года её конечной даты по конечную дату.
+
+    Такую выгрузку берёт «Отчёт по портфелям» (изменение Open QTY — с начала
+    года); «Динамике» годится и она, и выгрузка за один день.
+    """
+    return (start is not None and end is not None
+            and start == dt.date(end.year, 1, 1) and start < end)
+
+
+def is_year_start_export(path: Path) -> bool:
+    period = read_period(path)
+    return bool(period) and is_year_start_period(*period)
+
+
 def read_period(path: Path) -> Optional[Period]:
     """(начало, конец) периода выгрузки: из имени файла, иначе из шапки листа."""
     path = Path(path)
@@ -467,12 +482,7 @@ def split_slice_files(files: List[Path], folder_label: str = "") -> Tuple[Path, 
     # «Динамика» читает из обеих одно и то же (колонки на конец периода), но
     # выбор должен быть предсказуемым — берётся выгрузка с начала года, та же,
     # что у «Отчёта по портфелям».
-    def from_year_start(path: Path) -> bool:
-        period = read_period(path)
-        return bool(period) and period[0] == dt.date(period[1].year, 1, 1) \
-            and period[0] < period[1]
-
-    dated.sort(key=lambda item: (item[0], from_year_start(item[1])), reverse=True)
+    dated.sort(key=lambda item: (item[0], is_year_start_export(item[1])), reverse=True)
     t0_date, t0_path = dated[0]
     # Срез на ту же дату, что T0, — не кандидат в T-7, но и не повод молча
     # взять что-то третье: такую пару ниже отвергает отдельная проверка.

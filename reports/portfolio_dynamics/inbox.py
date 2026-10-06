@@ -37,8 +37,8 @@ sys.path.insert(0, str(BASE_DIR))
 import config  # noqa: E402
 from common.file_discovery import SourceConfig, find_date_folders  # noqa: E402
 from reports.portfolio_dynamics.etl import (  # noqa: E402
-    PROBE_SUFFIXES, PortfolioDynamicsError, logger, pick_t7, probe_business_date,
-    read_business_date,
+    PROBE_SUFFIXES, PortfolioDynamicsError, is_limits_file, is_year_start_export, logger,
+    pick_t7, probe_business_date, read_business_date,
 )
 from reports.portfolio_dynamics.limits import probe_limits_date  # noqa: E402
 
@@ -310,6 +310,125 @@ def _files_in_folder(source: SourceConfig, folder: Path) -> List[Path]:
     return sorted(f for f in folder.glob(source.glob_pattern) if _is_real_file(f))
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Раскладка выгрузок позиций по папкам ОБОИХ отчётов
+# ════════════════════════════════════════════════════════════════════════════
+# Одна и та же выгрузка «Позиция за период» нужна двум отчётам, и у каждого
+# своя папка исходных файлов:
+#   - «Отчёт по портфелям» берёт только выгрузку «01.01 - дата» — она ложится в
+#     его папку всегда;
+#   - «Динамике» годится любая (она читает колонки на конец периода), но в её
+#     папке-дате на одну дату должен лежать ОДИН срез: если там уже есть срез на
+#     эту дату (например, выгрузка за один день), второй туда не кладётся.
+# Так файл из загрузок не теряется, даже когда одна из папок его не принимает.
+def _report_source() -> SourceConfig:
+    return config.PORTFOLIO_REPORT_SOURCE
+
+
+def _dynamics_source() -> SourceConfig:
+    return config.PORTFOLIO_DYNAMICS_T0_SOURCE
+
+
+def slice_for_date(source: SourceConfig, folder: Path, business_date: dt.date,
+                   except_name: Optional[str] = None) -> Optional[Path]:
+    """Срез на эту дату, уже лежащий в папке (файл с именем except_name не в счёт)."""
+    files = [f for f in _files_in_folder(source, folder)
+             if f.name != except_name and not is_limits_file(f)]
+    for candidate in _dated(files, source):
+        if candidate.business_date == business_date:
+            return candidate.path
+    return None
+
+
+def report_destination(path: Path, business_date: dt.date) -> Optional[Path]:
+    """Куда выгрузке в папке «Отчёта по портфелям»; None — она не «01.01 - дата»."""
+    if not is_year_start_export(path):
+        return None
+    return folder_for_date(_report_source(), business_date) / Path(path).name
+
+
+def dynamics_destination(path: Path, business_date: dt.date) -> Optional[Path]:
+    """Куда выгрузке в папке «Динамики»; None — там уже лежит другой срез на эту дату."""
+    folder = folder_for_date(_dynamics_source(), business_date)
+    destination = folder / Path(path).name
+    if destination.exists():
+        return destination
+    other = slice_for_date(_dynamics_source(), folder, business_date, except_name=Path(path).name)
+    if other is not None:
+        logger.info("В папке «Динамики» %s уже есть срез на %s (%s) — %s туда не кладётся.",
+                    folder, business_date.isoformat(), other.name, Path(path).name)
+        return None
+    return destination
+
+
+def _copy(source_path: Path, destination: Path, what: str) -> bool:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(source_path), str(destination))
+    except (OSError, shutil.Error) as exc:
+        logger.warning("Не удалось положить %s в %s (%s): %s", source_path.name,
+                       destination.parent, what, exc)
+        return False
+    logger.info("%s -> %s (%s)", source_path.name, destination.parent, what)
+    return True
+
+
+def file_position_export(path: Path, business_date: dt.date, from_downloads: bool,
+                         move: Optional[bool] = None) -> Path:
+    """Раскладывает выгрузку позиций по папкам обоих отчётов.
+
+    Из загрузок — в папку «Отчёта по портфелям» (если это «01.01 - дата») и в
+    папку «Динамики» (если там нет другого среза на эту дату); из папок
+    «Динамики» — только копия в папку «Отчёта по портфелям». Из загрузок файл
+    убирается (move), только если он лёг хоть в одну папку: иначе он остаётся
+    там, где был. Возвращает экземпляр в папке «Отчёта по портфелям», если он
+    есть, затем — в папке «Динамики», иначе исходный путь.
+    """
+    path = Path(path)
+    if move is None:
+        move = config.PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS
+    targets = [(report_destination(path, business_date), "папка «Отчёта по портфелям»")]
+    if from_downloads:
+        targets.append((dynamics_destination(path, business_date), "папка «Динамики»"))
+
+    placed: List[Path] = []
+    for destination, what in targets:
+        if destination is None:
+            continue
+        if destination.exists() or _copy(path, destination, what):
+            placed.append(destination)
+    if from_downloads and move and placed and path.exists() and path not in placed:
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning("%s разложен по папкам, но из загрузок не убран: %s", path.name, exc)
+    if from_downloads and not placed:
+        logger.warning("%s не подошёл ни одной папке (не «01.01 - дата», а в папке «Динамики» "
+                       "уже есть срез на %s) — оставлен в загрузках.", path.name,
+                       business_date.isoformat())
+    return placed[0] if placed else path
+
+
+def mirror_to_report(paths: List[Path]) -> List[Path]:
+    """Выгрузки «01.01 - дата» из папок «Динамики» — копией в папку «Отчёта по портфелям».
+
+    Чтобы выгрузка, принятая «Динамикой», была и у «Отчёта по портфелям». Сбой
+    копирования не валит запуск: в лог уходит предупреждение.
+    """
+    copied: List[Path] = []
+    for path in paths:
+        path = Path(path)
+        if not path.exists():
+            continue
+        business_date = read_business_date(path)
+        destination = report_destination(path, business_date) if business_date else None
+        if destination is None or destination.exists():
+            continue
+        if _copy(path, destination, "папка «Отчёта по портфелям»"):
+            copied.append(destination)
+    return copied
+
+
 def _plan_limits(limits_source: Optional[SourceConfig], downloads_dir: Optional[Path],
                  folder: Path, target_date: dt.date) -> Tuple[Optional[Path], List[Tuple[Path, Path]]]:
     """Файл лимитов на отчётную дату: уже в папке или его надо взять из загрузок.
@@ -484,6 +603,11 @@ def _plan_archive(source: SourceConfig, folder: Path,
         destination = own_folder / candidate.path.name
         if destination.exists():
             continue
+        # В папке своей даты уже лежит другой срез на ту же дату (скажем,
+        # выгрузка за один день) — второй экземпляр ей не нужен.
+        if slice_for_date(source, own_folder, candidate.business_date,
+                          except_name=candidate.path.name) is not None:
+            continue
         entries.append((final, destination))
     return entries
 
@@ -499,6 +623,7 @@ def apply_import(plan: ImportPlan, move: bool = True) -> List[Path]:
         raise PortfolioDynamicsError(plan.problem)
     if not plan.to_import and not plan.reuse:
         _apply_archive(plan)
+        mirror_to_report(plan.existing)
         return list(plan.existing)
 
     try:
@@ -531,6 +656,7 @@ def apply_import(plan: ImportPlan, move: bool = True) -> List[Path]:
 
     landed += _apply_reuse(plan)
     _apply_archive(plan)
+    mirror_to_report(landed)
     return landed
 
 

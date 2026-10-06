@@ -51,6 +51,7 @@ class DateFolderTestCase(unittest.TestCase):
         # лежит в реальной папке загрузок того, кто его запускает.
         settings_file.write_text(json.dumps({
             "portfolio_dynamics_dir": str(self.data),
+            "portfolio_report_dir": str(Path(self.data).parent / "report_data"),
             "portfolio_dynamics_output_dir": str(self.tmp / "out"),
             "downloads_dir": str(self.downloads),
         }), encoding="utf-8")

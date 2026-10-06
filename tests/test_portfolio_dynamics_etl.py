@@ -102,7 +102,9 @@ class PortfolioDynamicsTestCase(unittest.TestCase):
         # разметки типов рядом с settings.json, и тест не должен сорить в проекте.
         self._saved_env = os.environ.get(settings.SETTINGS_FILE_ENV)
         settings_file = self.tmp / "settings.json"
-        settings_file.write_text(json.dumps({}), encoding="utf-8")
+        settings_file.write_text(json.dumps({
+            "portfolio_report_dir": str(self.tmp / "report_data"),
+        }), encoding="utf-8")
         os.environ[settings.SETTINGS_FILE_ENV] = str(settings_file)
         config.reload()
         self.t0_path = write_export(self.tmp / export_name("01.09.2026"), T0_ROWS)

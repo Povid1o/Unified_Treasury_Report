@@ -483,8 +483,17 @@ SETTINGS: List[Setting] = [
              "T0 и T-7; это значение идёт в отчёт, только если даты определить не удалось.",
     ),
     # ── Отчёт по портфелям ───────────────────────────────────────────────────
-    # Выгрузка та же, что у «Динамики портфелей», поэтому папка исходных файлов,
-    # шаблон имени и приёмка из загрузок берутся из её настроек.
+    # Выгрузка та же, что у «Динамики портфелей», поэтому шаблон имени, папки по
+    # датам и приёмка из загрузок берутся из её настроек. Папка исходных файлов —
+    # своя: выгрузка «01.01 - дата» кладётся и сюда, и в папку «Динамики».
+    Setting(
+        key="portfolio_report_dir", label="Папка исходных файлов", kind="dir",
+        group="portfolio_report", default=_under_root("data", "PortfolioReport"),
+        help="Выгрузки «Позиция за период 01.01 - дата». Загрузчик кладёт каждую такую "
+             "выгрузку и сюда, и в папку «Динамики портфелей» (в «Динамику» — только если "
+             "в её папке-дате ещё нет среза на ту же дату). Папки по датам — как у "
+             "«Динамики» (её настройка «Складывать выгрузки в папки по датам»).",
+    ),
     Setting(
         key="portfolio_report_output_dir", label="Папка результатов", kind="dir",
         group="portfolio_report", default=_under_root("output", "PortfolioReport"),
@@ -919,6 +928,8 @@ REPORT_SOURCES: List[ReportSource] = [
                  ("transfert_short_dir", "transfert_long_dir")),
     ReportSource("portfolio-dynamics", "Динамика портфелей", ("portfolio_dynamics_dir",),
                  date_folders_key="portfolio_dynamics_use_date_folders"),
+    ReportSource("portfolio-report", "Отчёт по портфелям", ("portfolio_report_dir",),
+                 date_folders_key="portfolio_dynamics_use_date_folders"),
 ]
 REPORT_SOURCES_BY_SLUG: Dict[str, ReportSource] = {r.slug: r for r in REPORT_SOURCES}
 
@@ -947,6 +958,7 @@ _SOURCE_GLOBS = {
     "transfert_short_dir": None,
     "transfert_long_dir": None,
     "portfolio_dynamics_dir": None,
+    "portfolio_report_dir": None,
 }
 
 # Пути, которые создаются сами при первом сохранении: отсутствие такой папки —
@@ -956,7 +968,7 @@ _CREATED_ON_WRITE = {
     "logs_dir", "ofz_output_path", "ovp_output_dir", "balance_struct_output_dir",
     "chpd_output_dir", "nim_output_dir", "transfert_output_dir",
     "portfolio_dynamics_output_dir", "portfolio_dynamics_types_file",
-    "portfolio_report_output_dir", "portfolio_report_market_history",
+    "portfolio_report_output_dir", "portfolio_report_market_history", "portfolio_report_dir",
 }
 
 

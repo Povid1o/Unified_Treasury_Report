@@ -88,6 +88,8 @@ PORTFOLIO_DYNAMICS_IMPORT_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS: bool
 PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE: bool
 
+PORTFOLIO_REPORT_DIR: Path
+PORTFOLIO_REPORT_SOURCE: SourceConfig
 PORTFOLIO_REPORT_OUTPUT_DIR: Path
 PORTFOLIO_REPORT_OWN_PORTFOLIOS: frozenset
 PORTFOLIO_REPORT_MARKET_HISTORY: Path
@@ -233,9 +235,15 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_ARCHIVE_OWN_DATE"] = v["portfolio_dynamics_archive_own_date"]
 
     # ── Отчёт по портфелям ───────────────────────────────────────────────────
-    # Источник общий с «Динамикой портфелей» (та же выгрузка «Позиция за
-    # период»), своя только папка результатов.
     g["PORTFOLIO_REPORT_OUTPUT_DIR"] = v["portfolio_report_output_dir"]
+    # Своя папка исходных файлов: та же выгрузка «Позиция за период», что у
+    # «Динамики», и та же раскладка по папкам-датам (их настройка общая).
+    g["PORTFOLIO_REPORT_DIR"] = v["portfolio_report_dir"]
+    g["PORTFOLIO_REPORT_SOURCE"] = SourceConfig(
+        directory=v["portfolio_report_dir"], filename_regex=v["portfolio_dynamics_regex"],
+        date_format=v["portfolio_dynamics_date_format"], label="Отчёт по портфелям",
+        date_folder_format=folder_format,
+    )
     # Портфели Казны (indicators=1 в BI): коды в верхнем регистре.
     g["PORTFOLIO_REPORT_OWN_PORTFOLIOS"] = frozenset(
         _settings.parse_codes(v["portfolio_report_own_portfolios"]))

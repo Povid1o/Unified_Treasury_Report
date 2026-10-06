@@ -33,7 +33,6 @@ NIM: одна строка — одно значение, смысл значе�
 """
 import datetime as dt
 import re
-import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -406,13 +405,18 @@ def diagnose(path: Path) -> List[str]:
 # ════════════════════════════════════════════════════════════════════════════
 # Поиск выгрузки на дату
 # ════════════════════════════════════════════════════════════════════════════
-# Выгрузки лежат там же, где у «Динамики портфелей»: папки-даты, плоская папка
-# и загрузки. Настройки источника общие — отдельно их заводить незачем.
+# Где искать выгрузку, в порядке убывания «своего»: своя папка исходных файлов
+# (папки-даты и плоская раскладка), папка «Динамики портфелей» (та же
+# выгрузка могла попасть туда её загрузчиком) и загрузки. Найденное не в своей
+# папке кладётся туда копией (см. take) — так у отчёта копится свой архив.
 ORIGIN_OWN_FOLDER = "папка своей даты"
 ORIGIN_OTHER_FOLDER = "другая папка-дата"
 ORIGIN_FLAT = "папка"
+ORIGIN_DYNAMICS = "папка «Динамики»"
 ORIGIN_DOWNLOADS = "загрузки"
-_ORIGIN_PRIORITY = [ORIGIN_OWN_FOLDER, ORIGIN_OTHER_FOLDER, ORIGIN_FLAT, ORIGIN_DOWNLOADS]
+_ORIGIN_PRIORITY = [ORIGIN_OWN_FOLDER, ORIGIN_OTHER_FOLDER, ORIGIN_FLAT, ORIGIN_DYNAMICS,
+                    ORIGIN_DOWNLOADS]
+_OWN_ORIGINS = (ORIGIN_OWN_FOLDER, ORIGIN_OTHER_FOLDER, ORIGIN_FLAT)
 
 
 @dataclass(frozen=True)
@@ -428,15 +432,10 @@ class SourceFile:
         return is_year_start_period(self.period_start, self.business_date)
 
 
-def is_year_start_period(start: Optional[dt.date], end: Optional[dt.date]) -> bool:
-    """Период выгрузки — с 01.01 года её конечной даты по конечную дату.
-
-    Выгрузка за один день не годится (изменение Open QTY в ней всегда ноль),
-    выгрузка с другой начальной даты — тоже: изменение посчиталось бы не с
-    начала года, и на дашборде это было бы не видно.
-    """
-    return (start is not None and end is not None
-            and start == dt.date(end.year, 1, 1) and start < end)
+# Выгрузка за один день не годится (изменение Open QTY в ней всегда ноль),
+# выгрузка с другой начальной даты — тоже: изменение посчиталось бы не с
+# начала года, и на дашборде это было бы не видно.
+is_year_start_period = positions.is_year_start_period
 
 
 def _period_text(start: Optional[dt.date], end: dt.date) -> str:
@@ -444,6 +443,10 @@ def _period_text(start: Optional[dt.date], end: dt.date) -> str:
 
 
 def _source():
+    return config.PORTFOLIO_REPORT_SOURCE
+
+
+def _dynamics_source():
     return config.PORTFOLIO_DYNAMICS_T0_SOURCE
 
 
@@ -459,32 +462,17 @@ def find_sources(downloads: Optional[Path]) -> List[SourceFile]:
 
     Если на дату есть несколько файлов, выгрузка с начала года важнее
     выгрузки за один день (та для отчёта не годится, см. pick_source). При
-    равенстве берётся лежащий в папке своей даты, затем в другой папке-дате,
-    затем в плоской папке, и только потом — в загрузках: разложенное по местам
-    важнее того, что ещё не принято.
+    равенстве берётся лежащий в своей папке (папка своей даты, другая
+    папка-дата, плоская), затем в папке «Динамики», и только потом — в
+    загрузках: разложенное по местам важнее того, что ещё не принято.
     """
-    source = _source()
     found: List[SourceFile] = []
-
-    for folder in find_date_folders(source):
-        files = [f for f in folder.files if not positions.is_limits_file(f)]
-        for candidate in inbox._dated(files, source):
-            origin = (ORIGIN_OWN_FOLDER if candidate.business_date == folder.date
-                      else ORIGIN_OTHER_FOLDER)
-            found.append(SourceFile(candidate.path, candidate.business_date, origin))
-
-    directory = Path(source.directory)
-    if directory.is_dir() and source.filename_regex:
-        pattern = re.compile(source.filename_regex)
-        flat = [f for f in directory.glob(source.glob_pattern)
-                if f.is_file() and not f.name.startswith("~$") and pattern.search(f.name)
-                and not positions.is_limits_file(f)]
-        found += [SourceFile(c.path, c.business_date, ORIGIN_FLAT)
-                  for c in inbox._dated(flat, source)]
-
+    found += _scan_folder(_source())
+    found += [SourceFile(item.path, item.business_date, ORIGIN_DYNAMICS)
+              for item in _scan_folder(_dynamics_source())]
     if downloads is not None:
         found += [SourceFile(c.path, c.business_date, ORIGIN_DOWNLOADS)
-                  for c in inbox.scan_slices(source, downloads)]
+                  for c in inbox.scan_slices(_source(), downloads)]
 
     def rank(item: SourceFile):
         return (not item.from_year_start, _ORIGIN_PRIORITY.index(item.origin))
@@ -500,34 +488,40 @@ def find_sources(downloads: Optional[Path]) -> List[SourceFile]:
     return [best[d] for d in sorted(best, reverse=True)]
 
 
-def take(item: SourceFile, move: Optional[bool] = None) -> Path:
-    """Путь к выгрузке; из загрузок она сначала кладётся в папку своей даты.
+def _scan_folder(source) -> List[SourceFile]:
+    """Выгрузки в папке источника: папки-даты и плоская раскладка."""
+    found: List[SourceFile] = []
+    for folder in find_date_folders(source):
+        files = [f for f in folder.files if not positions.is_limits_file(f)]
+        for candidate in inbox._dated(files, source):
+            origin = (ORIGIN_OWN_FOLDER if candidate.business_date == folder.date
+                      else ORIGIN_OTHER_FOLDER)
+            found.append(SourceFile(candidate.path, candidate.business_date, origin))
 
-    Туда же её положила бы «Динамика портфелей», так что файл потом пригодится
-    и ей. Ничего не удаляется: перенос или копия — по той же настройке.
+    directory = Path(source.directory)
+    if directory.is_dir() and source.filename_regex:
+        pattern = re.compile(source.filename_regex)
+        flat = [f for f in directory.glob(source.glob_pattern)
+                if f.is_file() and not f.name.startswith("~$") and pattern.search(f.name)
+                and not positions.is_limits_file(f)]
+        found += [SourceFile(c.path, c.business_date, ORIGIN_FLAT)
+                  for c in inbox._dated(flat, source)]
+    return found
+
+
+def take(item: SourceFile, move: Optional[bool] = None) -> Path:
+    """Путь к выгрузке в своей папке; найденная в другом месте сначала кладётся туда.
+
+    Из загрузок выгрузка раскладывается сразу по ОБЕИМ папкам — своей и
+    «Динамики» (в «Динамику» — только если в её папке-дате ещё нет среза на ту
+    же дату), см. inbox.file_position_export. Из папки «Динамики» — копией в
+    свою: оттуда ничего не уносится. Перенос или копия из загрузок — по
+    настройке «Переносить, а не копировать».
     """
-    if item.origin != ORIGIN_DOWNLOADS:
+    if item.origin in _OWN_ORIGINS:
         return item.path
-    if move is None:
-        move = config.PORTFOLIO_DYNAMICS_MOVE_FROM_DOWNLOADS
-    folder = inbox.folder_for_date(_source(), item.business_date)
-    destination = folder / item.path.name
-    if destination.exists():
-        logger.info("%s уже лежит в %s — взят оттуда.", destination.name, folder)
-        return destination
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        if move:
-            shutil.move(str(item.path), str(destination))
-        else:
-            shutil.copy2(str(item.path), str(destination))
-    except (OSError, shutil.Error) as exc:
-        logger.warning("Не удалось переложить %s из загрузок в %s: %s. Файл прочитан "
-                       "прямо из загрузок.", item.path.name, folder, exc)
-        return item.path
-    logger.info("%s из загрузок: %s -> %s", "Перенесено" if move else "Скопировано",
-                item.path.name, folder)
-    return destination
+    return inbox.file_position_export(item.path, item.business_date,
+                                      from_downloads=item.origin == ORIGIN_DOWNLOADS, move=move)
 
 
 def pick_source(sources: List[SourceFile], target: dt.date,
@@ -562,7 +556,8 @@ def pick_source(sources: List[SourceFile], target: dt.date,
                           if item.from_year_start) or "ни одной"
     raise PortfolioReportError(
         f"Не найдена выгрузка «Позиция за период» с начала года на {target.isoformat()}. "
-        f"Есть на даты: {available}. Искали в {Path(_source().directory)} (с папками-датами)"
+        f"Есть на даты: {available}. Искали в {Path(_source().directory)}, "
+        f"{Path(_dynamics_source().directory)} (с папками-датами)"
         + (" и в загрузках." if downloads_dir() is not None else "; приёмка из загрузок выключена.")
     )
 

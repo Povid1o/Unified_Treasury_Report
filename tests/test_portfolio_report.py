@@ -89,6 +89,7 @@ class PortfolioReportTest(unittest.TestCase):
         settings_file = self.tmp / "settings.json"
         settings_file.write_text(json.dumps({
             "portfolio_dynamics_dir": str(self.tmp / "data"),
+            "portfolio_report_dir": str(self.tmp / "report_data"),
             "portfolio_report_output_dir": str(self.tmp / "out"),
             "downloads_dir": str(self.tmp / "downloads"),
             "portfolio_dynamics_types_file": str(self.tmp / "portfolio_types.json"),
@@ -165,6 +166,71 @@ class PortfolioReportTest(unittest.TestCase):
                          .business_date, dt.date(2026, 9, 29))
         with self.assertRaises(etl.PortfolioReportError):
             etl.pick_source(sources, dt.date(2026, 9, 30))
+
+    # ── Загрузчик: обе папки, без второго среза на ту же дату в «Динамике» ──
+    @property
+    def report_data(self) -> Path:
+        return Path(config.PORTFOLIO_REPORT_DIR)
+
+    def test_download_is_filed_into_both_folders(self):
+        sources = etl.find_sources(Path(config.DOWNLOADS_DIR))
+        item = etl.pick_source(sources, dt.date(2026, 9, 29))
+        self.assertEqual(item.origin, etl.ORIGIN_DOWNLOADS)
+        path = etl.take(item, move=True)
+        self.assertEqual(path, self.report_data / "2026-09-29" / self.day2.name)
+        self.assertTrue((self.tmp / "data" / "2026-09-29" / self.day2.name).exists())
+        self.assertFalse(self.day2.exists(), "из загрузок перенесено")
+        # Следующий поиск находит выгрузку уже в своей папке.
+        again = etl.pick_source(etl.find_sources(Path(config.DOWNLOADS_DIR)), dt.date(2026, 9, 29))
+        self.assertEqual(again.origin, etl.ORIGIN_OWN_FOLDER)
+
+    def test_dynamics_folder_with_single_day_slice_gets_no_second_file(self):
+        dyn_folder = self.tmp / "data" / "2026-09-29"
+        single = write_export(dyn_folder / export_name("29.09.2026", "29.09.2026"), DAY2,
+                              "29.09.2026", period_start="29.09.2026")
+        item = etl.pick_source(etl.find_sources(Path(config.DOWNLOADS_DIR)), dt.date(2026, 9, 29))
+        self.assertEqual(item.origin, etl.ORIGIN_DOWNLOADS)  # с начала года важнее «за день»
+        path = etl.take(item, move=True)
+        self.assertEqual(path.parent, self.report_data / "2026-09-29")
+        self.assertEqual(sorted(f.name for f in dyn_folder.iterdir()), [single.name])
+        self.assertFalse(self.day2.exists(), "лёг в папку отчёта — из загрузок убран")
+
+    def test_unplaceable_download_stays_in_downloads(self):
+        """За день, а в папке «Динамики» уже есть срез на эту дату: класть некуда — не трогаем."""
+        from reports.portfolio_dynamics import inbox
+        single = write_export(self.tmp / "downloads" / export_name("28.09.2026", "28.09.2026"),
+                              DAY1, "28.09.2026", period_start="28.09.2026")
+        path = inbox.file_position_export(single, dt.date(2026, 9, 28), from_downloads=True,
+                                          move=True)
+        self.assertEqual(path, single)
+        self.assertTrue(single.exists())
+        self.assertFalse((self.report_data / "2026-09-28").exists())
+
+    def test_export_found_in_dynamics_folder_is_copied_to_own_folder(self):
+        item = etl.pick_source(etl.find_sources(None), dt.date(2026, 9, 28))
+        self.assertEqual(item.origin, etl.ORIGIN_DYNAMICS)
+        path = etl.take(item, move=True)
+        self.assertEqual(path, self.report_data / "2026-09-28" / self.day1.name)
+        self.assertTrue(self.day1.exists(), "из папки «Динамики» ничего не уносится")
+
+    def test_dynamics_import_mirrors_and_keeps_one_slice_per_date(self):
+        """Папка T0 «Динамики» укомплектована выгрузками с начала года; в папке даты T-7
+        уже лежит выгрузка за день — архивная копия туда не кладётся, а обе выгрузки
+        с начала года попадают в папку «Отчёта по портфелям»."""
+        from reports.portfolio_dynamics import inbox
+        folder = self.tmp / "data" / "2026-09-29"
+        t0 = write_export(folder / export_name("29.09.2026"), DAY2, "29.09.2026")
+        t7 = write_export(folder / export_name("22.09.2026"), DAY1, "22.09.2026")
+        single_t7 = write_export(self.tmp / "data" / "2026-09-22" / export_name("22.09.2026", "22.09.2026"),
+                                 DAY1, "22.09.2026", period_start="22.09.2026")
+        plan = inbox.plan_import(config.PORTFOLIO_DYNAMICS_T0_SOURCE, None, dt.date(2026, 9, 29))
+        self.assertTrue(plan.complete, plan.problem)
+        self.assertEqual(plan.archive, [])
+        inbox.apply_import(plan, move=False)
+        self.assertEqual(sorted(f.name for f in single_t7.parent.iterdir()), [single_t7.name])
+        self.assertTrue((self.report_data / "2026-09-29" / t0.name).exists())
+        self.assertTrue((self.report_data / "2026-09-22" / t7.name).exists())
+        self.assertFalse((self.report_data / "2026-09-22" / single_t7.name).exists())
 
     def test_previous_business_day(self):
         self.assertEqual(etl.previous_business_day(dt.date(2026, 9, 28)),  # пн
