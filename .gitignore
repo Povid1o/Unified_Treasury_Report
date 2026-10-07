@@ -25,3 +25,11 @@ portfolio_types.json
 # у каждой установки свой (начальный файл лежит в seed/ и в git попадает).
 /market_history.csv
 /market_history.csv.tmp
+
+# «Дополнительные портфели» и история их P&L — рабочие данные казначейства,
+# у каждой установки свои (common/manual_portfolios.py, reports/portfolio_report/manual.py).
+/additional_portfolios.xlsx
+/additional_portfolios.xlsx.tmp
+/~$additional_portfolios.xlsx
+/manual_pl_history.csv
+/manual_pl_history.csv.tmp

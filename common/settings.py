@@ -62,12 +62,15 @@ KIND_HINTS = {
     "pairs": "пары «ключ=значение» через запятую; пусто — ничего не задано",
     "durations": "пары «код портфеля=дюрация, лет» через запятую; пусто — ничего не задано",
     "codes": "коды портфелей через запятую; пусто — ничего не задано",
-    "portfolios": "список портфелей (код, название, тип, объём); правится своим экраном",
+    "portfolios": "список портфелей (код, название, тип, объём, Open QTY); правится в Excel или своим экраном",
     "rounding": "единица и знаки после запятой по каждому показателю; правится своим экраном",
 }
 
 # Поля записи дополнительного портфеля (kind="portfolios").
-PORTFOLIO_FIELDS = ("code", "name", "type", "volume", "duration")
+PORTFOLIO_FIELDS = ("code", "name", "type", "volume", "qty", "duration",
+                    "comment_report", "comment_dynamics")
+MANUAL_PORTFOLIOS_KEY = "portfolio_dynamics_manual_portfolios"
+MANUAL_PORTFOLIOS_FILE_KEY = "portfolio_dynamics_manual_portfolios_file"
 # Подсказка в диалоге: четыре согласованных типа (CONTRACT.md, п. 8.1).
 KNOWN_TYPES_HINT = ("AFS", "HTM", "HTM_KUAP", "TSS")
 
@@ -332,13 +335,27 @@ SETTINGS: List[Setting] = [
              "Свой лимит у вложенного типа при этом остаётся и работает как подлимит.",
     ),
     Setting(
-        key="portfolio_dynamics_manual_portfolios", label="Дополнительные портфели",
+        key=MANUAL_PORTFOLIOS_KEY, label="Дополнительные портфели",
         kind="portfolios", group="portfolio_dynamics", default=[],
-        help="Портфели, которых нет в выгрузке позиций, но объём по ним нужно вести "
-             "вручную: код, название, тип, объём в млн RUB и (желательно) дюрация. "
-             "Попадают и в справочник dim_portfolio, и в срез, и в объём своего типа. "
-             "Правятся экраном «Настройки» -> «Дополнительные портфели» (добавить, "
-             "изменить, удалить).",
+        help="Портфели, которых нет в выгрузке позиций, но которые нужно вести "
+             "вручную: код, тип, балансовая стоимость в млн RUB, Open QTY в штуках, "
+             "(желательно) дюрация и комментарии для каждого из двух отчётов. В "
+             "«Динамике портфелей» попадают в справочник dim_portfolio, в срез и в "
+             "объём своего типа; в «Отчёте по портфелям» — строкой портфеля (P&L с "
+             "начала года спрашивается при запуске). Главный источник — Excel-файл «Файл дополнительных "
+             "портфелей»; экран «Настройки» -> «Дополнительные портфели» правит тот "
+             "же файл, и в settings.json лежит его копия.",
+    ),
+    Setting(
+        key=MANUAL_PORTFOLIOS_FILE_KEY, label="Файл дополнительных портфелей",
+        kind="file", group="portfolio_dynamics",
+        default=lambda get: settings_path().parent / "additional_portfolios.xlsx",
+        help="Excel со списком дополнительных портфелей — строка на портфель. Файл "
+             "главный: отчёты читают его при каждом запуске, а правка через консоль "
+             "сразу записывается в него. Файла нет — создаётся сам из того, что уже "
+             "задано в настройках. Перед запуском отчёта сохраните файл; правка из "
+             "консоли не запишется, пока файл открыт в Excel. В git и в архив "
+             "проекта не попадает — у каждой установки свой.",
     ),
     Setting(
         key="portfolio_dynamics_kuap_durations", label="Дюрации по КУАП",
@@ -520,6 +537,15 @@ SETTINGS: List[Setting] = [
              "seed/market_history_seed.csv (или .xlsx) в папке проекта; записанное в этом "
              "файле они не перебивают. В git и в архив проекта не попадает — у каждой "
              "установки свой.",
+    ),
+    Setting(
+        key="portfolio_report_manual_pl_history", label="Файл истории P&L доп. портфелей",
+        kind="file", group="portfolio_report",
+        default=lambda get: settings_path().parent / "manual_pl_history.csv",
+        help="P&L с начала года по «Дополнительным портфелям»: его спрашивают при каждом "
+             "запуске, и каждый запуск дописывает сюда значение на дату позиций. Не "
+             "введено — берётся последнее записанное (как вчера). Колонки date, code, "
+             "pl_mln_rub. Файла нет — создаётся сам. В git и в архив проекта не попадает.",
     ),
 ]
 
@@ -717,8 +743,33 @@ def parse_durations(raw: Any, key: str = "durations") -> Dict[str, float]:
     return result
 
 
+def _optional_number(setting: "Setting", code: str, item: dict, field: str,
+                     title: str) -> Optional[float]:
+    """Необязательное неотрицательное число записи портфеля; пусто — None."""
+    value = item.get(field)
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = float(str(value).replace(" ", "").replace("\u00a0", "").replace(",", "."))
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(
+            f"[{setting.key}] У портфеля {code} некорректное значение «{title}»: {value!r}."
+        ) from exc
+    if number < 0:
+        raise SettingsError(f"[{setting.key}] {title} портфеля {code} не может быть отрицательным.")
+    return number
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    text = "" if value is None else str(value).strip()
+    return text or None
+
+
 def _parse_portfolios(setting: "Setting", raw: Any) -> List[dict]:
     """Проверяет список дополнительных портфелей: код, название, тип, объём.
+
+    Объём — балансовая стоимость в млн RUB. Open QTY нужен только «Отчёту по
+    портфелям» и потому необязателен.
 
     Дюрация необязательна, но её отсутствие — не мелочь: CHK_14 считает
     портфели без текущей дюрации, и пустое значение сделает лист checks
@@ -753,7 +804,8 @@ def _parse_portfolios(setting: "Setting", raw: Any) -> List[dict]:
         seen.add(code)
 
         try:
-            volume = float(str(item.get("volume", "")).replace(" ", "").replace(",", "."))
+            volume = float(str(item.get("volume", "")).replace(" ", "").replace("\u00a0", "")
+                           .replace(",", "."))
         except (TypeError, ValueError) as exc:
             raise SettingsError(
                 f"[{setting.key}] У портфеля {code} некорректный объём "
@@ -762,25 +814,15 @@ def _parse_portfolios(setting: "Setting", raw: Any) -> List[dict]:
         if volume < 0:
             raise SettingsError(f"[{setting.key}] Объём портфеля {code} не может быть отрицательным.")
 
-        duration = item.get("duration")
-        if duration in (None, ""):
-            duration = None
-        else:
-            try:
-                duration = float(str(duration).replace(" ", "").replace(",", "."))
-            except (TypeError, ValueError) as exc:
-                raise SettingsError(
-                    f"[{setting.key}] У портфеля {code} некорректная дюрация {duration!r}."
-                ) from exc
-            if duration < 0:
-                raise SettingsError(f"[{setting.key}] Дюрация портфеля {code} не может быть отрицательной.")
-
         result.append({
             "code": code,
             "name": str(item.get("name") or code).strip(),
             "type": portfolio_type,
             "volume": volume,
-            "duration": duration,
+            "qty": _optional_number(setting, code, item, "qty", "Open QTY"),
+            "duration": _optional_number(setting, code, item, "duration", "Дюрация"),
+            "comment_report": _optional_text(item.get("comment_report")),
+            "comment_dynamics": _optional_text(item.get("comment_dynamics")),
         })
     return result
 
@@ -876,11 +918,29 @@ def _write(overrides: Dict[str, Any]) -> Path:
     return path
 
 
-def set_value(key: str, raw: Any) -> Any:
-    """Переопределяет настройку и сразу сохраняет файл. Возвращает разобранное значение."""
+def _write_manual_portfolios_file(records: List[dict]) -> None:
+    """Дублирует список дополнительных портфелей в его Excel-файл.
+
+    Файл — главный источник списка (common/manual_portfolios.py), поэтому
+    правка из консоли пишется сначала в него: не записался (открыт в Excel) —
+    не меняется и settings.json, и они не расходятся.
+    """
+    from common import manual_portfolios  # лениво: модуль сам импортирует settings
+    manual_portfolios.write(manual_portfolios.file_path(), records)
+
+
+def set_value(key: str, raw: Any, sync_file: bool = True) -> Any:
+    """Переопределяет настройку и сразу сохраняет файл. Возвращает разобранное значение.
+
+    sync_file=False — только для синхронизации из Excel-файла дополнительных
+    портфелей: переписывать сам файл, из которого значение только что прочитано,
+    незачем.
+    """
     if key not in SETTINGS_BY_KEY:
         raise SettingsError(f"Неизвестная настройка {key!r}. Список: python console.py settings --list")
     value = parse_value(SETTINGS_BY_KEY[key], raw)
+    if key == MANUAL_PORTFOLIOS_KEY and sync_file:
+        _write_manual_portfolios_file(value)
     overrides = dict(_load_overrides())
     overrides[key] = _serialize(value)
     _write(overrides)
@@ -892,6 +952,8 @@ def reset(key: str) -> Any:
     """Убирает переопределение — настройка возвращается к значению по умолчанию."""
     if key not in SETTINGS_BY_KEY:
         raise SettingsError(f"Неизвестная настройка {key!r}.")
+    if key == MANUAL_PORTFOLIOS_KEY:
+        _write_manual_portfolios_file([])
     overrides = dict(_load_overrides())
     overrides.pop(key, None)
     _write(overrides)
@@ -900,6 +962,9 @@ def reset(key: str) -> Any:
 
 
 def reset_all() -> None:
+    """Сбрасывает settings.json. Excel-файл дополнительных портфелей — как и
+    portfolio_types.json — рабочие данные, а не настройка: он не трогается, и
+    следующий запуск отчёта вернёт список из него."""
     _write({})
     reload()
 
@@ -968,6 +1033,7 @@ _CREATED_ON_WRITE = {
     "logs_dir", "ofz_output_path", "ovp_output_dir", "balance_struct_output_dir",
     "chpd_output_dir", "nim_output_dir", "transfert_output_dir",
     "portfolio_dynamics_output_dir", "portfolio_dynamics_types_file",
+    MANUAL_PORTFOLIOS_FILE_KEY, "portfolio_report_manual_pl_history",
     "portfolio_report_output_dir", "portfolio_report_market_history", "portfolio_report_dir",
 }
 

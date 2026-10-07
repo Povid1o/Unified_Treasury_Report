@@ -21,13 +21,13 @@ from rich.table import Table
 from rich.text import Text
 
 import config
-from common import file_discovery, rounding, settings, ui
+from common import file_discovery, manual_portfolios, rounding, settings, ui
 
 MENU_TITLE = "Настройки"
 MENU_DESCRIPTION = "Пути к папкам, шаблоны имён файлов и константы отчётов — без правки config.py"
 
 
-MANUAL_PORTFOLIOS_KEY = "portfolio_dynamics_manual_portfolios"
+MANUAL_PORTFOLIOS_KEY = settings.MANUAL_PORTFOLIOS_KEY
 
 
 def _value_repr(key: str) -> str:
@@ -116,6 +116,12 @@ def _edit_setting(setting: settings.Setting) -> bool:
     """Диалог правки одной настройки. True — значение изменилось."""
     if setting.kind == "rounding":
         return _rounding_screen(setting)
+    if setting.kind == "portfolios":
+        return _manual_portfolios_screen()
+    if setting.key == settings.MANUAL_PORTFOLIOS_FILE_KEY:
+        # Файл создаётся при первом обращении — и при взгляде на эту настройку
+        # тоже: иначе человек видит путь к файлу, которого нет.
+        _sync_manual_portfolios()
     current = settings.get(setting.key)
     default = settings.default_of(setting.key)
     overridden = settings.is_overridden(setting.key)
@@ -136,7 +142,11 @@ def _edit_setting(setting: settings.Setting) -> bool:
         if not overridden:
             ui.console.print("[grey70]Значение и так по умолчанию — ничего не меняем.[/grey70]")
             return False
-        settings.reset(setting.key)
+        try:
+            settings.reset(setting.key)
+        except settings.SettingsError as exc:
+            ui.error(str(exc))
+            return False
         ui.success(f"{setting.key}: возвращено значение по умолчанию ({settings.get(setting.key)})")
         return True
 
@@ -147,7 +157,10 @@ def _edit_setting(setting: settings.Setting) -> bool:
         return False
 
     ui.success(f"{setting.key} = {value}")
-    _warn_if_missing(setting, value)
+    if setting.key == settings.MANUAL_PORTFOLIOS_FILE_KEY:
+        _sync_manual_portfolios()  # по новому пути — создать файл или взять список из него
+    else:
+        _warn_if_missing(setting, value)
     return True
 
 
@@ -340,19 +353,23 @@ def _portfolios_table(records) -> Table:
     table = Table(
         title="Дополнительные портфели", title_style="bold cyan", box=box.SIMPLE_HEAVY,
         show_header=True, header_style="bold cyan",
-        caption="Портфели, которых нет в выгрузке позиций; объём ведётся вручную.",
+        caption="Портфели, которых нет в выгрузке позиций; ведутся вручную.",
         caption_style="grey50",
     )
     table.add_column("#", justify="right", style="bold yellow", no_wrap=True, width=3)
-    table.add_column("Код", style="bold white", no_wrap=True)
-    table.add_column("Название", style="grey70", overflow="fold")
+    table.add_column("Портфель", style="bold white", no_wrap=True)
     table.add_column("Тип", no_wrap=True)
-    table.add_column("Объём, млн", justify="right", no_wrap=True)
+    table.add_column("Бал. стоимость, млн", justify="right", no_wrap=True)
+    table.add_column("Open QTY, шт", justify="right", no_wrap=True)
     table.add_column("Дюрация", justify="right", no_wrap=True)
+    table.add_column("Комм. в портфелях", style="grey70", overflow="fold")
+    table.add_column("Комм. в динамике", style="grey70", overflow="fold")
     for i, record in enumerate(records, start=1):
         duration = ("—" if record["duration"] is None else f"{record['duration']:.2f}")
-        table.add_row(str(i), record["code"], record["name"], record["type"],
-                      f"{record['volume']:,.0f}", duration)
+        qty = "—" if record.get("qty") is None else f"{record['qty']:,.0f}"
+        table.add_row(str(i), record["code"], record["type"],
+                      f"{record['volume']:,.2f}", qty, duration,
+                      record.get("comment_report") or "—", record.get("comment_dynamics") or "—")
     return table
 
 
@@ -361,25 +378,27 @@ def _ask_portfolio(existing: Optional[dict] = None) -> Optional[dict]:
     known = ", ".join(settings.KNOWN_TYPES_HINT)
     current = existing or {}
 
-    code = ui.ask("Код портфеля (латиницей, например OFZ_EXTRA)",
+    code = ui.ask("Портфель — код латиницей, например OFZ_EXTRA",
                   default=current.get("code", "")).strip().upper()
     if not code:
         ui.cancelled("Код не указан — запись не добавлена.")
         return None
 
-    name = ui.ask("Название (Enter — совпадает с кодом)",
-                  default=current.get("name", "")).strip() or code
     portfolio_type = ui.ask(f"Тип портфеля ({known})",
                             default=current.get("type", "")).strip().upper()
     if not portfolio_type:
         ui.cancelled("Тип не указан — запись не добавлена.")
         return None
 
-    volume = ui.ask("Объём, млн RUB",
+    volume = ui.ask("Балансовая стоимость, млн RUB",
                     default=("" if not current else str(current.get("volume", "")))).strip()
     if not volume:
-        ui.cancelled("Объём не указан — запись не добавлена.")
+        ui.cancelled("Балансовая стоимость не указана — запись не добавлена.")
         return None
+
+    qty_default = "" if not current or current.get("qty") is None else f"{current['qty']:g}"
+    qty = ui.ask("Open QTY, шт — для «Отчёта по портфелям» (Enter — не указывать)",
+                 default=qty_default).strip()
 
     ui.console.print("[grey70]Дюрацию можно не указывать, но тогда проверка CHK_14 "
                      "(«пустая текущая дюрация в срезе») покажет FAIL.[/grey70]")
@@ -387,8 +406,18 @@ def _ask_portfolio(existing: Optional[dict] = None) -> Optional[dict]:
     duration = ui.ask("Текущая дюрация, лет (Enter — не указывать)",
                       default=duration_default).strip()
 
-    return {"code": code, "name": name, "type": portfolio_type,
-            "volume": volume, "duration": duration or None}
+    hint = "Enter — оставить, «-» — убрать" if current else "Enter — без комментария"
+    comment_report = ui.ask(f"Комментарий в «Отчёте по портфелям» ({hint})",
+                            default=current.get("comment_report") or "").strip()
+    comment_dynamics = ui.ask(f"Комментарий в «Динамике портфелей» ({hint})",
+                              default=current.get("comment_dynamics") or "").strip()
+    comment_report = "" if comment_report == "-" else comment_report
+    comment_dynamics = "" if comment_dynamics == "-" else comment_dynamics
+
+    return {"code": code, "type": portfolio_type,
+            "volume": volume, "qty": qty or None, "duration": duration or None,
+            "comment_report": comment_report or None,
+            "comment_dynamics": comment_dynamics or None}
 
 
 def _save_portfolios(records) -> bool:
@@ -400,22 +429,54 @@ def _save_portfolios(records) -> bool:
     return True
 
 
+def _sync_manual_portfolios() -> Optional[manual_portfolios.SyncResult]:
+    """Сверяет консоль с Excel-файлом; ошибку в файле показывает, а не роняет экран."""
+    try:
+        result = manual_portfolios.sync()
+    except settings.SettingsError as exc:
+        ui.error(str(exc))
+        return None
+    if result.created:
+        ui.success(f"Создан файл дополнительных портфелей: {result.path}")
+    elif result.updated:
+        ui.success(f"Список взят из файла {result.path.name}: {len(result.records)} шт.")
+    return result
+
+
 def _manual_portfolios_screen() -> bool:
-    """Экран добавления/правки/удаления. True — что-то изменилось."""
+    """Экран добавления/правки/удаления. True — что-то изменилось.
+
+    Главный источник — Excel-файл: экран сначала подтягивает его, а каждое
+    сохранение пишет в него (settings.set_value).
+    """
     changed = False
     while True:
+        result = _sync_manual_portfolios()
+        changed |= bool(result and result.updated)
         records = list(settings.get(MANUAL_PORTFOLIOS_KEY))
         ui.console.print()
         if records:
             ui.console.print(_portfolios_table(records))
         else:
             ui.console.print("[grey70]Дополнительных портфелей нет.[/grey70]")
-        ui.console.print("[grey70]д — добавить, номер — изменить, у<номер> — удалить, "
-                         "0 — назад[/grey70]")
+        path = manual_portfolios.file_path()
+        if path is not None:
+            ui.console.print(f"[grey70]Файл: {path}[/grey70]")
+        ui.console.print("[grey70]е — открыть файл в Excel, д — добавить, номер — изменить, "
+                         "у<номер> — удалить, 0 — назад[/grey70]")
         choice = ui.ask("Действие", default="0").strip().lower()
 
         if choice in ("0", ""):
             return changed
+
+        if choice in ("е", "e"):
+            if path is None:
+                ui.warning("Файл не задан: настройка «Файл дополнительных портфелей» пустая.")
+                continue
+            if not _open_in_editor(path):
+                ui.console.print(f"[grey70]Откройте файл вручную: {path}[/grey70]")
+            ui.ask("Поправьте файл, СОХРАНИТЕ его и нажмите Enter — он будет проверен")
+            continue
 
         if choice in ("д", "d"):
             record = _ask_portfolio()
@@ -727,6 +788,8 @@ def _reset_all() -> bool:
         ui.console.print("[grey70]Изменённых настроек нет — сбрасывать нечего.[/grey70]")
         return False
     ui.warning(f"Будут сброшены все изменённые настройки ({len(keys)}): {', '.join(keys)}")
+    ui.console.print("[grey70]Файл дополнительных портфелей и разметка по типам не "
+                     "трогаются: это рабочие данные, а не настройки.[/grey70]")
     answer = ui.ask("Точно сбросить всё к значениям по умолчанию? (y/N)", default="N")
     if not answer.strip().lower().startswith("y"):
         ui.cancelled("Сброс отменён.")

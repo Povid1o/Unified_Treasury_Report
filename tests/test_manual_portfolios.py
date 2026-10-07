@@ -12,13 +12,14 @@ import unittest
 from pathlib import Path
 
 import pandas as pd
+from openpyxl import Workbook
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
 sys.path.insert(0, str(BASE_DIR / "tests"))
 
 import config  # noqa: E402
-from common import settings  # noqa: E402
+from common import manual_portfolios, settings  # noqa: E402
 from reports.portfolio_dynamics import etl, workbook  # noqa: E402
 from test_portfolio_dynamics_etl import (  # noqa: E402
     MLN, _write_view_comments, export_name, write_export,
@@ -85,7 +86,8 @@ class InTheReportTests(ManualPortfolioTestCase):
         self.set_extra(EXTRA)
         row = self.build().dim_portfolio.set_index("portfolio_code").loc["OFZ_EXTRA"]
 
-        self.assertEqual(row["portfolio_name"], "Внебиржевой ОФЗ")
+        # Названия в файле нет — как у портфелей из выгрузки, оно равно коду.
+        self.assertEqual(row["portfolio_name"], "OFZ_EXTRA")
         self.assertEqual(row["portfolio_type"], "HTM", "тип указан человеком, гадать не нужно")
 
     def test_manual_portfolio_reaches_the_snapshot(self):
@@ -170,14 +172,25 @@ class VolumeChangeTests(ManualPortfolioTestCase):
         row = self.build().fact_portfolio_snapshot.set_index("portfolio_code").loc["OFZ_EXTRA"]
         self.assertEqual(row["volume_t7"], 150)
 
-    def test_note_still_survives_a_rerun(self):
-        self.set_extra(EXTRA)
+    def test_note_comes_from_the_file_not_from_view_monitor(self):
+        """Комментарий доп. портфеля ведётся в его файле: правка на view_monitor
+        перезаписывается, стёртый в файле — пропадает."""
+        self.set_extra(dict(EXTRA, comment_dynamics="Ведём вручную"))
         released = workbook.save_workbook(self.build(), self.out / "dinamika_portfeley_prev.xlsx")
-        _write_view_comments(released, {"OFZ_EXTRA": "Ведём вручную"})
+        _write_view_comments(released, {"OFZ_EXTRA": "Правка на витрине",
+                                        "HTM_GOV": "Обычный портфель"})
 
         data = self.build(previous=released)
-        row = data.fact_portfolio_snapshot.set_index("portfolio_code").loc["OFZ_EXTRA"]
-        self.assertEqual(row["note_text"], "Ведём вручную")
+        snapshot = data.fact_portfolio_snapshot.set_index("portfolio_code")
+        self.assertEqual(snapshot.loc["OFZ_EXTRA", "note_text"], "Ведём вручную")
+        self.assertEqual(snapshot.loc["HTM_GOV", "note_text"], "Обычный портфель")
+        self.assertEqual(workbook._portfolio_notes(data)["OFZ_EXTRA"], "Ведём вручную")
+
+        self.set_extra(EXTRA)
+        data = self.build(previous=released)
+        self.assertTrue(pd.isna(data.fact_portfolio_snapshot.set_index("portfolio_code")
+                                .loc["OFZ_EXTRA", "note_text"]))
+        self.assertNotIn("OFZ_EXTRA", workbook._portfolio_notes(data))
 
 
 class ValidationTests(ManualPortfolioTestCase):
@@ -222,6 +235,90 @@ class ValidationTests(ManualPortfolioTestCase):
         settings.reload()
         self.assertEqual(settings.get("portfolio_dynamics_manual_portfolios")[0]["code"],
                          "OFZ_EXTRA")
+
+
+class ExcelFileTests(ManualPortfolioTestCase):
+    """Excel-файл — главный источник списка; консоль и файл не расходятся."""
+
+    def path(self) -> Path:
+        return manual_portfolios.file_path()
+
+    def write_rows(self, rows, header=None):
+        """Файл, как его заполнит человек: свои заголовки, пустые строки, запятые."""
+        wb = Workbook()
+        ws = wb.active
+        ws.title = manual_portfolios.SHEET
+        ws.append(header or [title for _f, title, _w, _fmt in manual_portfolios.COLUMNS])
+        for row in rows:
+            ws.append(list(row))
+        wb.save(self.path())
+
+    def test_file_is_created_from_what_is_already_in_settings(self):
+        """Заведённое через консоль до появления файла не теряется."""
+        overrides = json.loads(settings.settings_path().read_text(encoding="utf-8"))
+        overrides["portfolio_dynamics_manual_portfolios"] = [EXTRA]
+        settings.settings_path().write_text(json.dumps(overrides), encoding="utf-8")
+        config.reload()
+        self.assertFalse(self.path().exists())
+
+        result = manual_portfolios.sync()
+
+        self.assertTrue(result.created)
+        self.assertEqual([r["code"] for r in manual_portfolios.read(self.path())], ["OFZ_EXTRA"])
+
+    def test_console_edit_is_written_to_the_file(self):
+        self.set_extra(EXTRA)
+        records = manual_portfolios.read(self.path())
+        self.assertEqual(records[0]["volume"], 150)
+        self.assertEqual(records[0]["duration"], 4.2)
+
+    def test_file_edit_reaches_settings_and_the_report(self):
+        self.set_extra(EXTRA)
+        self.write_rows([
+            ("OFZ_EXTRA", "HTM", 200, 1000, 4.2, "в портфелях", "в динамике"),
+            (None, None, None, None, None, None, None),
+            ("afs_extra", "afs", "1 500,5", None, "1,5", None, "  "),
+        ])
+
+        self.assertEqual(self.volumes_by_type(self.build())["HTM"], 800)  # 600 + 200
+        stored = settings.get("portfolio_dynamics_manual_portfolios")
+        self.assertEqual([r["code"] for r in stored], ["OFZ_EXTRA", "AFS_EXTRA"])
+        self.assertEqual(stored[0]["qty"], 1000)
+        self.assertEqual((stored[0]["comment_report"], stored[0]["comment_dynamics"]),
+                         ("в портфелях", "в динамике"))
+        self.assertEqual(stored[1], {"code": "AFS_EXTRA", "name": "AFS_EXTRA", "type": "AFS",
+                                     "volume": 1500.5, "qty": None, "duration": 1.5,
+                                     "comment_report": None, "comment_dynamics": None})
+
+    def test_columns_are_found_by_header_not_position(self):
+        self.write_rows([("Коммент", "HTM", 150, "OFZ_EXTRA", "Своё название")],
+                        header=["Комментарий в динамике", "Тип", "Объём, млн", "Код портфеля",
+                                "Название"])
+        record = manual_portfolios.read(self.path())[0]
+        self.assertEqual((record["volume"], record["comment_dynamics"], record["name"]),
+                         (150, "Коммент", "Своё название"))
+
+    def test_broken_row_names_the_file(self):
+        self.write_rows([("OFZ_EXTRA", "HTM", "много", None, None, None, None)])
+        with self.assertRaisesRegex(etl.PortfolioDynamicsError, "additional_portfolios.xlsx"):
+            self.build()
+
+    def test_row_without_code_is_refused(self):
+        self.write_rows([(None, "HTM", 10, None, None, "без кода", None)])
+        with self.assertRaisesRegex(settings.SettingsError, "строке 2"):
+            manual_portfolios.read(self.path())
+
+    def test_cleared_file_clears_the_list(self):
+        self.set_extra(EXTRA)
+        self.write_rows([])
+        self.assertEqual(self.volumes_by_type(self.build())["HTM"], 600)
+        self.assertEqual(settings.get("portfolio_dynamics_manual_portfolios"), [])
+
+    def test_reset_all_keeps_the_file(self):
+        self.set_extra(EXTRA)
+        settings.reset_all()
+        config.reload()
+        self.assertEqual([r["code"] for r in manual_portfolios.sync().records], ["OFZ_EXTRA"])
 
 
 if __name__ == "__main__":

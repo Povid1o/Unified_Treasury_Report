@@ -28,7 +28,7 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BASE_DIR))
 
 import config  # noqa: E402
-from common import excel_io, settings  # noqa: E402
+from common import excel_io, manual_portfolios as manual_store, settings  # noqa: E402
 from common.logging_utils import get_logger  # noqa: E402
 
 logger = get_logger("portfolio_dynamics")
@@ -1028,10 +1028,15 @@ def canonical_type(name) -> str:
 def manual_portfolios() -> List[dict]:
     """Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
 
-    Задаются в настройках («Дополнительные портфели»). Попадают и в справочник,
-    и в срез, и в объём своего типа — иначе их объём выпал бы из светофора.
+    Задаются в Excel-файле «Дополнительных портфелей» (или экраном настроек,
+    который правит тот же файл — common/manual_portfolios.py). Попадают и в
+    справочник, и в срез, и в объём своего типа — иначе их объём выпал бы из
+    светофора.
     """
-    records = config.PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS or []
+    try:
+        records = manual_store.sync().records
+    except settings.SettingsError as exc:
+        raise PortfolioDynamicsError(str(exc)) from exc
     return [dict(r, type=canonical_type(r["type"])) for r in records]
 
 
@@ -1462,8 +1467,35 @@ def _build_snapshot(t0: PortfolioSlice, t7: PortfolioSlice, business_date: dt.da
     else:
         snapshot["note_text"] = None
 
+    # Комментарий дополнительного портфеля ведётся в его Excel-файле, а не на
+    # view_monitor: файл перебивает перенесённое из прошлого выпуска.
+    for code, text in _manual_notes(t0).items():
+        snapshot.loc[snapshot["portfolio_code"].astype(str) == code, "note_text"] = text
+
     restored = int(snapshot["note_text"].notna().sum())
     return snapshot[SNAPSHOT_COLUMNS], restored
+
+
+def _manual_notes(t0: PortfolioSlice) -> Dict[str, Optional[str]]:
+    """{код: «Комментарий в динамике»} дополнительных портфелей, которых нет в выгрузке.
+
+    Пустой комментарий — тоже значение (None): стёртый в файле комментарий
+    должен пропасть и из отчёта.
+    """
+    in_export = set(t0.frame["portfolio_code"].astype(str))
+    return {r["code"]: r.get("comment_dynamics") for r in manual_portfolios()
+            if r["code"] not in in_export}
+
+
+def _with_manual_notes(notes: Dict[str, str], t0: PortfolioSlice) -> Dict[str, str]:
+    """Комментарии справочника, где у дополнительных портфелей — текст из их файла."""
+    notes = dict(notes)
+    for code, text in _manual_notes(t0).items():
+        if text:
+            notes[code] = text
+        else:
+            notes.pop(code, None)
+    return notes
 
 
 def _notes_for(dim: pd.DataFrame, previous: PreviousRelease) -> Dict[str, str]:
@@ -1758,5 +1790,5 @@ def build_data(t0_path: Path, t7_path: Path, previous_path: Optional[Path] = Non
         history_rows_imported=imported_rows,
         history_rows_replaced=replaced,
         notes_restored=notes_restored,
-        portfolio_notes=_notes_for(dim, previous),
+        portfolio_notes=_with_manual_notes(_notes_for(dim, previous), t0),
     )

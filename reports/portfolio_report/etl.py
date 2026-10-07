@@ -30,6 +30,10 @@ NIM: одна строка — одно значение, смысл значе�
 - RUONIA, RGBI и RWA вводятся руками и копятся в файле истории; в CSV
   попадают и даты из истории, которых в папке результатов ещё нет
   (reports/portfolio_report/market.py).
+
+Плюс «Дополнительные портфели» — тех, что в выгрузке нет: Open QTY и
+стоимость из Excel-файла (общего с «Динамикой»), P&L с начала года вводится
+при запуске (reports/portfolio_report/manual.py).
 """
 import datetime as dt
 import re
@@ -175,6 +179,8 @@ class PortfolioReportData:
     # Рыночные показатели за ДРУГИЕ даты, которых ещё нет в CSV папки результатов
     # (см. market.pending): {дата: {rgbi/ruonia/rwa: значение}}.
     market_history: Dict[dt.date, Dict[str, float]] = field(default_factory=dict)
+    # Коды «Дополнительных портфелей», добавленных в frame (не из выгрузки).
+    manual_codes: List[str] = field(default_factory=list)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -598,12 +604,51 @@ def _type_of(code: str) -> str:
     return positions.guess_type(code, positions.KNOWN_PORTFOLIO_TYPES)
 
 
+MLN = 1_000_000
+
+
+def _manual_rows(frame: pd.DataFrame, records: List[dict],
+                 pl_mln: Dict[str, float]) -> List[dict]:
+    """Строки свода по «Дополнительным портфелям» (суммы — в рублях, как у выгрузки).
+
+    Open QTY в файле один на любую дату, поэтому на начало года он тот же, и
+    изменение — ноль. DV01 и Yield не заполняются: строк в CSV у них не будет.
+    """
+    existing = set(frame["portfolio_code"].astype(str).str.upper())
+    rows = []
+    for record in records:
+        code = record["code"]
+        if code in existing:
+            logger.warning(
+                "Портфель %s задан в «Дополнительных портфелях», но он есть и в выгрузке "
+                "позиций — значения из файла не применяются, взяты из выгрузки.", code)
+            continue
+        qty = record.get("qty")
+        pl = pl_mln.get(code)
+        rows.append({
+            "portfolio_code": code,
+            "portfolio_type": record["type"],
+            "open_qty": qty,
+            "open_qty_start": qty,
+            "open_qty_change": None if qty is None else 0.0,
+            "net_value": record["volume"] * MLN,
+            "total_pl": None if pl is None else pl * MLN,
+            "dv01": None,
+            "yield": None,
+        })
+    return rows
+
+
 def build_data(source_path: Path,
                market: Optional[MarketInputs] = None,
                report_date: Optional[dt.date] = None,
                comments: Optional[Dict[str, str]] = None,
-               market_history: Optional[Dict[dt.date, Dict[str, float]]] = None
+               market_history: Optional[Dict[dt.date, Dict[str, float]]] = None,
+               manual_portfolios: Optional[List[dict]] = None,
+               manual_pl: Optional[Dict[str, float]] = None,
                ) -> PortfolioReportData:
+    """manual_portfolios — записи «Дополнительных портфелей» (manual.records()),
+    manual_pl — их P&L с начала года, млн RUB, {код: значение}."""
     snapshot = parse_positions(source_path)
     name = Path(source_path).name
     if snapshot.business_date is None:
@@ -625,6 +670,11 @@ def build_data(source_path: Path,
         None if qty is None or pd.isna(qty) or first is None or pd.isna(first) else qty - first
         for qty, first in zip(frame["open_qty"], frame["open_qty_start"])
     ]
+    manual_rows = _manual_rows(frame, manual_portfolios or [], manual_pl or {})
+    if manual_rows:
+        frame = pd.concat([frame, pd.DataFrame(manual_rows)], ignore_index=True)
+        logger.info("Дополнительных портфелей добавлено: %d (%s)", len(manual_rows),
+                    ", ".join(r["portfolio_code"] for r in manual_rows))
 
     market = market or MarketInputs()
     for name in market.missing():
@@ -632,6 +682,16 @@ def build_data(source_path: Path,
 
     comments = {str(code).strip().upper(): text for code, text in (comments or {}).items()
                 if str(text or "").strip()}
+    # Комментарий дополнительного портфеля ведётся в его Excel-файле: файл
+    # перебивает витрину, а пустая ячейка в файле стирает комментарий.
+    for row in manual_rows:
+        code = row["portfolio_code"]
+        text = next((r.get("comment_report") for r in manual_portfolios or []
+                     if r["code"] == code), None)
+        if text:
+            comments[code] = text
+        else:
+            comments.pop(code, None)
     dropped = sorted(set(comments) - set(frame["portfolio_code"].str.upper()))
     if dropped:
         logger.warning("Портфелей %s нет в выгрузке — их комментарии сохранены в xlsx-витрине, "
@@ -649,6 +709,7 @@ def build_data(source_path: Path,
         comments={code: text for code, text in comments.items() if code not in dropped},
         absent_comments={code: comments[code] for code in dropped},
         market_history=history,
+        manual_codes=[r["portfolio_code"] for r in manual_rows],
     )
 
 

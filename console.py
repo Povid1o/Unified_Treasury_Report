@@ -32,6 +32,7 @@ from reports.nim.report import NimReport  # noqa: E402
 from reports.transfert_stavka.report import TransfertStavkaReport  # noqa: E402
 from reports.portfolio_dynamics.report import PortfolioDynamicsReport  # noqa: E402
 from reports.portfolio_report.report import PortfolioReport  # noqa: E402
+from reports.portfolios_daily.report import PortfoliosDailyReport  # noqa: E402
 
 REPORTS = [
     OfzRatesReport(),
@@ -42,6 +43,7 @@ REPORTS = [
     TransfertStavkaReport(),
     PortfolioDynamicsReport(),
     PortfolioReport(),
+    PortfoliosDailyReport(),
 ]
 REPORTS_BY_SLUG = {report.slug: report for report in REPORTS}
 

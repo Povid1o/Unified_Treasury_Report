@@ -73,6 +73,7 @@ PORTFOLIO_DYNAMICS_TYPE_PARENTS: str
 PORTFOLIO_DYNAMICS_NESTED_LIMITS: str
 PORTFOLIO_DYNAMICS_NESTED_REMAINING: str
 PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS: list
+PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS_FILE: Path
 PORTFOLIO_DYNAMICS_KUAP_DURATIONS: str
 PORTFOLIO_DYNAMICS_TYPE_RULES: str
 PORTFOLIO_DYNAMICS_PORTFOLIO_TYPES: str
@@ -93,6 +94,7 @@ PORTFOLIO_REPORT_SOURCE: SourceConfig
 PORTFOLIO_REPORT_OUTPUT_DIR: Path
 PORTFOLIO_REPORT_OWN_PORTFOLIOS: frozenset
 PORTFOLIO_REPORT_MARKET_HISTORY: Path
+PORTFOLIO_REPORT_MANUAL_PL_HISTORY: Path
 
 # Раздел настроек -> {показатель: {"scale", "decimals"}}; пусто — как сейчас.
 ROUNDING: dict
@@ -195,8 +197,11 @@ def _apply_settings() -> None:
     g["PORTFOLIO_DYNAMICS_NESTED_LIMITS"] = v["portfolio_dynamics_nested_limits"]
     # Какая часть совокупного «Остатка лимита сверху» приходится на вложенный тип.
     g["PORTFOLIO_DYNAMICS_NESTED_REMAINING"] = v["portfolio_dynamics_nested_remaining"]
-    # Портфели, которых нет в выгрузке, но объём по ним ведётся вручную.
+    # Портфели, которых нет в выгрузке, но объём по ним ведётся вручную. Это
+    # копия из settings.json; отчёты читают сам Excel-файл через
+    # common/manual_portfolios.sync() — он главный.
     g["PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS"] = v["portfolio_dynamics_manual_portfolios"]
+    g["PORTFOLIO_DYNAMICS_MANUAL_PORTFOLIOS_FILE"] = v["portfolio_dynamics_manual_portfolios_file"]
     # «Дюрация-КУАП» — дюрация, установленная КУАП, из отдельной настройки.
     g["PORTFOLIO_DYNAMICS_KUAP_DURATIONS"] = v["portfolio_dynamics_kuap_durations"]
     # Разметка портфелей по типам: правила по подстроке в коде и точечные исключения.
@@ -249,6 +254,8 @@ def _apply_settings() -> None:
         _settings.parse_codes(v["portfolio_report_own_portfolios"]))
     # Бэкап введённых RUONIA/RGBI/RWA (reports/portfolio_report/market.py).
     g["PORTFOLIO_REPORT_MARKET_HISTORY"] = v["portfolio_report_market_history"]
+    # История P&L с начала года по «Дополнительным портфелям» (manual.py).
+    g["PORTFOLIO_REPORT_MANUAL_PL_HISTORY"] = v["portfolio_report_manual_pl_history"]
 
     # ── Округление ───────────────────────────────────────────────────────────
     # Читается через common/rounding.rule(отчёт, показатель).

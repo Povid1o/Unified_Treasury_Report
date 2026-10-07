@@ -7,7 +7,8 @@
 
 Плюс неявные входы: комментарии из xlsx-витрины последнего выпуска и RGBI,
 RUONIA и RWA на сегодня — их вводят руками, и каждый запуск дописывает их в
-файл истории (market.py).
+файл истории (market.py). «Дополнительные портфели» — из Excel-файла, их P&L
+с начала года вводится тут же и копится в своей истории (manual.py).
 """
 import argparse
 import datetime as dt
@@ -20,7 +21,7 @@ from rich.table import Table
 import config
 from common import ui
 from reports.base import Report
-from reports.portfolio_report import etl, market, workbook
+from reports.portfolio_report import etl, manual, market, workbook
 
 
 class PortfolioReport(Report):
@@ -42,6 +43,11 @@ class PortfolioReport(Report):
         parser.add_argument("--rgbi", type=str, default=None, help="RGBI на сегодня")
         parser.add_argument("--ruonia", type=str, default=None, help="RUONIA на сегодня, %%")
         parser.add_argument("--rwa", type=str, default=None, help="RWA на сегодня")
+        parser.add_argument(
+            "--manual-pl", type=str, default=None,
+            help="P&L с начала года по «Дополнительным портфелям», млн RUB: "
+                 "«КОД=число, КОД2=число». Не указан — берётся прошлое значение.",
+        )
         parser.add_argument("--no-import", action="store_true",
                             help="Не заглядывать в папку загрузок")
         parser.add_argument("--output", type=str, default=None, help="Путь для сохранения .csv")
@@ -66,11 +72,24 @@ class PortfolioReport(Report):
         output_dir = (Path(args.output).parent if args.output
                       else Path(config.PORTFOLIO_REPORT_OUTPUT_DIR))
 
+        manual_records = manual.records()
+        manual_codes = [r["code"] for r in manual_records]
+        manual_entered = manual.parse_entered(getattr(args, "manual_pl", None))
+        unknown = sorted(set(manual_entered) - set(manual_codes))
+        if unknown:
+            ui.warning(f"P&L введён для портфелей, которых нет в «Дополнительных портфелях»: "
+                       f"{', '.join(unknown)} — пропущен.")
+        pl_history = manual.read_history() if manual_codes else {}
+        manual_pl = {code: value for code, value in manual_entered.items() if code in manual_codes}
+
         # Своя дата не считается уже выгруженной: файл за неё перезаписывается.
         history, already = market.load(output_dir, skip=snapshot_date)
         inputs, pending = entered, {}
         comments = {}
         if snapshot_date is not None:
+            if manual_codes:
+                manual_pl = manual.apply_inputs(pl_history, snapshot_date, manual_codes,
+                                                manual_entered)
             inputs = market.apply_inputs(history, snapshot_date, entered)
             pending = market.pending(history, already, snapshot_date)
             comments_path = workbook.find_comments_release(output_dir, snapshot_date)
@@ -80,8 +99,11 @@ class PortfolioReport(Report):
                                  f"[bold]{comments_path.name}[/bold][/grey70]")
 
         data = etl.build_data(source_path, market=inputs,
-                              comments=comments, market_history=pending)
+                              comments=comments, market_history=pending,
+                              manual_portfolios=manual_records, manual_pl=manual_pl)
         history_file = market.write_history(market.history_path(), history)
+        if manual_codes and snapshot_date is not None:
+            manual.write_history(pl_history)
         output = Path(args.output) if args.output else etl.default_output_path(data.business_date)
         etl.save_report(data, output)
         book = workbook.write_workbook(data, workbook.workbook_path(output))
@@ -94,7 +116,12 @@ class PortfolioReport(Report):
         if data.market_history:
             ui.console.print(f"[grey70]В CSV добавлены показатели рынка из истории: "
                              f"{market.dates_span(data.market_history)}[/grey70]")
-        missing = data.market.missing()
+        if data.manual_codes:
+            ui.console.print(f"[grey70]Дополнительные портфели ({len(data.manual_codes)}): "
+                             f"{', '.join(data.manual_codes)} — из "
+                             f"{manual.manual_store.file_path()}[/grey70]")
+        missing = data.market.missing() + [
+            f"P&L {code}" for code in data.manual_codes if code not in manual_pl]
         if missing:
             ui.warning(f"Не введены: {', '.join(missing)} — ячейки в отчёте пустые.")
 
@@ -117,31 +144,38 @@ class PortfolioReport(Report):
             # Файл едет из загрузок уже здесь, до спиннера: пользователь должен
             # видеть, что куда переложили.
             source_path = etl.take(item)
+        return ask_inputs(source_path, no_import)
 
-        snapshot_date = etl.positions.read_business_date(source_path)
 
-        # Подсказки при вводе — из истории: последнее значение до даты позиций и
-        # уже записанное на неё (при повторном прогоне его не нужно вводить снова).
-        yesterday, recorded = etl.MarketInputs(), etl.MarketInputs()
-        if snapshot_date is not None:
-            try:
-                history, _ = market.load(skip=snapshot_date)
-                yesterday = market.latest_before(history, snapshot_date)
-                recorded = etl.MarketInputs(**history.get(snapshot_date, {}))
-            except etl.PortfolioReportError as exc:
-                ui.warning(str(exc))
+def ask_inputs(source_path: Path, no_import: bool) -> argparse.Namespace:
+    """Диалог показателей, которых нет в выгрузке: RGBI, RUONIA, RWA и P&L
+    дополнительных портфелей. Общий с пунктом «Динамика + отчёт по портфелям»."""
+    snapshot_date = etl.positions.read_business_date(source_path)
 
-        today = dt.date.today()
-        target = (f" — запишутся на дату позиций {snapshot_date:%d.%m.%Y}"
-                  if snapshot_date is not None else "")
-        ui.console.print(f"[bold]Показатели на {today:%d.%m.%Y}[/bold]{target} "
-                         "[grey50](Enter — оставить записанное или пустым)[/grey50]")
-        return argparse.Namespace(
-            date=None, input=str(source_path), no_import=no_import, output=None,
-            rgbi=_ask_number("RGBI", yesterday.rgbi, recorded.rgbi),
-            ruonia=_ask_number("RUONIA, %", yesterday.ruonia, recorded.ruonia),
-            rwa=_ask_number("RWA", yesterday.rwa, recorded.rwa),
-        )
+    # Подсказки при вводе — из истории: последнее значение до даты позиций и
+    # уже записанное на неё (при повторном прогоне его не нужно вводить снова).
+    yesterday, recorded = etl.MarketInputs(), etl.MarketInputs()
+    if snapshot_date is not None:
+        try:
+            history, _ = market.load(skip=snapshot_date)
+            yesterday = market.latest_before(history, snapshot_date)
+            recorded = etl.MarketInputs(**history.get(snapshot_date, {}))
+        except etl.PortfolioReportError as exc:
+            ui.warning(str(exc))
+
+    today = dt.date.today()
+    target = (f" — запишутся на дату позиций {snapshot_date:%d.%m.%Y}"
+              if snapshot_date is not None else "")
+    ui.console.print(f"[bold]Показатели на {today:%d.%m.%Y}[/bold]{target} "
+                     "[grey50](Enter — оставить записанное или пустым)[/grey50]")
+    rgbi = _ask_number("RGBI", yesterday.rgbi, recorded.rgbi)
+    ruonia = _ask_number("RUONIA, %", yesterday.ruonia, recorded.ruonia)
+    rwa = _ask_number("RWA", yesterday.rwa, recorded.rwa)
+    return argparse.Namespace(
+        date=None, input=str(source_path), no_import=no_import, output=None,
+        rgbi=rgbi, ruonia=ruonia, rwa=rwa,
+        manual_pl=_ask_manual_pl(snapshot_date),
+    )
 
 
 def _number(raw: Optional[str], name: str) -> Optional[float]:
@@ -173,6 +207,34 @@ def _ask_number(label: str, previous: Optional[float],
         if etl.positions.parse_number(answer) is not None:
             return answer
         ui.warning(f"«{answer}» — не число. Например: 14.25 или 14,25.")
+
+
+def _ask_manual_pl(snapshot_date: Optional[dt.date]) -> Optional[str]:
+    """P&L с начала года по каждому «Дополнительному портфелю», млн RUB.
+
+    Enter — как вчера: run() возьмёт уже записанное на дату или последнее до неё.
+    """
+    records = manual.records()
+    if not records:
+        return None
+    previous, recorded = {}, {}
+    if snapshot_date is not None:
+        try:
+            history = manual.read_history()
+            previous = manual.latest_before(history, snapshot_date)
+            recorded = history.get(snapshot_date, {})
+        except etl.PortfolioReportError as exc:
+            ui.warning(str(exc))
+    ui.console.print("[bold]P&L с начала года по дополнительным портфелям, млн RUB[/bold] "
+                     "[grey50](Enter — как вчера)[/grey50]")
+    answers = []
+    for record in records:
+        code = record["code"]
+        label = code if record["name"] == code else f"{code} ({record['name']})"
+        answer = _ask_number(label, previous.get(code), recorded.get(code))
+        if answer is not None:
+            answers.append(f"{code}={answer}")
+    return "; ".join(answers) or None
 
 
 def _sources_table(sources: List[etl.SourceFile], default: dt.date) -> Table:

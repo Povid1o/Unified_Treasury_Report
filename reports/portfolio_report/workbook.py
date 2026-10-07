@@ -50,6 +50,8 @@ COLUMNS = [
 _HEADER_FILL = PatternFill("solid", fgColor="1F3864")
 _COMMENT_HEADER_FILL = PatternFill("solid", fgColor="BF8F00")
 _COMMENT_FILL = PatternFill("solid", fgColor="FFF2CC")
+# Комментарий дополнительного портфеля правится в его Excel-файле, не здесь.
+_MANUAL_COMMENT_FILL = PatternFill("solid", fgColor="E7E6E6")
 _WORKBOOK_DATE = re.compile(re.escape(etl.OUTPUT_FILENAME_PREFIX) + r"(\d{4}-\d{2}-\d{2})\.xlsx$")
 
 
@@ -124,6 +126,11 @@ def write_workbook(data: "etl.PortfolioReportData", path: Path) -> Path:
                 "выпуск и в CSV для BI. Чтобы правка попала в CSV этого выпуска, "
                 "перезапустите отчёт за ту же дату.")
     ws["A2"].font = Font(italic=True, color="595959")
+    if data.manual_codes:
+        ws["A3"] = ("Код курсивом — дополнительный портфель: его нет в выгрузке, Open QTY, "
+                    "стоимость и комментарий (серая ячейка) — из файла дополнительных "
+                    "портфелей, правятся там; P&L — введён при запуске.")
+        ws["A3"].font = Font(italic=True, color="7F6000")
 
     headers = [CODE_HEADER, "Тип"] + [title for title, *_ in COLUMNS] + [COMMENT_HEADER]
     comment_col = len(headers)
@@ -134,9 +141,12 @@ def write_workbook(data: "etl.PortfolioReportData", path: Path) -> Path:
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     frame = data.frame.sort_values(["portfolio_type", "portfolio_code"]).reset_index(drop=True)
+    manual_codes = set(data.manual_codes)
     for i, record in enumerate(frame.to_dict("records")):
         r = HEADER_ROW + 1 + i
-        ws.cell(row=r, column=1, value=record["portfolio_code"])
+        code_cell = ws.cell(row=r, column=1, value=record["portfolio_code"])
+        if record["portfolio_code"] in manual_codes:
+            code_cell.font = Font(italic=True, color="7F6000")
         ws.cell(row=r, column=2, value=record["portfolio_type"])
         for j, (_title, column, divisor, fmt) in enumerate(COLUMNS, start=3):
             value = record[column]
@@ -146,7 +156,8 @@ def write_workbook(data: "etl.PortfolioReportData", path: Path) -> Path:
             cell.number_format = fmt
         note = ws.cell(row=r, column=comment_col,
                        value=data.comments.get(str(record["portfolio_code"]).upper()))
-        note.fill = _COMMENT_FILL
+        note.fill = (_MANUAL_COMMENT_FILL if record["portfolio_code"] in manual_codes
+                     else _COMMENT_FILL)
         note.alignment = Alignment(wrap_text=True, vertical="top")
 
     # Портфели, которых нет в выгрузке, но есть комментарий: строка без чисел.
